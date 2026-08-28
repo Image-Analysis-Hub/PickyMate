@@ -27,7 +27,8 @@ from PySide6.QtCore import Qt
 from .image_view import ImageView2D
 from .thumb_grid import ParticleListPanel
 from .widgets import LabeledSpinBox, LabeledSlider
-from .metadata import js_open_dict, info_name, base_name
+from . import metadata
+from .metadata import base_name
 from .shapes import Shape
 from .volume import Volume, normalize, ParticleStackWriter
 
@@ -195,10 +196,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.datalp = None
         self.set_data(data)
 
-        # Plain-text coordinate sidecar (space-separated x y z per line) --
-        # this is the primary persisted pick location format; the JSON
-        # sidecar below is only used for class/box-size metadata.
-        self.boxfile = os.path.splitext(datafile)[0] + "_boxes.txt"
+        # Per-class plain-text pick files live in "<basename>_picks/".
+        self.picksdir = metadata.picks_dir(datafile)
 
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle("Particle List")
@@ -206,64 +205,39 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxesviewer.show()
 
         self.setspanel = TomoSetsPanel(self)
+        self.selectionpanel = SelectionPanel(self)
         self.optionviewer = TomoBoxerOptions(self)
         self.optionviewer.add_panel(self.setspanel, "Sets")
+        self.optionviewer.add_panel(self.selectionpanel, "Selection")
         self.optionviewer.show()
 
         self.boxesviewer.mx_image_selected.connect(self.img_selected)
+        self.boxesviewer.selection_changed.connect(self.selectionpanel.set_selection)
 
         self._arrange_windows()
 
         # -- metadata (picks + classes) ------------------------------------------
-        self.jsonfile = info_name(datafile)
-        info = js_open_dict(self.jsonfile)
-
+        # self.sets: class_id (int) -> class name (str), the name doubling
+        # as the "<name>.txt" filename inside self.picksdir.
         self.sets = {}
         self.boxsize = {}
-        if "class_list" in info:
-            clslst = info["class_list"]
-            for k in sorted(clslst.keys(), key=int):
-                v = clslst[k]
-                if isinstance(v, dict):
-                    self.sets[int(k)] = str(v["name"])
-                    self.boxsize[int(k)] = int(v["boxsize"])
-                else:
-                    self.sets[int(k)] = str(v)
-                    self.boxsize[int(k)] = 64
+
+        boxsizes_by_name = metadata.load_boxsizes(self.picksdir)
+        classnames = metadata.discover_classes(self.picksdir)
 
         self.sets_visible = set()
 
-        if os.path.isfile(self.boxfile):
-            # Previously picked coordinates take priority over the JSON
-            # sidecar's boxes_3d (kept only for backward compatibility).
-            with open(self.boxfile) as f:
-                for line in f:
-                    parts = line.split()[:3]
-                    if len(parts) < 3:
-                        continue
-                    bdf = [float(parts[0]), float(parts[1]), float(parts[2]), "manual", 0.0, 0, self._new_uid()]
-                    self.boxes.append(bdf)
-            if self.boxes and 0 not in self.sets:
-                self.sets[0] = "particles_00"
-                self.boxsize[0] = 32 if options.mode == "3D" else 64
-        elif "boxes_3d" in info:
-            for b in info["boxes_3d"]:
-                bdf = [0, 0, 0, "manual", 0.0, 0]
-                for j, bi in enumerate(b):
-                    bdf[j] = bi
-                if bdf[5] not in self.sets:
-                    clsi = int(bdf[5])
-                    self.sets[clsi] = f"particles_{clsi:02d}"
-                    self.boxsize[clsi] = 64
-                bdf.append(self._new_uid())
+        for i, name in enumerate(classnames):
+            self.sets[i] = name
+            self.boxsize[i] = boxsizes_by_name.get(name, metadata.DEFAULT_BOXSIZE)
+            for x, y, z in metadata.load_class_coords(self.picksdir, name):
+                bdf = [x, y, z, "manual", 0.0, i, self._new_uid()]
                 self.boxes.append(bdf)
 
         shape = [self.data.nx, self.data.ny, self.data.nz]
         for b in self.boxes:
             for i in range(3):
                 b[i] = int(np.clip(round(b[i]), 1, shape[i] - 1))
-
-        info.close()
 
         if len(self.sets) == 0:
             self.new_set("particles_00")
@@ -276,7 +250,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             else:
                 print("cannot find specified label")
 
-        self.sets_visible.add(self.currentset)
+        # All classes are visible by default when the tomogram is opened.
+        self.sets_visible.update(self.sets.keys())
         self.setspanel.update_sets()
         self.wboxsize.setValue(self.get_boxsize())
 
@@ -301,7 +276,20 @@ class TomoBoxer(QtWidgets.QMainWindow):
         """Split the screen evenly between this window (tomogram) and the
         particle list, and put the options window on top, centered, so it
         can be minimized out of the way without affecting the other two."""
-        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        # self.screen() is meaningless before the window has ever been
+        # shown (Qt just returns some default/primary screen), which is
+        # why everything used to always land on the primary monitor. Use
+        # whichever screen the mouse cursor is currently on instead, which
+        # reflects where the user is actually working; only fall back to
+        # self.screen()/primaryScreen() once the window is already mapped
+        # to a real screen.
+        screen = None
+        if self.isVisible():
+            screen = self.screen()
+        if screen is None:
+            screen = QtGui.QGuiApplication.screenAt(QtGui.QCursor.pos())
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
         if screen is None:
             return
         avail = screen.availableGeometry()
@@ -443,8 +431,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for b in boxes:
                 out.write(f"{b[0]} {b[1]} {b[2]}\n")
 
-    def save_boxfile(self):
-        self._write_coords(self.boxfile, self.boxes)
+    def save_picks(self):
+        """Write every class's particles to its own "<name>.txt" file in
+        self.picksdir, and update config.settings with any non-default box
+        sizes. This is the sole persistence mechanism (no JSON)."""
+        for clsid, name in self.sets.items():
+            coords = [(b[0], b[1], b[2]) for b in self.boxes if b[5] == clsid]
+            metadata.save_class_coords(self.picksdir, name, coords)
+        boxsizes_by_name = {self.sets[k]: self.boxsize[k] for k in self.sets}
+        metadata.save_boxsizes(self.picksdir, boxsizes_by_name)
 
     def save_boxes(self, clsid=None):
         clsid = clsid or []
@@ -604,6 +599,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self._undo_add(action)
         elif action["type"] == "delete":
             self._undo_delete(action)
+        elif action["type"] == "reassign":
+            self._undo_reassign(action)
 
     def _undo_add(self, action):
         idx = self._index_for_uid(action["uid"])
@@ -618,6 +615,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.boxesimgs.insert(idx, img)
         for i in range(len(self.boxes)):
             self.update_box_shape(i, self.boxes[i])
+        if self.initialized:
+            self.save_json()
+        self.update_all()
+
+    def _undo_reassign(self, action):
+        for i, prev_class in action["changes"]:
+            if 0 <= i < len(self.boxes):
+                self.boxes[i][5] = prev_class
+                self.update_box_shape(i, self.boxes[i])
         if self.initialized:
             self.save_json()
         self.update_all()
@@ -662,13 +668,19 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def update_boximgs(self):
         self.boxids = [i for i, m in enumerate(self.boxesimgs) if self.boxes[i][5] in self.sets_visible]
-        pairs = [(self.boxes[i][6], self.boxesimgs[i]) for i in self.boxids]
-        self.boxesviewer.sync_particles(pairs)
+        triples = [(self.boxes[i][6], self.boxesimgs[i], self.boxes[i][5]) for i in self.boxids]
+        self.boxesviewer.rebuild_tabs(self.sets)
+        self.boxesviewer.sync_particles(triples)
 
     def img_selected(self, event, lc):
         lci = self._index_for_uid(lc[0])
         if lci is None:
             return
+        # Quick-delete gesture in the particle list: Shift+click deletes
+        # this one particle, Shift+Ctrl+click deletes it and everything
+        # after it in the list. (Ctrl/Alt+click without Shift are used for
+        # multi-select in the thumbnail grid itself, see
+        # ParticleGrid.mousePressEvent.)
         if event.modifiers() & Qt.ShiftModifier:
             if event.modifiers() & Qt.ControlModifier:
                 self.del_box(list(range(lci, len(self.boxes))))
@@ -847,14 +859,19 @@ class TomoBoxer(QtWidgets.QMainWindow):
         delids = [i for i, b in enumerate(self.boxes) if b[5] == int(name)]
         self.del_box(delids, record_undo=False)
         self.sets_visible.discard(name)
-        self.sets.pop(name, None)
+        classname = self.sets.pop(name, None)
         self.boxsize.pop(name, None)
+        if classname is not None:
+            metadata.delete_class_file(self.picksdir, classname)
         self.update_all()
 
     def rename_set(self, oldname, newname):
         name = parse_setname(oldname)
         if name in self.sets:
+            metadata.rename_class_file(self.picksdir, self.sets[name], newname)
             self.sets[name] = newname
+            if self.initialized:
+                self.save_picks()
 
     def new_set(self, name):
         i = 0
@@ -862,10 +879,40 @@ class TomoBoxer(QtWidgets.QMainWindow):
             i += 1
         self.sets[i] = name
         self.sets_visible.add(i)
-        self.boxsize[i] = 32 if self.options.mode == "3D" else 64
+        self.boxsize[i] = metadata.DEFAULT_BOXSIZE
+        return i
 
     def save_set(self):
         self.save_boxes(list(self.sets_visible))
+
+    # -- multi-selection actions (used by the Options window's Selection panel) --
+    def delete_particles_by_uid(self, uids):
+        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        self.del_box(idx)
+
+    def move_particles_by_uid(self, uids, target_classname):
+        """Reassign the given particles (by uid) to target_classname,
+        creating the class if it doesn't exist yet. Undo-able."""
+        target_id = None
+        for k, v in self.sets.items():
+            if v == target_classname:
+                target_id = k
+                break
+        if target_id is None:
+            target_id = self.new_set(target_classname)
+
+        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        if not idx:
+            return
+        prev = [(i, self.boxes[i][5]) for i in idx]
+        for i in idx:
+            self.boxes[i][5] = target_id
+            self.update_box_shape(i, self.boxes[i])
+        self._push_undo({"type": "reassign", "changes": prev, "new_class": target_id})
+        self.sets_visible.add(target_id)
+        if self.initialized:
+            self.save_picks()
+        self.update_all()
 
     # -- keyboard -----------------------------------------------------------
     def key_press(self, event):
@@ -877,16 +924,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.keyPress.emit(event)
 
     # -- persistence -----------------------------------------------------------
+    # Backward-compatible alias, kept in case anything still calls save_json().
     def save_json(self):
-        # Coordinates are the source of truth in the plain-text sidecar
-        # (self.boxfile); the JSON sidecar only keeps class/box-size metadata.
-        info = js_open_dict(self.jsonfile)
-        info["class_list"] = {
-            str(int(k)): {"name": self.sets[k], "boxsize": int(self.boxsize[k])}
-            for k in self.sets
-        }
-        info.close()
-        self.save_boxfile()
+        self.save_picks()
 
     def closeEvent(self, event):
         if self._closing:
@@ -907,7 +947,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def _do_close_all(self):
         self._closing = True
         print("Exiting")
-        self.save_json()
+        self.save_picks()
         self.boxesviewer.close()
         self.optionviewer.close()
         try:
@@ -927,6 +967,79 @@ class TomoBoxer(QtWidgets.QMainWindow):
             return
         self._do_close_all()
         self.close()
+
+
+class SelectionPanel(QtWidgets.QWidget):
+    """Shows how many particles are currently multi-selected in the
+    particle list and lets you delete them or move them to another (or a
+    new) class. Inert ("No selection") when nothing is selected."""
+
+    def __init__(self, target):
+        super().__init__()
+        self.target = weakref.ref(target)
+        self._uids = []
+
+        vbl = QtWidgets.QVBoxLayout(self)
+        self.status_label = QtWidgets.QLabel("No selection")
+        vbl.addWidget(self.status_label)
+
+        self.delete_button = QtWidgets.QPushButton("Delete Selected")
+        vbl.addWidget(self.delete_button)
+
+        moverow = QtWidgets.QHBoxLayout()
+        self.class_combo = QtWidgets.QComboBox()
+        self.class_combo.setEditable(True)
+        self.class_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        moverow.addWidget(self.class_combo)
+        self.move_button = QtWidgets.QPushButton("Move to")
+        moverow.addWidget(self.move_button)
+        vbl.addLayout(moverow)
+        vbl.addStretch(1)
+
+        self.delete_button.clicked.connect(self._delete)
+        self.move_button.clicked.connect(self._move)
+
+        self._set_active(False)
+
+    def refresh_classes(self):
+        target = self.target()
+        if target is None:
+            return
+        current = self.class_combo.currentText()
+        self.class_combo.blockSignals(True)
+        self.class_combo.clear()
+        self.class_combo.addItems(sorted(target.sets.values()))
+        self.class_combo.setCurrentText(current)
+        self.class_combo.blockSignals(False)
+
+    def set_selection(self, uids):
+        self._uids = list(uids or [])
+        active = len(self._uids) > 0
+        self._set_active(active)
+        if active:
+            self.status_label.setText(f"{len(self._uids)} particle(s) selected")
+            self.refresh_classes()
+
+    def _set_active(self, active):
+        self.status_label.setText(f"{len(self._uids)} particle(s) selected" if active else "No selection")
+        self.delete_button.setEnabled(active)
+        self.move_button.setEnabled(active)
+        self.class_combo.setEnabled(active)
+
+    def _delete(self):
+        target = self.target()
+        if target is None or not self._uids:
+            return
+        target.delete_particles_by_uid(self._uids)
+        self.set_selection([])
+
+    def _move(self):
+        target = self.target()
+        name = self.class_combo.currentText().strip()
+        if target is None or not self._uids or not name:
+            return
+        target.move_particles_by_uid(self._uids, name)
+        self.set_selection([])
 
 
 class TomoBoxerOptions(QtWidgets.QWidget):

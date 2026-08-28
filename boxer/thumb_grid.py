@@ -27,9 +27,13 @@ UID_ROLE = 0
 
 
 class ParticleGrid(QtWidgets.QGraphicsView):
-    """Grid view: mx_image_selected(event, [uid]) is emitted on click."""
+    """Grid view: mx_image_selected(event, [uid]) is emitted on a plain
+    click (navigates to that particle, as before). selection_changed([uids])
+    is emitted whenever the multi-selection changes (plain click -> single
+    item selection; Ctrl+click -> toggle; Shift+click -> range select)."""
 
     mx_image_selected = QtCore.Signal(object, object)
+    selection_changed = QtCore.Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,12 +49,26 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._images = {}       # uid -> raw numpy image (kept for re-scaling on zoom)
         self._slot_of_uid = {}  # uid -> stable slot index
         self._next_slot = 0
-        self._selection = None  # QGraphicsRectItem highlighting the current pick
+        self._selected = []      # ordered list of selected uids
+        self._selection_rects = {}  # uid -> QGraphicsRectItem
+        self._last_clicked_uid = None
 
         self._update_scene_rect()
 
     def set_mouse_mode(self, mode):
         self._mouse_mode = mode
+
+    def selected_uids(self):
+        return list(self._selected)
+
+    def clear_selection(self, emit=True):
+        for uid in list(self._selection_rects.keys()):
+            self._hide_selection(uid)
+        self._selected = []
+        self._last_clicked_uid = None
+        if emit:
+            self.selection_changed.emit([])
+
 
     # -- syncing particles -----------------------------------------------
     def sync_particles(self, uid_img_pairs):
@@ -100,9 +118,9 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             self._scene.removeItem(item)
         self._images.pop(uid, None)
         self._slot_of_uid.pop(uid, None)
-        if self._selection is not None and self._selection.data(UID_ROLE) == uid:
-            self._scene.removeItem(self._selection)
-            self._selection = None
+        self._hide_selection(uid)
+        if uid in self._selected:
+            self._selected.remove(uid)
 
     def _update_pixmap(self, uid, img):
         self._images[uid] = img
@@ -132,8 +150,9 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         x = SPACING + col * step
         y = -SPACING - row * step - self._thumb_size
         item.setPos(x, y)
-        if self._selection is not None and self._selection.data(UID_ROLE) == uid:
-            self._selection.setRect(x - 2, y - 2, self._thumb_size + 4, self._thumb_size + 4)
+        rect = self._selection_rects.get(uid)
+        if rect is not None:
+            rect.setRect(x - 2, y - 2, self._thumb_size + 4, self._thumb_size + 4)
 
     def _relayout_all(self):
         for uid in self._items:
@@ -151,14 +170,39 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         item = self._items.get(uid)
         if item is None:
             return
-        if self._selection is None:
+        rect = self._selection_rects.get(uid)
+        if rect is None:
             pen = QtGui.QPen(QtGui.QColor("yellow"))
             pen.setWidth(3)
-            self._selection = self._scene.addRect(0, 0, 0, 0, pen)
-        self._selection.setData(UID_ROLE, uid)
+            rect = self._scene.addRect(0, 0, 0, 0, pen)
+            rect.setZValue(10)
+            # The highlight sits visually on top of the thumbnail, but must
+            # not intercept mouse clicks -- otherwise itemAt() returns this
+            # rect (which has no UID_ROLE data) instead of the pixmap item
+            # underneath once a particle is selected, silently breaking
+            # every click gesture (including Shift-click delete) on already
+            # -selected particles.
+            rect.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            rect.setAcceptHoverEvents(False)
+            self._selection_rects[uid] = rect
         pos = item.pos()
-        self._selection.setRect(pos.x() - 2, pos.y() - 2, self._thumb_size + 4, self._thumb_size + 4)
-        self._selection.setZValue(10)
+        rect.setRect(pos.x() - 2, pos.y() - 2, self._thumb_size + 4, self._thumb_size + 4)
+
+    def _hide_selection(self, uid):
+        rect = self._selection_rects.pop(uid, None)
+        if rect is not None:
+            self._scene.removeItem(rect)
+
+    def _set_selection(self, uids, emit=True):
+        uids = list(dict.fromkeys(uids))  # de-dup, preserve order
+        for uid in list(self._selection_rects.keys()):
+            if uid not in uids:
+                self._hide_selection(uid)
+        for uid in uids:
+            self._show_selection(uid)
+        self._selected = uids
+        if emit:
+            self.selection_changed.emit(list(uids))
 
     # -- zoom (mouse wheel) -----------------------------------------------
     def zoom_in(self):
@@ -194,15 +238,57 @@ class ParticleGrid(QtWidgets.QGraphicsView):
 
     def mousePressEvent(self, event):
         if event.button() == QtCore.Qt.LeftButton:
-            item = self.itemAt(event.pos())
-            if item is not None:
-                uid = item.data(UID_ROLE)
-                if uid is not None:
-                    self._show_selection(uid)
+            # itemAt() returns the strict topmost item regardless of
+            # acceptedMouseButtons/acceptHoverEvents, so a selection
+            # highlight rect (also drawn at this position, on top so it's
+            # visible) would shadow the pixmap item underneath once a
+            # particle is selected. Walk all items at this position instead
+            # and use the first one that actually carries a UID.
+            uid = None
+            for candidate in self.items(event.pos()):
+                cand_uid = candidate.data(UID_ROLE)
+                if cand_uid is not None:
+                    uid = cand_uid
+                    break
+            if uid is not None:
+                mods = event.modifiers()
+                # Shift(+Ctrl)+click is the quick-delete gesture (single /
+                # to-end-of-list, handled by TomoBoxer.img_selected) --
+                # bypass multi-select entirely and forward it as-is.
+                if mods & QtCore.Qt.ShiftModifier:
                     self.mx_image_selected.emit(event, [uid])
                     event.accept()
                     return
+                # Multi-select uses Ctrl (toggle one item) and Alt
+                # (range-select from the last clicked item), since
+                # Shift is reserved for the delete gesture above.
+                if mods & QtCore.Qt.AltModifier and self._last_clicked_uid is not None:
+                    self._range_select(self._last_clicked_uid, uid)
+                elif mods & QtCore.Qt.ControlModifier:
+                    sel = list(self._selected)
+                    if uid in sel:
+                        sel.remove(uid)
+                    else:
+                        sel.append(uid)
+                    self._last_clicked_uid = uid
+                    self._set_selection(sel)
+                else:
+                    self._last_clicked_uid = uid
+                    self._set_selection([uid])
+                    self.mx_image_selected.emit(event, [uid])
+                event.accept()
+                return
         super().mousePressEvent(event)
+
+    def _range_select(self, from_uid, to_uid):
+        if from_uid not in self._slot_of_uid or to_uid not in self._slot_of_uid:
+            self._set_selection([to_uid])
+            return
+        lo, hi = sorted((self._slot_of_uid[from_uid], self._slot_of_uid[to_uid]))
+        uids = [u for u, s in self._slot_of_uid.items() if lo <= s <= hi]
+        uids.sort(key=lambda u: self._slot_of_uid[u])
+        self._last_clicked_uid = to_uid
+        self._set_selection(uids)
 
 
 def _thumbnail_pixmap(img: np.ndarray) -> QtGui.QPixmap:
@@ -218,28 +304,177 @@ def _thumbnail_pixmap(img: np.ndarray) -> QtGui.QPixmap:
     return QtGui.QPixmap.fromImage(qimg)
 
 
+class DetachedGridWindow(QtWidgets.QWidget):
+    """A floating top-level window holding a single class's ParticleGrid
+    that has been "detached" out of the tabbed panel. Closing it (via the
+    window's [x] or the explicit Reattach button) sends the grid back to
+    its tab in the parent ParticleListPanel."""
+
+    closed = QtCore.Signal(int)  # classid
+
+    def __init__(self, classid, grid, title):
+        super().__init__()
+        self.classid = classid
+        self.grid = grid
+        self.setWindowTitle(title)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(grid)
+        # QTabWidget/QStackedWidget explicitly hide()s a page when it is
+        # removed (removeTab), and that explicit-hidden flag survives being
+        # reparented into this window's layout -- so force it visible again.
+        grid.setVisible(True)
+        self.reattach_button = QtWidgets.QPushButton("Reattach")
+        layout.addWidget(self.reattach_button)
+        self.reattach_button.clicked.connect(self.close)
+        self.resize(420, 480)
+
+    def closeEvent(self, event):
+        self.closed.emit(self.classid)
+        super().closeEvent(event)
+
+
 class ParticleListPanel(QtWidgets.QWidget):
-    """Wraps the ParticleGrid with an "Organize Grid" button beneath it."""
+    """Wraps a tabbed set of ParticleGrids: an "All" tab showing every
+    visible particle, plus one tab per class (rebuilt via rebuild_tabs()).
+    Any class tab can be "detached" into its own floating window with the
+    Detach button, and reattached by closing that window."""
 
     mx_image_selected = QtCore.Signal(object, object)
+    selection_changed = QtCore.Signal(object)  # list of uids currently selected
 
     def __init__(self, target=None, parent=None):
         super().__init__(parent)
         self._target = weakref.ref(target) if target is not None else None
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
+
         self.grid = ParticleGrid()
-        layout.addWidget(self.grid)
+        self.tabs.addTab(self.grid, "All")
+        self._connect_grid(self.grid)
+
+        self._class_grids = {}     # classid -> ParticleGrid (docked, in a tab)
+        self._class_names = {}     # classid -> name currently shown
+        self._detached = {}        # classid -> DetachedGridWindow
+
+        btnrow = QtWidgets.QHBoxLayout()
         self.organize_button = QtWidgets.QPushButton("Organize Grid")
-        layout.addWidget(self.organize_button)
-        self.organize_button.clicked.connect(self.grid.reorganize)
-        self.grid.mx_image_selected.connect(self.mx_image_selected)
+        btnrow.addWidget(self.organize_button)
+        self.detach_button = QtWidgets.QPushButton("Detach Tab")
+        btnrow.addWidget(self.detach_button)
+        layout.addLayout(btnrow)
+
+        self.organize_button.clicked.connect(lambda: self._active_grid().reorganize())
+        self.detach_button.clicked.connect(self._detach_current_tab)
+
+    def _connect_grid(self, grid):
+        grid.mx_image_selected.connect(self.mx_image_selected)
+        grid.selection_changed.connect(self.selection_changed)
+
+    def _active_grid(self):
+        w = self.tabs.currentWidget()
+        return w if isinstance(w, ParticleGrid) else self.grid
 
     def set_mouse_mode(self, mode):
         self.grid.set_mouse_mode(mode)
+        for g in self._class_grids.values():
+            g.set_mouse_mode(mode)
 
-    def sync_particles(self, uid_img_pairs):
-        self.grid.sync_particles(uid_img_pairs)
+    # -- tabs / classes -----------------------------------------------------
+    def rebuild_tabs(self, sets: dict):
+        """sets: {classid: name}. Adds/removes/renames class tabs to match,
+        alphabetically ordered by name. Detached windows are left alone
+        (they aren't tabs), just their title is refreshed on rename."""
+        wanted = dict(sets)
+
+        for classid in list(self._class_grids.keys()):
+            if classid not in wanted:
+                grid = self._class_grids.pop(classid)
+                self._class_names.pop(classid, None)
+                idx = self.tabs.indexOf(grid)
+                if idx >= 0:
+                    self.tabs.removeTab(idx)
+
+        for classid, name in list(self._detached.items()):
+            if classid not in wanted:
+                win = self._detached.pop(classid)
+                win.close()
+                continue
+            if self._class_names.get(classid) != wanted[classid]:
+                pass  # name refreshed below via _class_names bookkeeping
+
+        for classid, name in sorted(wanted.items(), key=lambda kv: kv[1]):
+            if classid in self._detached:
+                win = self._detached[classid]
+                win.setWindowTitle(name)
+                self._class_names[classid] = name
+                continue
+            if classid in self._class_grids:
+                grid = self._class_grids[classid]
+                if self._class_names.get(classid) != name:
+                    idx = self.tabs.indexOf(grid)
+                    if idx >= 0:
+                        self.tabs.setTabText(idx, name)
+                    self._class_names[classid] = name
+                continue
+            grid = ParticleGrid()
+            self._connect_grid(grid)
+            self._class_grids[classid] = grid
+            self._class_names[classid] = name
+            self.tabs.addTab(grid, name)
+
+    def _detach_current_tab(self):
+        w = self.tabs.currentWidget()
+        classid = None
+        for cid, grid in self._class_grids.items():
+            if grid is w:
+                classid = cid
+                break
+        if classid is None:
+            return  # "All" tab can't be detached
+        grid = self._class_grids.pop(classid)
+        name = self._class_names.get(classid, str(classid))
+        idx = self.tabs.indexOf(grid)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+        win = DetachedGridWindow(classid, grid, name)
+        win.closed.connect(self._reattach)
+        self._detached[classid] = win
+        win.show()
+
+    def _reattach(self, classid):
+        win = self._detached.pop(classid, None)
+        if win is None:
+            return
+        grid = win.grid
+        name = self._class_names.get(classid, str(classid))
+        self._class_grids[classid] = grid
+        grid.setVisible(True)
+        # Insert alphabetically among existing class tabs (after "All").
+        idx = 1
+        for i in range(1, self.tabs.count()):
+            if self.tabs.tabText(i) < name:
+                idx = i + 1
+            else:
+                break
+        self.tabs.insertTab(idx, grid, name)
+        self.tabs.setCurrentWidget(grid)
+
+    # -- particle sync --------------------------------------------------------
+    def sync_particles(self, entries):
+        """entries: iterable of (uid, img, classid)."""
+        entries = list(entries)
+        self.grid.sync_particles([(uid, img) for uid, img, _cid in entries])
+        by_class = {}
+        for uid, img, cid in entries:
+            by_class.setdefault(cid, []).append((uid, img))
+        for classid, grid in self._class_grids.items():
+            grid.sync_particles(by_class.get(classid, []))
+        for classid, win in self._detached.items():
+            win.grid.sync_particles(by_class.get(classid, []))
 
     def closeEvent(self, event):
         target = self._target() if self._target is not None else None
@@ -247,4 +482,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             event.ignore()
             target.request_close_all()
             return
+        for win in list(self._detached.values()):
+            win.close()
         event.accept()
+
