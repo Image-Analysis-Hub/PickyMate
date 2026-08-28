@@ -10,7 +10,16 @@ gaps while preserving relative order.
 
 Particles are tracked by a caller-supplied unique id (uid), not by list
 position, so slot assignment survives additions/removals anywhere else in
-the particle list.
+the particle list. A uid that reappears after being removed (only possible
+via undo, since uids are never reused) returns to its old slot and is
+shown selected/highlighted, rather than being appended at the end.
+
+The "All" tab is the one exception to the stable-slot rule: it groups
+particles by class (Recycle Bin and Confirmed first, then alphabetically),
+via ParticleGrid.sync_particles_grouped, which fully recomputes slots on
+every call so classes stay visually clustered as particles move between
+them. Per-class tabs are unaffected and keep the stable/gap-preserving
+behavior described above.
 """
 from __future__ import annotations
 
@@ -18,6 +27,9 @@ import weakref
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from . import categories
+from .widgets import space_key_state
 
 THUMB_SIZE = 96
 MIN_THUMB = 24
@@ -48,10 +60,18 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._items = {}        # uid -> QGraphicsPixmapItem
         self._images = {}       # uid -> raw numpy image (kept for re-scaling on zoom)
         self._slot_of_uid = {}  # uid -> stable slot index
+        self._known_slot = {}   # uid -> last slot it ever occupied (survives removal,
+                                 # so a particle brought back by undo returns to the
+                                 # same spot instead of being appended at the end)
         self._next_slot = 0
         self._selected = []      # ordered list of selected uids
         self._selection_rects = {}  # uid -> QGraphicsRectItem
         self._last_clicked_uid = None
+        self._labels = {}        # uid -> (bg QGraphicsRectItem, text QGraphicsSimpleTextItem)
+        self._border_rects = {}  # uid -> QGraphicsRectItem (class-color border, grouped views only)
+        self._border_colors = {}  # uid -> QColor
+        self._pending_restore = []  # uids re-added this sync that were previously removed
+        self._pan_last = None    # last screen pos while right-button panning
 
         self._update_scene_rect()
 
@@ -75,17 +95,71 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         """Reconcile displayed items with an iterable of (uid, image) pairs.
         New uids are appended to the next free slot (bottom-left first);
         uids no longer present are removed, leaving their slot empty;
-        uids already shown just get their thumbnail image refreshed."""
+        uids already shown just get their thumbnail image refreshed. A uid
+        that reappears after having been removed (only possible via undo,
+        since uids are never reused) returns to its old slot and gets
+        highlighted -- see _add_item."""
         wanted = dict(uid_img_pairs)
         for uid in list(self._items.keys()):
             if uid not in wanted:
                 self._remove_item(uid)
+        self._pending_restore = []
         for uid, img in uid_img_pairs:
             if uid in self._items:
                 self._update_pixmap(uid, img)
             else:
                 self._add_item(uid, img)
         self._update_scene_rect()
+        self._finish_restore_highlight()
+
+    def sync_particles_grouped(self, entries, class_order):
+        """Like sync_particles, but groups items by class: entries is an
+        iterable of (uid, image, classid) and class_order lists classids in
+        the order their groups should appear (see categories.category_order).
+        Unlike the plain per-class grids, slots are fully recomputed on
+        every call -- that's unavoidable to keep classes clustered together
+        as particles move between them -- so this is only used for the
+        "All" tab. Each item also gets a border in its class's color so
+        categories stay visually distinct even without column headers."""
+        entries = list(entries)
+        wanted = {uid for uid, _img, _cid in entries}
+        for uid in list(self._items.keys()):
+            if uid not in wanted:
+                self._remove_item(uid)
+
+        by_class = {}
+        for uid, img, cid in entries:
+            by_class.setdefault(cid, []).append((uid, img))
+
+        self._pending_restore = []
+        self._slot_of_uid = {}
+        cols = self._cols()
+        slot = 0
+        for cid in class_order:
+            group = by_class.get(cid)
+            if not group:
+                continue
+            if slot % cols != 0:
+                slot += cols - (slot % cols)
+            color = categories.class_color(cid)
+            for uid, img in group:
+                if uid in self._items:
+                    self._update_pixmap(uid, img)
+                    self._slot_of_uid[uid] = slot
+                    self._known_slot[uid] = slot
+                else:
+                    self._add_item(uid, img, slot=slot)
+                self.set_border_color(uid, color)
+                slot += 1
+        self._next_slot = slot
+        self._relayout_all()
+        self._update_scene_rect()
+        self._finish_restore_highlight()
+
+    def _finish_restore_highlight(self):
+        if self._pending_restore:
+            self._set_selection(self._pending_restore)
+        self._pending_restore = []
 
     def reorganize(self):
         """Compact the grid: drop gaps left by deleted particles while
@@ -95,22 +169,32 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._next_slot = 0
         for uid in ordered:
             self._slot_of_uid[uid] = self._next_slot
+            self._known_slot[uid] = self._next_slot
             self._next_slot += 1
         for uid in ordered:
             self._position_item(uid)
         self._update_scene_rect()
 
     # -- internal item management -----------------------------------------
-    def _add_item(self, uid, img):
+    def _add_item(self, uid, img, slot=None):
         self._images[uid] = img
-        slot = self._next_slot
-        self._next_slot += 1
+        restored = uid in self._known_slot
+        if slot is None:
+            if restored and self._known_slot[uid] not in self._slot_of_uid.values():
+                slot = self._known_slot[uid]
+            else:
+                slot = self._next_slot
+                self._next_slot += 1
+        self._known_slot[uid] = slot
         self._slot_of_uid[uid] = slot
         item = QtWidgets.QGraphicsPixmapItem(self._make_pixmap(img))
         item.setData(UID_ROLE, uid)
         self._scene.addItem(item)
         self._items[uid] = item
+        self._add_label(uid)
         self._position_item(uid)
+        if restored:
+            self._pending_restore.append(uid)
 
     def _remove_item(self, uid):
         item = self._items.pop(uid, None)
@@ -119,6 +203,11 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._images.pop(uid, None)
         self._slot_of_uid.pop(uid, None)
         self._hide_selection(uid)
+        self._hide_label(uid)
+        self._border_colors.pop(uid, None)
+        rect = self._border_rects.pop(uid, None)
+        if rect is not None:
+            self._scene.removeItem(rect)
         if uid in self._selected:
             self._selected.remove(uid)
 
@@ -153,6 +242,66 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         rect = self._selection_rects.get(uid)
         if rect is not None:
             rect.setRect(x - 2, y - 2, self._thumb_size + 4, self._thumb_size + 4)
+        self._position_label(uid)
+        self._update_border(uid)
+
+    # -- particle number-id label -------------------------------------------
+    def _add_label(self, uid):
+        bg = self._scene.addRect(0, 0, 0, 0, QtGui.QPen(QtCore.Qt.NoPen), QtGui.QBrush(QtGui.QColor(0, 0, 0, 160)))
+        bg.setZValue(6)
+        bg.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+        text = self._scene.addSimpleText(str(uid))
+        text.setBrush(QtGui.QBrush(QtGui.QColor("white")))
+        font = text.font()
+        font.setPointSize(8)
+        text.setFont(font)
+        text.setZValue(7)
+        text.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+        self._labels[uid] = (bg, text)
+        self._position_label(uid)
+
+    def _position_label(self, uid):
+        item = self._items.get(uid)
+        lbl = self._labels.get(uid)
+        if item is None or lbl is None:
+            return
+        bg, text = lbl
+        pos = item.pos()
+        text.setPos(pos.x() + 2, pos.y() + 1)
+        br = text.boundingRect()
+        bg.setRect(pos.x() + 1, pos.y() + 1, br.width() + 3, br.height())
+
+    def _hide_label(self, uid):
+        lbl = self._labels.pop(uid, None)
+        if lbl is not None:
+            bg, text = lbl
+            self._scene.removeItem(bg)
+            self._scene.removeItem(text)
+
+    # -- per-item class-color border (used by the grouped "All" view) -------
+    def set_border_color(self, uid, color):
+        self._border_colors[uid] = color
+        self._update_border(uid)
+
+    def _update_border(self, uid):
+        color = self._border_colors.get(uid)
+        item = self._items.get(uid)
+        if item is None or color is None:
+            return
+        rect = self._border_rects.get(uid)
+        if rect is None:
+            pen = QtGui.QPen(color)
+            pen.setWidth(2)
+            rect = self._scene.addRect(0, 0, 0, 0, pen)
+            rect.setZValue(1)
+            rect.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            self._border_rects[uid] = rect
+        else:
+            pen = rect.pen()
+            pen.setColor(color)
+            rect.setPen(pen)
+        pos = item.pos()
+        rect.setRect(pos.x() - 1, pos.y() - 1, self._thumb_size + 2, self._thumb_size + 2)
 
     def _relayout_all(self):
         for uid in self._items:
@@ -237,6 +386,16 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._relayout_all()
 
     def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.RightButton:
+            # Grab-and-pan: right-click and drag to scroll the grid, same
+            # gesture as the tomogram views (ImageView2D). A plain
+            # right-click with no drag does nothing else -- it does NOT
+            # select, since that made right-click redundant with (and
+            # easily confused for) a left-click.
+            self._pan_last = (event.position().x(), event.position().y())
+            self.setCursor(QtCore.Qt.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() == QtCore.Qt.LeftButton:
             # itemAt() returns the strict topmost item regardless of
             # acceptedMouseButtons/acceptHoverEvents, so a selection
@@ -252,16 +411,18 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                     break
             if uid is not None:
                 mods = event.modifiers()
-                # Shift(+Ctrl)+click is the quick-delete gesture (single /
-                # to-end-of-list, handled by TomoBoxer.img_selected) --
-                # bypass multi-select entirely and forward it as-is.
-                if mods & QtCore.Qt.ShiftModifier:
+                # Shift(+Ctrl)+click sends this particle (or it and
+                # everything after it in the list) to the Recycle Bin;
+                # Space+click sends it to Confirmed -- both handled by
+                # TomoBoxer.img_selected. Bypass multi-select entirely and
+                # forward the click as-is.
+                if mods & QtCore.Qt.ShiftModifier or space_key_state().held:
                     self.mx_image_selected.emit(event, [uid])
                     event.accept()
                     return
                 # Multi-select uses Ctrl (toggle one item) and Alt
-                # (range-select from the last clicked item), since
-                # Shift is reserved for the delete gesture above.
+                # (range-select from the last clicked item), since Shift
+                # and Space are reserved for the gestures above.
                 if mods & QtCore.Qt.AltModifier and self._last_clicked_uid is not None:
                     self._range_select(self._last_clicked_uid, uid)
                 elif mods & QtCore.Qt.ControlModifier:
@@ -279,6 +440,25 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_last is not None and (event.buttons() & QtCore.Qt.RightButton):
+            x, y = event.position().x(), event.position().y()
+            dx, dy = x - self._pan_last[0], y - self._pan_last[1]
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(dx))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(dy))
+            self._pan_last = (x, y)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.RightButton:
+            self._pan_last = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _range_select(self, from_uid, to_uid):
         if from_uid not in self._slot_of_uid or to_uid not in self._slot_of_uid:
@@ -359,6 +539,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._class_grids = {}     # classid -> ParticleGrid (docked, in a tab)
         self._class_names = {}     # classid -> name currently shown
         self._detached = {}        # classid -> DetachedGridWindow
+        self._all_class_order = []  # classids, fixed categories first then alphabetical
 
         btnrow = QtWidgets.QHBoxLayout()
         self.organize_button = QtWidgets.QPushButton("Organize Grid")
@@ -386,9 +567,12 @@ class ParticleListPanel(QtWidgets.QWidget):
     # -- tabs / classes -----------------------------------------------------
     def rebuild_tabs(self, sets: dict):
         """sets: {classid: name}. Adds/removes/renames class tabs to match,
-        alphabetically ordered by name. Detached windows are left alone
-        (they aren't tabs), just their title is refreshed on rename."""
+        ordered with the fixed Recycle Bin / Confirmed categories first and
+        everything else alphabetically after (see categories.category_order).
+        Detached windows are left alone (they aren't tabs), just their title
+        is refreshed on rename."""
         wanted = dict(sets)
+        self._all_class_order = categories.category_order(wanted)
 
         for classid in list(self._class_grids.keys()):
             if classid not in wanted:
@@ -398,15 +582,13 @@ class ParticleListPanel(QtWidgets.QWidget):
                 if idx >= 0:
                     self.tabs.removeTab(idx)
 
-        for classid, name in list(self._detached.items()):
+        for classid in list(self._detached.keys()):
             if classid not in wanted:
                 win = self._detached.pop(classid)
                 win.close()
-                continue
-            if self._class_names.get(classid) != wanted[classid]:
-                pass  # name refreshed below via _class_names bookkeeping
 
-        for classid, name in sorted(wanted.items(), key=lambda kv: kv[1]):
+        for classid in self._all_class_order:
+            name = wanted[classid]
             if classid in self._detached:
                 win = self._detached[classid]
                 win.setWindowTitle(name)
@@ -425,6 +607,21 @@ class ParticleListPanel(QtWidgets.QWidget):
             self._class_grids[classid] = grid
             self._class_names[classid] = name
             self.tabs.addTab(grid, name)
+
+        self._reorder_tabs()
+
+    def _reorder_tabs(self):
+        """Move docked class tabs into _all_class_order (tab 0 is always
+        "All"). Needed both after rebuild_tabs adds/removes tabs and after
+        reattaching a detached tab, since insertTab there just appends."""
+        bar = self.tabs.tabBar()
+        for pos, classid in enumerate(self._all_class_order, start=1):
+            grid = self._class_grids.get(classid)
+            if grid is None:
+                continue
+            cur = self.tabs.indexOf(grid)
+            if cur >= 0 and cur != pos:
+                bar.moveTab(cur, pos)
 
     def _detach_current_tab(self):
         w = self.tabs.currentWidget()
@@ -453,21 +650,15 @@ class ParticleListPanel(QtWidgets.QWidget):
         name = self._class_names.get(classid, str(classid))
         self._class_grids[classid] = grid
         grid.setVisible(True)
-        # Insert alphabetically among existing class tabs (after "All").
-        idx = 1
-        for i in range(1, self.tabs.count()):
-            if self.tabs.tabText(i) < name:
-                idx = i + 1
-            else:
-                break
-        self.tabs.insertTab(idx, grid, name)
+        self.tabs.addTab(grid, name)
+        self._reorder_tabs()
         self.tabs.setCurrentWidget(grid)
 
     # -- particle sync --------------------------------------------------------
     def sync_particles(self, entries):
         """entries: iterable of (uid, img, classid)."""
         entries = list(entries)
-        self.grid.sync_particles([(uid, img) for uid, img, _cid in entries])
+        self.grid.sync_particles_grouped(entries, self._all_class_order)
         by_class = {}
         for uid, img, cid in entries:
             by_class.setdefault(cid, []).append((uid, img))

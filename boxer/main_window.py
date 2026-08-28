@@ -26,17 +26,12 @@ from PySide6.QtCore import Qt
 
 from .image_view import ImageView2D
 from .thumb_grid import ParticleListPanel
-from .widgets import LabeledSpinBox, LabeledSlider
+from .widgets import LabeledSpinBox, LabeledSlider, space_key_state
+from . import categories
 from . import metadata
 from .metadata import base_name
 from .shapes import Shape
 from .volume import Volume, normalize, ParticleStackWriter
-
-SETCOLORS = [
-    QtGui.QColor("blue"), QtGui.QColor("green"), QtGui.QColor("red"),
-    QtGui.QColor("cyan"), QtGui.QColor("purple"), QtGui.QColor("orange"),
-    QtGui.QColor("yellow"), QtGui.QColor("hotpink"), QtGui.QColor("gold"),
-]
 
 
 def parse_setname(name):
@@ -61,6 +56,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.options = options
         self.boxshape = "circle" if options.mode == "3D" else "rect"
         self.setWindowTitle("Tomogram Boxer (standalone)")
+
+        # Install the space-bar tracker now rather than waiting for the
+        # first space+click gesture to trigger it lazily -- see
+        # space_key_state()'s docstring for why that races the very first
+        # keypress of the session.
+        space_key_state()
 
         # -- menu ---------------------------------------------------------
         self.mfile = self.menuBar().addMenu("File")
@@ -135,6 +136,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.dragging = -1
         self._next_uid = 0
         self._undo_stack = []
+        self._redo_stack = []
 
         # -- wiring -----------------------------------------------------------
         self.mfile_read_boxloc.triggered.connect(self.menu_file_read_boxloc)
@@ -176,6 +178,23 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.undo_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Undo, self)
         self.undo_shortcut.setContext(Qt.ApplicationShortcut)
         self.undo_shortcut.activated.connect(self.undo)
+
+        # QKeySequence.Redo resolves to whatever the desktop theme defines
+        # as "the" redo key -- on Linux (GNOME/KDE) that's normally
+        # Ctrl+Shift+Z, not Ctrl+Y (the Windows convention), so a plain
+        # QShortcut(QKeySequence.Redo, self) left Ctrl+Y doing nothing.
+        # Merge Ctrl+Y into the same shortcut's key list (rather than
+        # registering it as a second separate QShortcut) so it works
+        # everywhere without ever colliding with the native binding as an
+        # "ambiguous shortcut" on platforms where they're already the same.
+        redo_keys = QtGui.QKeySequence.keyBindings(QtGui.QKeySequence.Redo)
+        ctrl_y = QtGui.QKeySequence("Ctrl+Y")
+        if ctrl_y not in redo_keys:
+            redo_keys.append(ctrl_y)
+        self.redo_shortcut = QtGui.QShortcut(self)
+        self.redo_shortcut.setKeys(redo_keys)
+        self.redo_shortcut.setContext(Qt.ApplicationShortcut)
+        self.redo_shortcut.activated.connect(self.redo)
 
         # -- load data ---------------------------------------------------------
         self.datafilename = datafile
@@ -224,14 +243,24 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         boxsizes_by_name = metadata.load_boxsizes(self.picksdir)
         classnames = metadata.discover_classes(self.picksdir)
+        normal_names = [n for n in classnames if n not in categories.FIXED_CLASS_NAMES]
 
         self.sets_visible = set()
 
-        for i, name in enumerate(classnames):
+        for i, name in enumerate(normal_names):
             self.sets[i] = name
             self.boxsize[i] = boxsizes_by_name.get(name, metadata.DEFAULT_BOXSIZE)
             for x, y, z in metadata.load_class_coords(self.picksdir, name):
                 bdf = [x, y, z, "manual", 0.0, i, self._new_uid()]
+                self.boxes.append(bdf)
+
+        # The Recycle Bin and Confirmed categories always exist, whether or
+        # not their pick files were present on disk yet.
+        for name, cid in categories.FIXED_CLASS_NAMES.items():
+            self.sets[cid] = name
+            self.boxsize[cid] = boxsizes_by_name.get(name, metadata.DEFAULT_BOXSIZE)
+            for x, y, z in metadata.load_class_coords(self.picksdir, name):
+                bdf = [x, y, z, "manual", 0.0, cid, self._new_uid()]
                 self.boxes.append(bdf)
 
         shape = [self.data.nx, self.data.ny, self.data.nz]
@@ -239,10 +268,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for i in range(3):
                 b[i] = int(np.clip(round(b[i]), 1, shape[i] - 1))
 
-        if len(self.sets) == 0:
+        if not normal_names:
             self.new_set("particles_00")
 
-        self.currentset = sorted(self.sets.keys())[0]
+        self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
         if options.label:
             sid = [i for i in self.sets if self.sets[i] == options.label]
             if sid:
@@ -250,8 +279,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
             else:
                 print("cannot find specified label")
 
-        # All classes are visible by default when the tomogram is opened.
+        # All classes are visible by default when the tomogram is opened,
+        # except the Recycle Bin -- rejected particles are more useful
+        # tucked out of the way until you deliberately want to review them.
         self.sets_visible.update(self.sets.keys())
+        self.sets_visible.discard(categories.RECYCLE_BIN_ID)
         self.setspanel.update_sets()
         self.wboxsize.setValue(self.get_boxsize())
 
@@ -331,6 +363,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.curbox = -1
         self._next_uid = 0
         self._undo_stack = []
+        self._redo_stack = []
 
         if self.initialized:
             self.update_all()
@@ -431,15 +464,26 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for b in boxes:
                 out.write(f"{b[0]} {b[1]} {b[2]}\n")
 
-    def save_picks(self):
+    def save_picks(self, only=None):
         """Write every class's particles to its own "<name>.txt" file in
         self.picksdir, and update config.settings with any non-default box
-        sizes. This is the sole persistence mechanism (no JSON)."""
-        for clsid, name in self.sets.items():
+        sizes. This is the sole persistence mechanism (no JSON).
+
+        `only`, when given, restricts the file writes to those classids --
+        a single reclassification only changes the source and destination
+        classes' contents, so rewriting every other class's file too (one
+        open+write per class, every single click) was pure waste. Box sizes
+        aren't affected by reclassifying particles, so that part is skipped
+        for a scoped save; it still gets written on any full (only=None)
+        save, e.g. at close."""
+        classids = self.sets.keys() if only is None else (cid for cid in only if cid in self.sets)
+        for clsid in classids:
+            name = self.sets[clsid]
             coords = [(b[0], b[1], b[2]) for b in self.boxes if b[5] == clsid]
             metadata.save_class_coords(self.picksdir, name, coords)
-        boxsizes_by_name = {self.sets[k]: self.boxsize[k] for k in self.sets}
-        metadata.save_boxsizes(self.picksdir, boxsizes_by_name)
+        if only is None:
+            boxsizes_by_name = {self.sets[k]: self.boxsize[k] for k in self.sets}
+            metadata.save_boxsizes(self.picksdir, boxsizes_by_name)
 
     def save_boxes(self, clsid=None):
         clsid = clsid or []
@@ -490,7 +534,31 @@ class TomoBoxer(QtWidgets.QMainWindow):
         writer.close()
 
     # -- slice view update ----------------------------------------------------------
-    def update_sliceview(self, axis=("x", "y", "z")):
+    def update_sliceview(self, axis=("x", "y", "z"), reslice=True, only_indices=None):
+        """Recompute box-shape visibility/geometry for the given axes and
+        repaint those views. When reslice is True (the default) each view's
+        background is also re-fetched from the volume and rebuilt -- that's
+        the expensive part (a full mean-projection over the volume plus an
+        8-bit image rebuild per view) and is only needed when the viewing
+        position/thickness/filter actually changed. Purely
+        adding/deleting/reclassifying particles never moves the viewing
+        cursor, so callers for those (see update_all's reslice param) pass
+        reslice=False to just refresh the box overlays instead -- this is
+        what made every recycle/confirm/delete click needlessly re-slice
+        and repaint the whole tomogram.
+
+        only_indices restricts the shape-visibility recompute below to just
+        those box indices, instead of every box in the tomogram. A pure
+        reclassification only changes the inplane/color/visibility outcome
+        for the reassigned particle(s) -- every other box's position, class
+        and the viewing cursor are all unchanged, so its outcome can't have
+        changed either, and re-deriving it from scratch every time was pure
+        O(particle count) waste on every single click. Pass an empty list
+        when nothing needs recomputing at all (e.g. a plain deletion, where
+        surviving boxes' shapes are untouched and only need repainting).
+        None (the default) recomputes every box, which is still required
+        whenever the viewing cursor, visible-set membership generally, or
+        box sizes could have changed for boxes other than a known few."""
         boxes = self.boxes
         allside = not self.wlocalbox.isChecked()
 
@@ -506,9 +574,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
             v.del_shape("xline")
             v.del_shape("yline")
 
+        if only_indices is None:
+            items = list(enumerate(boxes))
+        else:
+            items = [(i, boxes[i]) for i in only_indices if 0 <= i < len(boxes)]
+
         for ax in axis:
             ia, view, loc = pms[ax]
-            for i, b in enumerate(boxes):
+            for i, b in items:
                 bs = self.get_boxsize(b[5])
                 dst = abs(b[ia] - loc)
                 inplane = dst < bs // 2
@@ -532,15 +605,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 else:
                     shp.kind = "hidden"
 
-            img = self.get_slice(loc, self.nlayers(), ax)
-            view.set_data(img, keepcontrast=not self.wbautoc.isChecked())
+            if reslice:
+                img = self.get_slice(loc, self.nlayers(), ax)
+                view.set_data(img, keepcontrast=not self.wbautoc.isChecked())
+            else:
+                view.update()
 
         self.update_coords()
 
-    def update_all(self):
+    def update_all(self, reslice=True, only_indices=None):
         if self.data is None:
             return
-        self.update_sliceview()
+        self.update_sliceview(reslice=reslice, only_indices=only_indices)
         self.update_boximgs()
 
     def update_coords(self):
@@ -563,6 +639,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         delids = sorted({i for i in delids if 0 <= i < len(self.boxes)})
         if not delids:
             return
+        affected_classes = {self.boxes[i][5] for i in delids}
         if record_undo:
             removed = [(i, list(self.boxes[i]), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in delids]
             self._push_undo({"type": "delete", "removed": removed})
@@ -573,8 +650,60 @@ class TomoBoxer(QtWidgets.QMainWindow):
             view.shapes = {i: view.shapes[k] for i, k in enumerate(kpids) if k in view.shapes}
         self.curbox = -1
         if self.initialized:
-            self.save_json()
-        self.update_all()
+            self.save_json(only=affected_classes)
+        # Deleting never moves the viewing cursor, and surviving boxes'
+        # shapes are untouched (just renumbered above) -- nothing needs
+        # recomputing, only repainting with the now-smaller shape dicts.
+        self.update_all(reslice=False, only_indices=[])
+
+    def send_to_recycle_bin(self, indices):
+        """Reassign particles to the Recycle Bin instead of deleting them
+        outright, so a cleanup pass (shift+click) stays reversible. A
+        particle that is already in the Recycle Bin is permanently deleted
+        instead -- that's how a specific particle gets deleted out of the
+        bin without emptying the whole thing (see also empty_recycle_bin,
+        which purges everything in it at once)."""
+        if not isinstance(indices, list):
+            indices = [indices]
+        idx = sorted({i for i in indices if 0 <= i < len(self.boxes)})
+        already_binned = [i for i in idx if self.boxes[i][5] == categories.RECYCLE_BIN_ID]
+        rest = [i for i in idx if self.boxes[i][5] != categories.RECYCLE_BIN_ID]
+        if rest:
+            self._reassign_boxes(rest, categories.RECYCLE_BIN_ID)
+        if already_binned:
+            self.del_box(already_binned)
+
+    def send_to_confirmed(self, indices):
+        """Reassign particles to the Confirmed category (space+click)."""
+        self._reassign_boxes(indices, categories.CONFIRMED_ID)
+
+    def _reassign_boxes(self, indices, target_id):
+        if not isinstance(indices, list):
+            indices = [indices]
+        idx = sorted({i for i in indices if 0 <= i < len(self.boxes)})
+        changed = [(i, self.boxes[i][5]) for i in idx if self.boxes[i][5] != target_id]
+        if not changed:
+            return
+        for i, _prev_class in changed:
+            self.boxes[i][5] = target_id
+            self.update_box_shape(i, self.boxes[i])
+        self._push_undo({"type": "reassign", "changes": changed, "new_class": target_id})
+        # Deliberately not forcing target_id into sets_visible here: if the
+        # user has Recycle Bin/Confirmed (or any class) hidden, sending
+        # more particles into it should not silently pop it back into view.
+        self.curbox = -1
+        affected_classes = {target_id} | {prev for _, prev in changed}
+        if self.initialized:
+            self.save_json(only=affected_classes)
+        # Reclassifying never moves the viewing cursor, and every other
+        # box's inplane/visibility outcome is unchanged, so only the
+        # reassigned indices need their shapes recomputed.
+        self.update_all(reslice=False, only_indices=[i for i, _ in changed])
+
+    def empty_recycle_bin(self):
+        """Permanently purge every particle currently in the Recycle Bin."""
+        delids = [i for i, b in enumerate(self.boxes) if b[5] == categories.RECYCLE_BIN_ID]
+        self.del_box(delids)
 
     # -- particle uids / undo -----------------------------------------------
     def _new_uid(self):
@@ -590,6 +719,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _push_undo(self, action):
         self._undo_stack.append(action)
+        # Any genuinely new action invalidates whatever "future" redo would
+        # have restored -- standard undo/redo semantics. undo()/redo()
+        # themselves push their own mirror entries directly onto the other
+        # stack (see below) rather than through here, precisely so that
+        # replaying history doesn't wipe out the history it's replaying.
+        self._redo_stack = []
 
     def undo(self):
         if not self._undo_stack:
@@ -602,36 +737,96 @@ class TomoBoxer(QtWidgets.QMainWindow):
         elif action["type"] == "reassign":
             self._undo_reassign(action)
 
+    def redo(self):
+        if not self._redo_stack:
+            return
+        action = self._redo_stack.pop()
+        if action["type"] == "add":
+            self._redo_add(action)
+        elif action["type"] == "delete":
+            self._redo_delete(action)
+        elif action["type"] == "reassign":
+            self._redo_reassign(action)
+
     def _undo_add(self, action):
         idx = self._index_for_uid(action["uid"])
         if idx is None:
             return
+        box_copy = list(self.boxes[idx])
+        img = self.boxesimgs[idx] if idx < len(self.boxesimgs) else None
         self.del_box(idx, record_undo=False)
+        # Redoing an "add" is exactly "undoing a delete" of this one
+        # particle -- reuse that same (index, box, image) shape so
+        # _redo_add can just replay it with _undo_delete's own logic.
+        self._redo_stack.append({"type": "add", "uid": action["uid"], "removed": [(idx, box_copy, img)]})
+
+    def _redo_add(self, action):
+        self._reinsert_boxes(action["removed"])
+        self._undo_stack.append({"type": "add", "uid": action["uid"]})
 
     def _undo_delete(self, action):
-        for orig_index, box_copy, img in action["removed"]:
+        self._reinsert_boxes(action["removed"])
+        # Redo re-deletes the same particles, resolved by uid at redo time
+        # rather than by the original index, so it stays correct even if
+        # something else happens to shift positions in between.
+        self._redo_stack.append({"type": "delete", "uids": [box_copy[6] for _, box_copy, _ in action["removed"]]})
+
+    def _redo_delete(self, action):
+        idx = sorted(i for i in (self._index_for_uid(u) for u in action["uids"]) if i is not None)
+        if not idx:
+            return
+        removed = [(i, list(self.boxes[i]), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in idx]
+        self.del_box(idx, record_undo=False)
+        self._undo_stack.append({"type": "delete", "removed": removed})
+
+    def _reinsert_boxes(self, removed):
+        """Shared by _undo_delete and _redo_add: reinsert a (orig_index,
+        box_copy, img) list (ascending orig_index) back into self.boxes at
+        those same positions, and rebuild every shape from scratch, since
+        insertion shifts every later box's index."""
+        affected_classes = {box_copy[5] for _, box_copy, _ in removed}
+        for orig_index, box_copy, img in removed:
             idx = min(orig_index, len(self.boxes))
             self.boxes.insert(idx, list(box_copy))
             self.boxesimgs.insert(idx, img)
         for i in range(len(self.boxes)):
             self.update_box_shape(i, self.boxes[i])
         if self.initialized:
-            self.save_json()
-        self.update_all()
+            self.save_json(only=affected_classes)
+        self.update_all(reslice=False)
 
     def _undo_reassign(self, action):
-        for i, prev_class in action["changes"]:
+        uids = [self.boxes[i][6] for i, _ in action["changes"] if 0 <= i < len(self.boxes)]
+        self._apply_reassign(action["changes"])
+        self._redo_stack.append({"type": "reassign", "uids": uids, "new_class": action["new_class"]})
+
+    def _redo_reassign(self, action):
+        idx = [i for i in (self._index_for_uid(u) for u in action["uids"]) if i is not None]
+        changes = [(i, self.boxes[i][5]) for i in idx if self.boxes[i][5] != action["new_class"]]
+        if not changes:
+            return
+        self._apply_reassign(changes, target_id=action["new_class"])
+        self._undo_stack.append({"type": "reassign", "changes": changes, "new_class": action["new_class"]})
+
+    def _apply_reassign(self, changes, target_id=None):
+        """Shared by _undo_reassign and _redo_reassign: set each (index,
+        class) pair's box to target_id (undo instead restores each box to
+        its own recorded prior class, when target_id is None)."""
+        affected_classes = {prev for _, prev in changes}
+        for i, prev_class in changes:
             if 0 <= i < len(self.boxes):
-                self.boxes[i][5] = prev_class
+                self.boxes[i][5] = target_id if target_id is not None else prev_class
                 self.update_box_shape(i, self.boxes[i])
+        if target_id is not None:
+            affected_classes.add(target_id)
         if self.initialized:
-            self.save_json()
-        self.update_all()
+            self.save_json(only=affected_classes)
+        self.update_all(reslice=False, only_indices=[i for i, _ in changes])
 
     def update_box_shape(self, n, box):
         bs2 = self.get_boxsize(box[5]) // 2
         lw = 3 if n == self.curbox else 2
-        color = SETCOLORS[box[5] % len(SETCOLORS)].getRgbF()[:3]
+        color = categories.class_color(box[5]).getRgbF()[:3]
         if self.options.mode == "3D":
             self.xyview.add_shape(n, Shape("circle", color, [box[0], box[1], bs2], lw))
             self.xzview.add_shape(n, Shape("circle", color, [box[0], box[2], bs2], lw))
@@ -641,14 +836,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.xzview.add_shape(n, Shape("rect", color, [box[0] - bs2, box[2] - 1, box[0] + bs2, box[2] + 1], 2))
             self.zyview.add_shape(n, Shape("rect", color, [box[2] - 1, box[1] - bs2, box[2] + 1, box[1] + bs2], 2))
 
-    def update_box(self, n, quiet=False):
+    def update_box(self, n, quiet=False, axis=("x", "y", "z")):
         if n < 0 or n >= len(self.boxes):
             return
         box = self.boxes[n]
         self.update_box_shape(n, box)
 
         if self.initialized:
-            self.update_sliceview()
+            self.update_sliceview(axis)
 
         if not quiet:
             proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
@@ -660,9 +855,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
             if self.initialized:
                 self.save_json()
-
-        if self.initialized:
-            self.update_boximgs()
+                # The gallery thumbnail only needs refreshing when the
+                # particle's own snapshot image changes (just above), which
+                # only happens here in the non-quiet path -- doing this on
+                # every quiet in-drag update was rebuilding the entire
+                # thumbnail grid layout on every mouse-move tick for no
+                # visible benefit, which is what made dragging feel slow.
+                self.update_boximgs()
 
         self.curbox = n
 
@@ -676,16 +875,19 @@ class TomoBoxer(QtWidgets.QMainWindow):
         lci = self._index_for_uid(lc[0])
         if lci is None:
             return
-        # Quick-delete gesture in the particle list: Shift+click deletes
-        # this one particle, Shift+Ctrl+click deletes it and everything
-        # after it in the list. (Ctrl/Alt+click without Shift are used for
+        # Quick gestures in the particle list: Shift+click sends this one
+        # particle to the Recycle Bin, Shift+Ctrl+click sends it and
+        # everything after it in the list; Space+click sends it to
+        # Confirmed. (Ctrl/Alt+click without Shift/Space are used for
         # multi-select in the thumbnail grid itself, see
         # ParticleGrid.mousePressEvent.)
         if event.modifiers() & Qt.ShiftModifier:
             if event.modifiers() & Qt.ControlModifier:
-                self.del_box(list(range(lci, len(self.boxes))))
+                self.send_to_recycle_bin(list(range(lci, len(self.boxes))))
             else:
-                self.del_box(lci)
+                self.send_to_recycle_bin(lci)
+        elif space_key_state().held:
+            self.send_to_confirmed(lci)
         else:
             self.curbox = lci
             box = self.boxes[lci]
@@ -702,7 +904,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 continue
             if (x >= 0) * (b[0] - x) ** 2 + (y >= 0) * (b[1] - y) ** 2 + (z >= 0) * (b[2] - z) ** 2 < rad ** 2:
                 delids.append(i)
-        self.del_box(delids)
+        self.send_to_recycle_bin(delids)
 
     def scroll_to(self, x, y, z, axis=""):
         if axis != "z":
@@ -739,7 +941,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
         for i in range(len(self.boxes)):
             if self.inside_box(i, x, y, z):
                 if event.modifiers() & Qt.ShiftModifier:
-                    self.del_box(i)
+                    self.send_to_recycle_bin(i)
+                elif space_key_state().held:
+                    self.send_to_confirmed(i)
                 else:
                     self.dragging = i
                     self.curbox = i
@@ -776,27 +980,34 @@ class TomoBoxer(QtWidgets.QMainWindow):
             view.eraser_shape = None
 
     # -- dragging -----------------------------------------------------------
-    def mouse_drag(self, x, y, z):
+    def mouse_drag(self, x, y, z, skip_axis=None):
         if self.dragging < 0 or min(x, y, z) < 0:
             return
         self.x_loc, self.y_loc, self.z_loc = x, y, z
         self.boxes[self.dragging][:3] = [x, y, z]
-        self.update_box(self.dragging, True)
+        # Whichever view is being dragged in passes its own loc back
+        # unchanged (see the three callers below), so that view's own
+        # background slice can't have changed -- only its box overlay has.
+        # Re-slicing and repainting it anyway on every mouse-move tick
+        # while dragging is pure waste; the other two views' slice depths
+        # do follow the drag live and still need a full refresh.
+        axis = tuple(a for a in ("x", "y", "z") if a != skip_axis)
+        self.update_box(self.dragging, True, axis=axis)
 
     def xy_drag(self, event):
         if self.dragging >= 0:
             x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, y, self.z_loc)
+            self.mouse_drag(x, y, self.z_loc, skip_axis="z")
 
     def xz_drag(self, event):
         if self.dragging >= 0:
             x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, self.y_loc, z)
+            self.mouse_drag(x, self.y_loc, z, skip_axis="y")
 
     def zy_drag(self, event):
         if self.dragging >= 0:
             z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(self.x_loc, y, z)
+            self.mouse_drag(self.x_loc, y, z, skip_axis="x")
 
     def mouse_up(self, event):
         if self.dragging >= 0:
@@ -856,6 +1067,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def delete_set(self, name):
         name = parse_setname(name)
+        if name in categories.FIXED_CLASS_IDS:
+            return  # Recycle Bin / Confirmed are fixed and can't be deleted
         delids = [i for i, b in enumerate(self.boxes) if b[5] == int(name)]
         self.del_box(delids, record_undo=False)
         self.sets_visible.discard(name)
@@ -863,10 +1076,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxsize.pop(name, None)
         if classname is not None:
             metadata.delete_class_file(self.picksdir, classname)
-        self.update_all()
+        self.update_all(reslice=False, only_indices=[])
 
     def rename_set(self, oldname, newname):
         name = parse_setname(oldname)
+        if name in categories.FIXED_CLASS_IDS:
+            return  # Recycle Bin / Confirmed are fixed and can't be renamed
         if name in self.sets:
             metadata.rename_class_file(self.picksdir, self.sets[name], newname)
             self.sets[name] = newname
@@ -888,7 +1103,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
     # -- multi-selection actions (used by the Options window's Selection panel) --
     def delete_particles_by_uid(self, uids):
         idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
-        self.del_box(idx)
+        self.send_to_recycle_bin(idx)
+
+    def confirm_particles_by_uid(self, uids):
+        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        self.send_to_confirmed(idx)
 
     def move_particles_by_uid(self, uids, target_classname):
         """Reassign the given particles (by uid) to target_classname,
@@ -909,10 +1128,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.boxes[i][5] = target_id
             self.update_box_shape(i, self.boxes[i])
         self._push_undo({"type": "reassign", "changes": prev, "new_class": target_id})
-        self.sets_visible.add(target_id)
+        # new_set() above already makes a brand-new class visible; an
+        # existing target class that the user deliberately hid should stay
+        # hidden even as particles get moved into it.
+        affected_classes = {target_id} | {prev for _, prev in prev}
         if self.initialized:
-            self.save_picks()
-        self.update_all()
+            self.save_picks(only=affected_classes)
+        self.update_all(reslice=False, only_indices=idx)
 
     # -- keyboard -----------------------------------------------------------
     def key_press(self, event):
@@ -925,8 +1147,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     # -- persistence -----------------------------------------------------------
     # Backward-compatible alias, kept in case anything still calls save_json().
-    def save_json(self):
-        self.save_picks()
+    def save_json(self, only=None):
+        self.save_picks(only=only)
 
     def closeEvent(self, event):
         if self._closing:
@@ -983,8 +1205,11 @@ class SelectionPanel(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("No selection")
         vbl.addWidget(self.status_label)
 
-        self.delete_button = QtWidgets.QPushButton("Delete Selected")
+        self.delete_button = QtWidgets.QPushButton("Send to Recycle Bin")
         vbl.addWidget(self.delete_button)
+
+        self.confirm_button = QtWidgets.QPushButton("Send to Confirmed")
+        vbl.addWidget(self.confirm_button)
 
         moverow = QtWidgets.QHBoxLayout()
         self.class_combo = QtWidgets.QComboBox()
@@ -997,6 +1222,7 @@ class SelectionPanel(QtWidgets.QWidget):
         vbl.addStretch(1)
 
         self.delete_button.clicked.connect(self._delete)
+        self.confirm_button.clicked.connect(self._confirm)
         self.move_button.clicked.connect(self._move)
 
         self._set_active(False)
@@ -1019,10 +1245,21 @@ class SelectionPanel(QtWidgets.QWidget):
         if active:
             self.status_label.setText(f"{len(self._uids)} particle(s) selected")
             self.refresh_classes()
+        self._update_delete_label()
+
+    def _update_delete_label(self):
+        # Sending an already-recycled particle to the Recycle Bin again
+        # permanently deletes it (see TomoBoxer.send_to_recycle_bin) --
+        # reflect that on the button so it isn't a surprise.
+        target = self.target()
+        already_binned = bool(self._uids) and target is not None and all(
+            b[5] == categories.RECYCLE_BIN_ID for b in target.boxes if b[6] in self._uids)
+        self.delete_button.setText("Delete Permanently" if already_binned else "Send to Recycle Bin")
 
     def _set_active(self, active):
         self.status_label.setText(f"{len(self._uids)} particle(s) selected" if active else "No selection")
         self.delete_button.setEnabled(active)
+        self.confirm_button.setEnabled(active)
         self.move_button.setEnabled(active)
         self.class_combo.setEnabled(active)
 
@@ -1031,6 +1268,13 @@ class SelectionPanel(QtWidgets.QWidget):
         if target is None or not self._uids:
             return
         target.delete_particles_by_uid(self._uids)
+        self.set_selection([])
+
+    def _confirm(self):
+        target = self.target()
+        if target is None or not self._uids:
+            return
+        target.confirm_particles_by_uid(self._uids)
         self.set_selection([])
 
     def _move(self):
@@ -1093,12 +1337,15 @@ class TomoSetsPanel(QtWidgets.QWidget):
         vbl.addWidget(self.save_set_button)
         self.delete_set_button = QtWidgets.QPushButton("Delete")
         vbl.addWidget(self.delete_set_button)
+        self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
+        vbl.addWidget(self.empty_recycle_button)
         hbl.addLayout(vbl)
 
         self.save_set_button.clicked.connect(self.save_set)
         self.new_set_button.clicked.connect(self.new_set)
         self.rename_set_button.clicked.connect(self.rename_set)
         self.delete_set_button.clicked.connect(self.delete_set)
+        self.empty_recycle_button.clicked.connect(self.empty_recycle_bin)
         self.setlist.itemChanged.connect(self.set_list_item_changed)
         self.setlist.currentRowChanged.connect(self.set_list_row_changed)
 
@@ -1122,12 +1369,29 @@ class TomoSetsPanel(QtWidgets.QWidget):
         if not selections:
             return
         names = [i.text() for i in selections]
+        if parse_setname(names[0]) in categories.FIXED_CLASS_IDS:
+            QtWidgets.QMessageBox.information(
+                self, "Delete set", "Recycle Bin and Confirmed are fixed categories and can't be deleted.")
+            return
         cancel = QtWidgets.QMessageBox.question(
             self, "Delete set",
             f"Are you sure to delete {names[0]}? This will remove all particles in that class",
             QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
         if cancel == QtWidgets.QMessageBox.Yes:
             self.target().delete_set(names[0])
+            self.update_sets()
+
+    def empty_recycle_bin(self, unused=None):
+        target = self.target()
+        count = sum(1 for b in target.boxes if b[5] == categories.RECYCLE_BIN_ID)
+        if count == 0:
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Empty Recycle Bin",
+            f"Permanently delete {count} particle(s) in the Recycle Bin? (Undo-able with Ctrl+Z right after.)",
+            QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            target.empty_recycle_bin()
             self.update_sets()
 
     def new_set(self, unused=None):
@@ -1145,6 +1409,10 @@ class TomoSetsPanel(QtWidgets.QWidget):
         selections = self.setlist.selectedItems()
         if not selections:
             return
+        if parse_setname(selections[0].text()) in categories.FIXED_CLASS_IDS:
+            QtWidgets.QMessageBox.information(
+                self, "Rename set", "Recycle Bin and Confirmed are fixed categories and can't be renamed.")
+            return
         name, ok = QtWidgets.QInputDialog.getText(self, "Set Name", "Enter a name for the new set:")
         if not ok:
             return
@@ -1161,16 +1429,16 @@ class TomoSetsPanel(QtWidgets.QWidget):
 
     def update_sets(self):
         target = self.target()
-        keys = sorted(target.sets.keys())
+        keys = categories.category_order(target.sets)
         viskeys = set(target.sets_visible)
         self.setlist.blockSignals(True)
         self.setlist.clear()
 
-        for i, k in enumerate(keys):
+        for k in keys:
             kname = f"{int(k):02d} :: {target.sets[k]}"
             item = QtWidgets.QListWidgetItem(kname)
             item.setFlags(Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            item.setForeground(QtGui.QBrush(SETCOLORS[i % len(SETCOLORS)]))
+            item.setForeground(QtGui.QBrush(categories.class_color(k)))
             self.setlist.addItem(item)
             item.setCheckState(Qt.Checked if k in viskeys else Qt.Unchecked)
             if not self.initialized and k == target.currentset:
