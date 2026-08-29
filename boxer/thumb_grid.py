@@ -37,6 +37,28 @@ MAX_THUMB = 256
 SPACING = 4
 UID_ROLE = 0
 
+_label_style = None  # lazily-built (bg_brush, no_pen, text_brush, font) shared by every
+                      # particle's number-id label -- see _get_label_style()
+
+
+def _get_label_style():
+    """The pen/brushes/font used for every particle's number-id label are
+    identical every time -- build them once and share the same instances
+    (safe: QPen/QBrush/QFont are implicitly-shared value types that every
+    setter below copies from) instead of constructing fresh ones per
+    particle, which added up when populating a grid with many thousands of
+    thumbnails at once. Built lazily rather than at import time since these
+    need at least a QGuiApplication to exist."""
+    global _label_style
+    if _label_style is None:
+        bg_brush = QtGui.QBrush(QtGui.QColor(0, 0, 0, 160))
+        no_pen = QtGui.QPen(QtCore.Qt.NoPen)
+        text_brush = QtGui.QBrush(QtGui.QColor("white"))
+        font = QtGui.QFont()
+        font.setPointSize(8)
+        _label_style = (bg_brush, no_pen, text_brush, font)
+    return _label_style
+
 
 class ParticleGrid(QtWidgets.QGraphicsView):
     """Grid view: mx_image_selected(event, [uid]) is emitted on a plain
@@ -287,13 +309,12 @@ class ParticleGrid(QtWidgets.QGraphicsView):
 
     # -- particle number-id label -------------------------------------------
     def _add_label(self, uid):
-        bg = self._scene.addRect(0, 0, 0, 0, QtGui.QPen(QtCore.Qt.NoPen), QtGui.QBrush(QtGui.QColor(0, 0, 0, 160)))
+        bg_brush, no_pen, text_brush, font = _get_label_style()
+        bg = self._scene.addRect(0, 0, 0, 0, no_pen, bg_brush)
         bg.setZValue(6)
         bg.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         text = self._scene.addSimpleText(str(uid))
-        text.setBrush(QtGui.QBrush(QtGui.QColor("white")))
-        font = text.font()
-        font.setPointSize(8)
+        text.setBrush(text_brush)
         text.setFont(font)
         text.setZValue(7)
         text.setAcceptedMouseButtons(QtCore.Qt.NoButton)
@@ -582,6 +603,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._detached = {}        # classid -> DetachedGridWindow
         self._all_class_order = []  # classids, fixed categories first then alphabetical
         self._levels_state = None  # (lo, hi) currently applied, so a newly created grid gets it too
+        self._pending_entries = {}  # classid -> [(uid, img), ...] not yet applied to a
+                                     # not-currently-shown docked tab's grid (see sync_particles)
 
         btnrow = QtWidgets.QHBoxLayout()
         self.organize_button = QtWidgets.QPushButton("Organize Grid")
@@ -592,6 +615,16 @@ class ParticleListPanel(QtWidgets.QWidget):
 
         self.organize_button.clicked.connect(lambda: self._active_grid().reorganize())
         self.detach_button.clicked.connect(self._detach_current_tab)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, index):
+        widget = self.tabs.widget(index)
+        for classid, grid in self._class_grids.items():
+            if grid is widget:
+                pending = self._pending_entries.pop(classid, None)
+                if pending is not None:
+                    grid.sync_particles(pending)
+                break
 
     def _connect_grid(self, grid):
         grid.mx_image_selected.connect(self.mx_image_selected)
@@ -636,6 +669,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             if classid not in wanted:
                 grid = self._class_grids.pop(classid)
                 self._class_names.pop(classid, None)
+                self._pending_entries.pop(classid, None)
                 idx = self.tabs.indexOf(grid)
                 if idx >= 0:
                     self.tabs.removeTab(idx)
@@ -722,9 +756,29 @@ class ParticleListPanel(QtWidgets.QWidget):
         by_class = {}
         for uid, img, cid in entries:
             by_class.setdefault(cid, []).append((uid, img))
+        current_widget = self.tabs.currentWidget()
         for classid, grid in self._class_grids.items():
-            grid.sync_particles(by_class.get(classid, []))
+            class_entries = by_class.get(classid, [])
+            if grid is current_widget:
+                grid.sync_particles(class_entries)
+                self._pending_entries.pop(classid, None)
+            else:
+                # Not the tab on screen right now -- its thumbnails aren't
+                # visible either way, so defer the (potentially expensive,
+                # many-thumbnail) sync until it's actually switched to (see
+                # _on_tab_changed) instead of eagerly maintaining every
+                # class's full grid on every single particle change,
+                # including ones nobody is currently looking at. This is
+                # what made opening a tomogram with many pre-existing
+                # particles across several classes slow: it was building
+                # every tab's entire thumbnail grid up front, most of which
+                # wouldn't be looked at before the next edit rebuilt them
+                # all again anyway.
+                self._pending_entries[classid] = class_entries
         for classid, win in self._detached.items():
+            # Detached windows are independent, possibly-visible-right-now
+            # top-level windows, not tab pages Qt can tell us are hidden --
+            # always keep them eagerly in sync.
             win.grid.sync_particles(by_class.get(classid, []))
 
     def closeEvent(self, event):
