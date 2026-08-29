@@ -95,7 +95,8 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         for uid, img in self._images.items():
             item = self._items.get(uid)
             if item is not None:
-                item.setPixmap(self._make_pixmap(img))
+                item.setPixmap(self._render_pixmap(img))
+                self._apply_item_scale(uid)
 
     def selected_uids(self):
         return list(self._selected)
@@ -206,7 +207,8 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 self._next_slot += 1
         self._known_slot[uid] = slot
         self._slot_of_uid[uid] = slot
-        item = QtWidgets.QGraphicsPixmapItem(self._make_pixmap(img))
+        item = QtWidgets.QGraphicsPixmapItem(self._render_pixmap(img))
+        item.setTransformationMode(QtCore.Qt.SmoothTransformation)
         item.setData(UID_ROLE, uid)
         self._scene.addItem(item)
         self._items[uid] = item
@@ -234,11 +236,29 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._images[uid] = img
         item = self._items.get(uid)
         if item is not None:
-            item.setPixmap(self._make_pixmap(img))
+            item.setPixmap(self._render_pixmap(img))
+            self._apply_item_scale(uid)
 
-    def _make_pixmap(self, img):
-        pix = _thumbnail_pixmap(img, levels=self._levels)
-        return pix.scaled(self._thumb_size, self._thumb_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+    def _render_pixmap(self, img):
+        """The one place that actually touches pixel data: the contrast
+        stretch from the raw particle crop, at its native (box-size)
+        resolution -- no resize here. Zoom is a display-only concern (see
+        _apply_item_scale) so it never needs to re-run this."""
+        return _thumbnail_pixmap(img, levels=self._levels)
+
+    def _apply_item_scale(self, uid):
+        """Scale the item to the current thumbnail size via a transform
+        (with SmoothTransformation set on it in _add_item, the same
+        bilinear-quality resampling a manual .scaled() call would do) rather
+        than regenerating its pixmap -- this is what makes zoom cheap: it
+        no longer touches pixel data at all, just this one number."""
+        item = self._items.get(uid)
+        if item is None:
+            return
+        pix = item.pixmap()
+        native = max(pix.width(), pix.height())
+        if native > 0:
+            item.setScale(self._thumb_size / native)
 
     def _cols(self):
         w = max(self.viewport().width(), self._thumb_size + SPACING)
@@ -248,6 +268,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         item = self._items.get(uid)
         if item is None:
             return
+        self._apply_item_scale(uid)
         slot = self._slot_of_uid[uid]
         cols = self._cols()
         row, col = divmod(slot, cols)
@@ -375,15 +396,10 @@ class ParticleGrid(QtWidgets.QGraphicsView):
     # -- zoom (mouse wheel) -----------------------------------------------
     def zoom_in(self):
         self._thumb_size = min(MAX_THUMB, int(round(self._thumb_size * 1.15)))
-        self._rescale_all()
+        self._relayout_all()
 
     def zoom_out(self):
         self._thumb_size = max(MIN_THUMB, int(round(self._thumb_size / 1.15)))
-        self._rescale_all()
-
-    def _rescale_all(self):
-        for uid, img in self._images.items():
-            self._items[uid].setPixmap(self._make_pixmap(img))
         self._relayout_all()
 
     # -- events -------------------------------------------------------------

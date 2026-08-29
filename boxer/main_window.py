@@ -651,12 +651,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 if shp is None:
                     continue
                 if inplane and (b[5] in self.sets_visible):
-                    shp.kind = self.boxshape
                     shp.linewidth = 3 if self.curbox == i else 2
                     if self.options.mode == "3D":
                         shp.geom[2] = rad
+                    shp.kind = self.boxshape
                 else:
                     shp.kind = "hidden"
+                view.sync_shape(i)
 
             if reslice:
                 img = self.get_slice(loc, self.nlayers(), ax)
@@ -700,7 +701,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxes = [self.boxes[i] for i in kpids]
         self.boxesimgs = [self.boxesimgs[i] for i in kpids if i < len(self.boxesimgs)]
         for view in (self.xyview, self.xzview, self.zyview):
-            view.shapes = {i: view.shapes[k] for i, k in enumerate(kpids) if k in view.shapes}
+            view.remap_shape_keys(kpids)
         self.curbox = -1
         if self.initialized:
             self.save_json(only=affected_classes)
