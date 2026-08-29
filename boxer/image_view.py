@@ -35,6 +35,7 @@ class ImageView2D(QtWidgets.QWidget):
         self._qimage = QtGui.QImage(4, 4, QtGui.QImage.Format_Grayscale8)
         self._qimage.fill(0)
         self._levels = (0.0, 1.0)
+        self._manual_levels = None  # (lo, hi) override set via the contrast slider; None = autocontrast
         self._scale = 1.0
         self._origin = (0.0, 0.0)  # image coord shown at widget top-left
         self._center = None        # image coord to keep centered across resizes/zooms
@@ -52,7 +53,9 @@ class ImageView2D(QtWidgets.QWidget):
     # -- data -----------------------------------------------------------
     def set_data(self, img: np.ndarray, keepcontrast: bool = False):
         self._img = np.asarray(img, dtype=np.float32)
-        if not keepcontrast or self._levels is None:
+        if self._manual_levels is not None:
+            self._levels = self._manual_levels
+        elif not keepcontrast or self._levels is None:
             mean = float(self._img.mean())
             std = float(self._img.std())
             if std == 0:
@@ -62,6 +65,18 @@ class ImageView2D(QtWidgets.QWidget):
             self._levels = (lo, hi)
         self._rebuild_qimage()
         self.update()
+
+    def set_manual_levels(self, lo, hi):
+        """Set an explicit (lo, hi) display range, overriding autocontrast
+        until clear_manual_levels() is called -- used by the contrast
+        slider."""
+        self._manual_levels = (float(lo), float(hi))
+        self._levels = self._manual_levels
+        self._rebuild_qimage()
+        self.update()
+
+    def clear_manual_levels(self):
+        self._manual_levels = None
 
     def _rebuild_qimage(self):
         lo, hi = self._levels

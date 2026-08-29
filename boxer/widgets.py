@@ -1,9 +1,116 @@
 """Small labeled-value widgets, replacing EMAN2's ValBox/ValSlider for the
 handful of numeric controls e2spt_boxer.py uses (box size, eraser radius,
-layer thickness, lowpass filter strength)."""
+layer thickness)."""
 from __future__ import annotations
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
+
+
+class RangeSlider(QtWidgets.QWidget):
+    """A single horizontal slider with two draggable handles marking a
+    (low, high) sub-range of [minimum, maximum] -- used for the manual
+    contrast control, where the two handles are the black/white display
+    levels rather than two independent values."""
+
+    rangeChanged = QtCore.Signal(float, float)
+    HANDLE_RADIUS = 7
+
+    def __init__(self, minimum=0.0, maximum=1.0, low=0.0, high=1.0, parent=None):
+        super().__init__(parent)
+        self._min = float(minimum)
+        self._max = float(maximum)
+        self._low = float(low)
+        self._high = float(high)
+        self._dragging = None  # "low" | "high" | None
+        self.setMinimumHeight(20)
+        self.setMinimumWidth(80)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def set_bounds(self, minimum, maximum):
+        self._min, self._max = float(minimum), float(maximum)
+        self._low = max(self._min, min(self._low, self._max))
+        self._high = max(self._min, min(self._high, self._max))
+        self.update()
+
+    def set_values(self, low, high, emit=True):
+        self._low = max(self._min, min(float(low), self._max))
+        self._high = max(self._min, min(float(high), self._max))
+        if self._low > self._high:
+            self._low, self._high = self._high, self._low
+        self.update()
+        if emit:
+            self.rangeChanged.emit(self._low, self._high)
+
+    def values(self):
+        return self._low, self._high
+
+    def _value_to_x(self, value):
+        w = max(1, self.width() - 2 * self.HANDLE_RADIUS)
+        span = self._max - self._min
+        frac = 0.0 if span <= 0 else (value - self._min) / span
+        return self.HANDLE_RADIUS + frac * w
+
+    def _x_to_value(self, x):
+        w = max(1, self.width() - 2 * self.HANDLE_RADIUS)
+        frac = max(0.0, min(1.0, (x - self.HANDLE_RADIUS) / w))
+        return self._min + frac * (self._max - self._min)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        mid_y = self.height() // 2
+
+        pen = QtGui.QPen(QtGui.QColor(140, 140, 140))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        painter.drawLine(self.HANDLE_RADIUS, mid_y, self.width() - self.HANDLE_RADIUS, mid_y)
+
+        lo_x, hi_x = self._value_to_x(self._low), self._value_to_x(self._high)
+        pen.setColor(QtGui.QColor(90, 160, 250))
+        painter.setPen(pen)
+        painter.drawLine(int(lo_x), mid_y, int(hi_x), mid_y)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor(60, 60, 60)))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(235, 235, 235)))
+        for x in (lo_x, hi_x):
+            painter.drawEllipse(QtCore.QPointF(x, mid_y), self.HANDLE_RADIUS, self.HANDLE_RADIUS)
+
+    def mousePressEvent(self, event):
+        if event.button() != QtCore.Qt.LeftButton:
+            return
+        x = event.position().x()
+        lo_x, hi_x = self._value_to_x(self._low), self._value_to_x(self._high)
+        self._dragging = "low" if abs(x - lo_x) <= abs(x - hi_x) else "high"
+        self._drag_to(x)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            self._drag_to(event.position().x())
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        # The handle itself tracks the cursor live (via _drag_to's repaint)
+        # for smooth visual feedback, but rangeChanged -- which drives the
+        # actual (expensive: re-slicing 3 views plus every gallery
+        # thumbnail) contrast update -- only fires once, here, on release.
+        # Applying it on every mouse-move made dragging feel laggy.
+        was_dragging = self._dragging is not None
+        self._dragging = None
+        if was_dragging:
+            self.rangeChanged.emit(self._low, self._high)
+
+    def _drag_to(self, x):
+        value = self._x_to_value(x)
+        if self._dragging == "low":
+            self._low = min(value, self._high)
+        else:
+            self._high = max(value, self._low)
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update()
 
 
 class _SpaceKeyState(QtCore.QObject):
@@ -61,7 +168,12 @@ def space_key_state() -> _SpaceKeyState:
 
 class LabeledSpinBox(QtWidgets.QWidget):
     """Label + integer spin box. Drop-in equivalent of ValBox for the
-    integer-valued controls used here (box size, eraser radius)."""
+    integer-valued controls used here (box size, eraser radius).
+
+    Keyboard tracking is off: typing a new value (e.g. box size, which can
+    trigger rewriting every particle's shape/thumbnail) doesn't apply on
+    every keystroke, only once you press Enter, click elsewhere, or use the
+    up/down arrows/spin buttons."""
 
     valueChanged = QtCore.Signal(object)
 
@@ -73,6 +185,7 @@ class LabeledSpinBox(QtWidgets.QWidget):
             lbl = QtWidgets.QLabel(label)
             layout.addWidget(lbl)
         self.spin = QtWidgets.QSpinBox()
+        self.spin.setKeyboardTracking(False)
         self.spin.setRange(minimum, maximum)
         self.spin.setValue(int(value))
         layout.addWidget(self.spin)
@@ -84,53 +197,4 @@ class LabeledSpinBox(QtWidgets.QWidget):
     def setValue(self, value):
         self.spin.blockSignals(True)
         self.spin.setValue(int(value))
-        self.spin.blockSignals(False)
-
-
-class LabeledSlider(QtWidgets.QWidget):
-    """Label + slider + spin box. Drop-in equivalent of ValSlider for the
-    "Filt" lowpass control."""
-
-    valueChanged = QtCore.Signal(object)
-
-    def __init__(self, rng=(0, 150), label="", value=0, parent=None):
-        super().__init__(parent)
-        self._lo, self._hi = rng
-        layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        if label:
-            layout.addWidget(QtWidgets.QLabel(label))
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider.setRange(int(self._lo), int(self._hi))
-        self.slider.setValue(int(value))
-        self.spin = QtWidgets.QSpinBox()
-        self.spin.setRange(int(self._lo), int(self._hi))
-        self.spin.setValue(int(value))
-        layout.addWidget(self.slider)
-        layout.addWidget(self.spin)
-
-        self.slider.valueChanged.connect(self._on_slider)
-        self.spin.valueChanged.connect(self._on_spin)
-
-    def _on_slider(self, v):
-        self.spin.blockSignals(True)
-        self.spin.setValue(v)
-        self.spin.blockSignals(False)
-        self.valueChanged.emit(v)
-
-    def _on_spin(self, v):
-        self.slider.blockSignals(True)
-        self.slider.setValue(v)
-        self.slider.blockSignals(False)
-        self.valueChanged.emit(v)
-
-    def getValue(self):
-        return self.slider.value()
-
-    def setValue(self, value):
-        self.slider.blockSignals(True)
-        self.spin.blockSignals(True)
-        self.slider.setValue(int(value))
-        self.spin.setValue(int(value))
-        self.slider.blockSignals(False)
         self.spin.blockSignals(False)

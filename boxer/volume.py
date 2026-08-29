@@ -1,7 +1,7 @@
 """Lightweight, dependency-free replacement for EMAN2's EMData for tomogram
 volumes, providing only the subset of functionality that the tomogram boxer
 needs: MRC I/O, centered sub-volume extraction (with zero-padding), thin-slab
-axis-aligned projections, normalization, and a simple Gaussian lowpass filter.
+axis-aligned projections, and normalization.
 
 Internally the volume is stored as a numpy array shaped (nz, ny, nx), matching
 the on-disk convention used by mrcfile. ``nx``/``ny``/``nz`` properties are
@@ -91,19 +91,6 @@ class Volume:
             return self.data[:, :, lo_c:hi_c].mean(axis=2).T
         else:
             raise ValueError(f"unknown axis {axis!r}")
-
-    def lowpass(self, cutoff_freq: float) -> "Volume":
-        """Simple FFT-domain Gaussian lowpass filter (cutoff_freq in
-        cycles/pixel), analogous to EMAN2's filter.lowpass.gauss."""
-        if cutoff_freq <= 0:
-            return self
-        shape = self.data.shape
-        freqs = [np.fft.fftfreq(n) for n in shape]
-        gz, gy, gx = np.meshgrid(*freqs, indexing="ij")
-        r2 = gz ** 2 + gy ** 2 + gx ** 2
-        mask = np.exp(-r2 / (2.0 * cutoff_freq ** 2))
-        filtered = np.fft.ifftn(np.fft.fftn(self.data) * mask).real.astype(np.float32)
-        return Volume(filtered, self.apix)
 
 
 def normalize(img: np.ndarray) -> np.ndarray:

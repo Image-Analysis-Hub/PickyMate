@@ -6,10 +6,9 @@ outside the EMAN2 environment, built on plain PySide6 + numpy + mrcfile.
 Feature-complete for v1: orthogonal XY/XZ/ZY slice viewing, 2D or 3D particle
 picking with mouse (move/drag/shift-delete), an eraser tool, multiple
 picking "sets" (classes) with visibility toggles, per-class box size, slab
-thickness averaging, a lowpass filter preview, saving/loading picks to a JSON
-sidecar next to the tomogram, saving picks as a plain text coordinate file,
-and saving extracted particles as an MRC stack (2D) or a folder of MRC
-volumes (3D).
+thickness averaging, saving/loading picks to a JSON sidecar next to the
+tomogram, saving picks as a plain text coordinate file, and saving
+extracted particles as an MRC stack (2D) or a folder of MRC volumes (3D).
 
 Deferred to a later pass (noted in the code where relevant): PCA-based
 tomogram "flatten" re-orientation, GIF export, and window-geometry
@@ -26,7 +25,7 @@ from PySide6.QtCore import Qt
 
 from .image_view import ImageView2D
 from .thumb_grid import ParticleListPanel
-from .widgets import LabeledSpinBox, LabeledSlider, space_key_state
+from .widgets import LabeledSpinBox, RangeSlider, space_key_state
 from . import categories
 from . import metadata
 from .metadata import base_name
@@ -113,22 +112,22 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wbautoc.setChecked(True)
         gbl3.addWidget(self.wbautoc)
 
+        self.wcontrast = RangeSlider(minimum=0.0, maximum=1.0, low=0.0, high=1.0)
+        self.gbl2.addWidget(self.wcontrast, 1, 0, 1, 2)
+
         self.wboxsize = LabeledSpinBox(label="Box Size:", value=0, minimum=1, maximum=8192)
-        self.gbl2.addWidget(self.wboxsize, 1, 0)
+        self.gbl2.addWidget(self.wboxsize, 2, 0)
+
+        self.wboxsize_allsets = QtWidgets.QCheckBox("Apply to All Sets")
+        self.wboxsize_allsets.setChecked(True)
+        self.gbl2.addWidget(self.wboxsize_allsets, 2, 1)
 
         label0 = QtWidgets.QLabel("Thickness")
-        self.gbl2.addWidget(label0, 2, 0)
+        self.gbl2.addWidget(label0, 3, 0)
         self.wnlayers = QtWidgets.QSpinBox()
         self.wnlayers.setRange(1, 256)
         self.wnlayers.setValue(1)
-        self.gbl2.addWidget(self.wnlayers, 2, 1)
-
-        self.wlocalbox = QtWidgets.QCheckBox("Limit Side Boxes")
-        self.wlocalbox.setChecked(True)
-        self.gbl2.addWidget(self.wlocalbox, 3, 0)
-
-        self.wfilt = LabeledSlider(rng=(0, 150), label="Filt", value=0)
-        self.gbl2.addWidget(self.wfilt, 4, 0, 1, 2)
+        self.gbl2.addWidget(self.wnlayers, 3, 1)
 
         self.curbox = -1
         self.boxes = []       # [x, y, z, method, score, class_id, uid]
@@ -146,8 +145,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wdepth.valueChanged[int].connect(self.event_depth)
         self.wnlayers.valueChanged[int].connect(self.event_nlayers)
         self.wboxsize.valueChanged.connect(self.event_boxsize)
-        self.wfilt.valueChanged.connect(self.event_filter)
-        self.wlocalbox.stateChanged[int].connect(self.event_localbox)
+        self.wboxsize_allsets.toggled.connect(self.event_boxsize_allsets_toggled)
+        self.wbautoc.toggled.connect(self.event_autocontrast)
+        self.wcontrast.rangeChanged.connect(self.event_contrast_slider)
 
         self.xyview.mousemove.connect(self.xy_move)
         self.xyview.mousedown.connect(self.xy_down)
@@ -212,7 +212,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if options.apix:
             data.apix = options.apix
         self.data = None
-        self.datalp = None
         self.set_data(data)
 
         # Per-class plain-text pick files live in "<basename>_picks/".
@@ -232,6 +231,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.boxesviewer.mx_image_selected.connect(self.img_selected)
         self.boxesviewer.selection_changed.connect(self.selectionpanel.set_selection)
+        self.boxesviewer.selection_changed.connect(self.set_selected_uids)
 
         self._arrange_windows()
 
@@ -289,7 +289,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         if options.clean:
             self.optionviewer.erasercheckbox.setChecked(True)
-            self.wlocalbox.setChecked(False)
 
         for i in range(len(self.boxes)):
             self.update_box(i)
@@ -352,7 +351,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
     # -- data / geometry -----------------------------------------------------------
     def set_data(self, data: Volume):
         self.data = data
-        self.datalp = data
         self.apix = data.apix
         self.datasize = (data.nx, data.ny, data.nz)
         self.x_loc, self.y_loc, self.z_loc = data.nx // 2, data.ny // 2, data.nz // 2
@@ -364,9 +362,27 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._next_uid = 0
         self._undo_stack = []
         self._redo_stack = []
+        self._selected_uids = set()
+
+        self._init_contrast_slider(data)
 
         if self.initialized:
             self.update_all()
+
+    def _init_contrast_slider(self, data: Volume):
+        """Set the contrast slider's range and default handle positions
+        from the volume's overall intensity distribution, so it starts
+        somewhere sensible instead of at (0, 1). A full-volume mean/std is
+        too slow for a real tomogram (multiple seconds), so this samples
+        every 4th voxel along each axis instead -- close enough for a
+        contrast range and orders of magnitude faster."""
+        sample = data.data[::4, ::4, ::4]
+        mean, std = float(sample.mean()), float(sample.std())
+        if std == 0:
+            std = 1.0
+        self._contrast_defaults = (mean - 3 * std, mean + 3 * std)
+        self.wcontrast.set_bounds(mean - 6 * std, mean + 6 * std)
+        self.wcontrast.set_values(*self._contrast_defaults, emit=False)
 
     def eraser_width(self):
         return int(self.optionviewer.eraser_radius.getValue())
@@ -377,17 +393,39 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return self.data.get_clip_centered(x, y, z, bs, bs, bz)
 
     def get_slice(self, idx, thk=1, axis="z"):
-        data = self.datalp if self.wfilt.getValue() != 0.0 else self.data
-        return data.slab_projection(axis, idx, int(thk - 1))
+        return self.data.slab_projection(axis, idx, int(thk - 1))
 
-    # -- box size / thickness / filter events -----------------------------------
+    # -- box size / thickness events -----------------------------------
     def event_boxsize(self):
-        if self.get_boxsize() == int(self.wboxsize.getValue()):
+        new_size = int(self.wboxsize.getValue())
+        if self.wboxsize_allsets.isChecked():
+            self.apply_boxsize_to_all_sets(new_size)
+        else:
+            if self.get_boxsize() == new_size:
+                return
+            self.boxsize[self.currentset] = new_size
+            self._resize_boxes(lambda b: b[5] == self.currentset)
+
+    def event_boxsize_allsets_toggled(self, checked):
+        # Checking the box is itself an action ("make everything match the
+        # currently displayed size"), not just a mode switch for the next
+        # edit -- otherwise checking it while the number happens to already
+        # equal the current set's size silently did nothing.
+        if checked:
+            self.apply_boxsize_to_all_sets(int(self.wboxsize.getValue()))
+
+    def apply_boxsize_to_all_sets(self, new_size):
+        changed_classes = {cid for cid in self.sets if self.boxsize.get(cid) != new_size}
+        if not changed_classes:
             return
-        self.boxsize[self.currentset] = int(self.wboxsize.getValue())
+        for cid in changed_classes:
+            self.boxsize[cid] = new_size
+        self._resize_boxes(lambda b: b[5] in changed_classes)
+
+    def _resize_boxes(self, affects):
         self.initialized = False
         for i in range(len(self.boxes)):
-            if self.boxes[i][5] == self.currentset:
+            if affects(self.boxes[i]):
                 self.update_box(i)
         self.initialized = True
         self.update_all()
@@ -408,20 +446,40 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def event_nlayers(self):
         self.update_all()
 
-    def event_filter(self):
-        if self.wfilt.getValue() != 0.0:
-            print("Filtering tomogram...")
-            self.datalp = self.data.lowpass(1.0 / self.wfilt.getValue())
+    # -- contrast -----------------------------------------------------------
+    def event_autocontrast(self, checked):
+        if checked:
+            for v in (self.xyview, self.xzview, self.zyview):
+                v.clear_manual_levels()
+            self.boxesviewer.clear_levels()
+            self.wcontrast.set_values(*self._contrast_defaults, emit=False)
+            self.update_all()
         else:
-            self.datalp = self.data
-        self.update_all()
+            self._apply_manual_contrast(*self.wcontrast.values())
 
-    def event_localbox(self, tog):
-        self.update_sliceview()
+    def event_contrast_slider(self, lo, hi):
+        if self.wbautoc.isChecked():
+            # Dragging the slider is a deliberate manual override -- switch
+            # off AutoContrast, which (via event_autocontrast above) reads
+            # the slider's own just-updated values and applies them.
+            self.wbautoc.setChecked(False)
+        else:
+            self._apply_manual_contrast(lo, hi)
 
-    def get_boxsize(self, clsid=-1):
-        if clsid < 0:
-            return int(self.boxsize[self.currentset])
+    def _apply_manual_contrast(self, lo, hi):
+        for v in (self.xyview, self.xzview, self.zyview):
+            v.set_manual_levels(lo, hi)
+        self.boxesviewer.set_levels(lo, hi)
+
+    def get_boxsize(self, clsid=None):
+        # clsid=None means "the current set". -1 used to double as that
+        # sentinel, but Recycle Bin/Confirmed are real classids that are
+        # themselves negative (see categories.py), so a caller asking for
+        # one of those got back whatever the *currently selected* set's box
+        # size was instead of its own -- every particle sitting in Recycle
+        # Bin/Confirmed would visibly resize as you switched sets.
+        if clsid is None:
+            clsid = self.currentset
         try:
             return int(self.boxsize[clsid])
         except KeyError:
@@ -560,7 +618,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         whenever the viewing cursor, visible-set membership generally, or
         box sizes could have changed for boxes other than a known few."""
         boxes = self.boxes
-        allside = not self.wlocalbox.isChecked()
 
         pms = {
             "z": (2, self.xyview, self.z_loc),
@@ -586,10 +643,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 dst = abs(b[ia] - loc)
                 inplane = dst < bs // 2
                 rad = bs // 2 - dst
-
-                if allside:
-                    inplane = True
-                    rad = bs // 2
 
                 if ax == "z" and self.options.mode == "2D":
                     inplane = dst < 1
@@ -826,7 +879,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def update_box_shape(self, n, box):
         bs2 = self.get_boxsize(box[5]) // 2
         lw = 3 if n == self.curbox else 2
-        color = categories.class_color(box[5]).getRgbF()[:3]
+        # Gallery selection (yellow, same as the gallery's own highlight)
+        # takes priority over the class color -- but only for a particle
+        # actually selected in the list, never just because it's the one
+        # currently being picked/dragged (curbox/dragging never touch
+        # _selected_uids).
+        if box[6] in self._selected_uids:
+            color = categories.SELECTED_COLOR.getRgbF()[:3]
+        else:
+            color = categories.class_color(box[5]).getRgbF()[:3]
         if self.options.mode == "3D":
             self.xyview.add_shape(n, Shape("circle", color, [box[0], box[1], bs2], lw))
             self.xzview.add_shape(n, Shape("circle", color, [box[0], box[2], bs2], lw))
@@ -835,6 +896,20 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.xyview.add_shape(n, Shape("rect", color, [box[0] - bs2, box[1] - bs2, box[0] + bs2, box[1] + bs2], 2))
             self.xzview.add_shape(n, Shape("rect", color, [box[0] - bs2, box[2] - 1, box[0] + bs2, box[2] + 1], 2))
             self.zyview.add_shape(n, Shape("rect", color, [box[2] - 1, box[1] - bs2, box[2] + 1, box[1] + bs2], 2))
+
+    def set_selected_uids(self, uids):
+        """Mirror the gallery's multi-selection as a yellow outline on the
+        same particles in the tomogram views. Only the particles whose
+        selection state actually changed need their shape rebuilt."""
+        new_selected = set(uids or [])
+        changed_uids = self._selected_uids ^ new_selected
+        self._selected_uids = new_selected
+        if not changed_uids:
+            return
+        changed_indices = [i for i, b in enumerate(self.boxes) if b[6] in changed_uids]
+        for i in changed_indices:
+            self.update_box_shape(i, self.boxes[i])
+        self.update_all(reslice=False, only_indices=changed_indices)
 
     def update_box(self, n, quiet=False, axis=("x", "y", "z")):
         if n < 0 or n >= len(self.boxes):
@@ -847,7 +922,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         if not quiet:
             proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
-            proj = normalize(proj[0])
+            # Keep raw intensities here (not normalize()'d) -- the gallery
+            # thumbnail is rendered with the exact same contrast code and
+            # levels as the tomogram views (see thumb_grid._thumbnail_pixmap
+            # and ParticleGrid.set_levels), so it needs to be on the same
+            # intensity scale as them to actually look like a matching crop.
+            # Unrelated to save_boxes()'s own normalize() call below, which
+            # is about the exported particle stack's data format, not
+            # on-screen display.
+            proj = proj[0]
 
             for _ in range(len(self.boxesimgs), n + 1):
                 self.boxesimgs.append(None)
@@ -931,11 +1014,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if min(x, y, z) < 0:
             return
         if self.optionviewer.erasercheckbox.isChecked():
-            side = self.wlocalbox.isChecked()
-            xyz = {"x": x, "y": y, "z": z}
-            if not side:
-                xyz[axis] = -1
-            self.del_region_xy(xyz["x"], xyz["y"], xyz["z"], -1)
+            self.del_region_xy(x, y, z, -1)
             return
 
         for i in range(len(self.boxes)):
@@ -1078,6 +1157,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
             metadata.delete_class_file(self.picksdir, classname)
         self.update_all(reslice=False, only_indices=[])
 
+    def toggle_colors(self):
+        """Rotate every normal class to the next color in the remaining
+        (non-reserved) palette at once, napari-style. Recycle Bin/Confirmed
+        and the selection highlight are fixed and unaffected."""
+        categories.cycle_colors()
+        for i in range(len(self.boxes)):
+            self.update_box_shape(i, self.boxes[i])
+        self.setspanel.update_sets()
+        self.update_all(reslice=False)
+
     def rename_set(self, oldname, newname):
         name = parse_setname(oldname)
         if name in categories.FIXED_CLASS_IDS:
@@ -1094,7 +1183,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
             i += 1
         self.sets[i] = name
         self.sets_visible.add(i)
-        self.boxsize[i] = metadata.DEFAULT_BOXSIZE
+        # With "Apply to All Sets" on, every set is kept at the same box
+        # size, so a brand-new one should join at that size too rather than
+        # reverting to the generic default and breaking that invariant.
+        # (hasattr guard: new_set() can be called during __init__'s initial
+        # bootstrap, before self.currentset exists yet.)
+        if self.wboxsize_allsets.isChecked() and hasattr(self, "currentset"):
+            self.boxsize[i] = self.get_boxsize()
+        else:
+            self.boxsize[i] = metadata.DEFAULT_BOXSIZE
         return i
 
     def save_set(self):
@@ -1339,6 +1436,8 @@ class TomoSetsPanel(QtWidgets.QWidget):
         vbl.addWidget(self.delete_set_button)
         self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
         vbl.addWidget(self.empty_recycle_button)
+        self.toggle_colors_button = QtWidgets.QPushButton("Toggle Colors")
+        vbl.addWidget(self.toggle_colors_button)
         hbl.addLayout(vbl)
 
         self.save_set_button.clicked.connect(self.save_set)
@@ -1346,8 +1445,15 @@ class TomoSetsPanel(QtWidgets.QWidget):
         self.rename_set_button.clicked.connect(self.rename_set)
         self.delete_set_button.clicked.connect(self.delete_set)
         self.empty_recycle_button.clicked.connect(self.empty_recycle_bin)
+        self.toggle_colors_button.clicked.connect(self.toggle_colors)
         self.setlist.itemChanged.connect(self.set_list_item_changed)
         self.setlist.currentRowChanged.connect(self.set_list_row_changed)
+
+    def toggle_colors(self):
+        target = self.target()
+        if target is None:
+            return
+        target.toggle_colors()  # this also refreshes update_sets() for us
 
     def set_list_row_changed(self, i):
         if not self.initialized:

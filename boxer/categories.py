@@ -18,18 +18,32 @@ CONFIRMED_NAME = "Confirmed"
 FIXED_CLASS_IDS = (RECYCLE_BIN_ID, CONFIRMED_ID)
 FIXED_CLASS_NAMES = {RECYCLE_BIN_NAME: RECYCLE_BIN_ID, CONFIRMED_NAME: CONFIRMED_ID}
 
+# Red/green/yellow are reserved for Recycle Bin/Confirmed/selection (see
+# below) and deliberately excluded here so a normal class's color can never
+# be confused with one of those three meanings.
 SETCOLORS = [
-    QtGui.QColor("blue"), QtGui.QColor("green"), QtGui.QColor("red"),
-    QtGui.QColor("cyan"), QtGui.QColor("purple"), QtGui.QColor("orange"),
-    QtGui.QColor("yellow"), QtGui.QColor("hotpink"), QtGui.QColor("gold"),
+    QtGui.QColor("blue"), QtGui.QColor("cyan"), QtGui.QColor("purple"),
+    QtGui.QColor("orange"), QtGui.QColor("hotpink"), QtGui.QColor("gold"),
+    QtGui.QColor("turquoise"), QtGui.QColor("chocolate"), QtGui.QColor("slateblue"),
 ]
 _FIXED_COLORS = {RECYCLE_BIN_ID: QtGui.QColor("crimson"), CONFIRMED_ID: QtGui.QColor("limegreen")}
+SELECTED_COLOR = QtGui.QColor("yellow")
+
+# A global rotation offset into SETCOLORS, advanced by cycle_colors() (the
+# "Toggle Colors" button) so every normal class shifts to the next color at
+# once, napari-style -- in-memory only, resets each session.
+_color_offset = 0
 
 
 def class_color(classid: int) -> QtGui.QColor:
     if classid in _FIXED_COLORS:
         return _FIXED_COLORS[classid]
-    return SETCOLORS[classid % len(SETCOLORS)]
+    return SETCOLORS[(classid + _color_offset) % len(SETCOLORS)]
+
+
+def cycle_colors() -> None:
+    global _color_offset
+    _color_offset = (_color_offset + 1) % len(SETCOLORS)
 
 
 def category_order(sets: dict) -> list:

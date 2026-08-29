@@ -72,11 +72,30 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._border_colors = {}  # uid -> QColor
         self._pending_restore = []  # uids re-added this sync that were previously removed
         self._pan_last = None    # last screen pos while right-button panning
+        self._levels = None      # (lo, hi) contrast override; None = per-thumbnail autocontrast
 
         self._update_scene_rect()
 
     def set_mouse_mode(self, mode):
         self._mouse_mode = mode
+
+    def set_levels(self, lo, hi):
+        """Apply an explicit (lo, hi) contrast range to every thumbnail
+        here, overriding the default per-thumbnail mean/std autocontrast --
+        mirrors ImageView2D.set_manual_levels so the main window's contrast
+        slider affects the gallery identically."""
+        self._levels = (float(lo), float(hi))
+        self._refresh_all_pixmaps()
+
+    def clear_levels(self):
+        self._levels = None
+        self._refresh_all_pixmaps()
+
+    def _refresh_all_pixmaps(self):
+        for uid, img in self._images.items():
+            item = self._items.get(uid)
+            if item is not None:
+                item.setPixmap(self._make_pixmap(img))
 
     def selected_uids(self):
         return list(self._selected)
@@ -218,7 +237,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             item.setPixmap(self._make_pixmap(img))
 
     def _make_pixmap(self, img):
-        pix = _thumbnail_pixmap(img)
+        pix = _thumbnail_pixmap(img, levels=self._levels)
         return pix.scaled(self._thumb_size, self._thumb_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
 
     def _cols(self):
@@ -471,10 +490,16 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._set_selection(uids)
 
 
-def _thumbnail_pixmap(img: np.ndarray) -> QtGui.QPixmap:
+def _thumbnail_pixmap(img: np.ndarray, levels=None) -> QtGui.QPixmap:
+    """levels, when given, is an explicit (lo, hi) display range (the
+    contrast slider) used instead of this thumbnail's own mean/std -- so
+    manual contrast applies identically here and in the tomogram views."""
     img = np.asarray(img, dtype=np.float32)
-    mean, std = float(img.mean()), float(img.std())
-    lo, hi = (mean - 3 * std, mean + 3 * std) if std else (mean - 1, mean + 1)
+    if levels is not None:
+        lo, hi = levels
+    else:
+        mean, std = float(img.mean()), float(img.std())
+        lo, hi = (mean - 3 * std, mean + 3 * std) if std else (mean - 1, mean + 1)
     if hi <= lo:
         hi = lo + 1
     buf = np.clip((img - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
@@ -540,6 +565,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._class_names = {}     # classid -> name currently shown
         self._detached = {}        # classid -> DetachedGridWindow
         self._all_class_order = []  # classids, fixed categories first then alphabetical
+        self._levels_state = None  # (lo, hi) currently applied, so a newly created grid gets it too
 
         btnrow = QtWidgets.QHBoxLayout()
         self.organize_button = QtWidgets.QPushButton("Organize Grid")
@@ -563,6 +589,22 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.grid.set_mouse_mode(mode)
         for g in self._class_grids.values():
             g.set_mouse_mode(mode)
+
+    def _all_grids(self):
+        yield self.grid
+        yield from self._class_grids.values()
+        for win in self._detached.values():
+            yield win.grid
+
+    def set_levels(self, lo, hi):
+        self._levels_state = (lo, hi)
+        for g in self._all_grids():
+            g.set_levels(lo, hi)
+
+    def clear_levels(self):
+        self._levels_state = None
+        for g in self._all_grids():
+            g.clear_levels()
 
     # -- tabs / classes -----------------------------------------------------
     def rebuild_tabs(self, sets: dict):
@@ -604,6 +646,8 @@ class ParticleListPanel(QtWidgets.QWidget):
                 continue
             grid = ParticleGrid()
             self._connect_grid(grid)
+            if self._levels_state is not None:
+                grid.set_levels(*self._levels_state)
             self._class_grids[classid] = grid
             self._class_names[classid] = name
             self.tabs.addTab(grid, name)
