@@ -18,7 +18,8 @@ from PySide6 import QtWidgets
 _SHORTCUTS = [
     ("Add particle", "Click empty space (tomogram view)"),
     ("Move particle", "Click + drag (tomogram view)"),
-    ("Switch active picking class", "1-9"),
+    ("Switch active picking class + gallery tab", "1-9"),
+    ("Reorder a set's tab", "Drag it in the gallery"),
     ("Pan", "Right-click + drag (tomogram view or gallery)"),
     ("Zoom", "Mouse wheel"),
     ("Step depth/slice", "Shift + wheel (tomogram view)"),
@@ -32,6 +33,7 @@ _SHORTCUTS = [
     ("Finish freeform selection", "Double-click, Enter, or click near the start point"),
     ("Undo last freeform point", "Backspace (while placing points)"),
     ("Cancel freeform selection", "Escape"),
+    ("Clear the current selection (anywhere in the app)", "Escape"),
     ("New set", "Click the gallery's \"+\" tab"),
     ("Rename set", "Double-click its tab"),
     ("Undo", "Ctrl+Z"),
@@ -52,9 +54,10 @@ _NOTES = [
     "permanently (undoable).",
     "A particle selected in the gallery is outlined yellow in the tomogram "
     "views too -- only for selection, never while picking or dragging.",
-    "The Edit toolbar's Confirm/Recycle/Move Selected act on whatever's "
-    "currently selected, from either window; a label at the bottom-right of "
-    "the tomogram window shows how many particles are selected.",
+    "The Selection toolbar's Confirm/Recycle/Move Selected act on "
+    "whatever's currently selected, from either window, and clear the "
+    "selection afterward; a label at the bottom-right of the tomogram "
+    "window shows how many particles are selected.",
     "The shared 2D/3D checkbox (Tools toolbar) applies to whichever of "
     "Eraser/Select is active: 2D only affects particles visible on the "
     "current slice; 3D drops that limit -- Eraser becomes a full sphere of "
@@ -67,6 +70,23 @@ _NOTES = [
     "Bin live in its button row.",
     "File > Save forces an immediate write of every set's picks and box "
     "sizes (happens automatically anyway) and tells you which folder.",
+    "Each tab has a color swatch -- click it to choose any color, or "
+    "revert it (Reset to Automatic, or Revert to Red/Green for Recycle "
+    "Bin/Confirmed, which can be recolored too). A manual color is saved "
+    "and is never changed by Toggle Colors (particle list toolbar).",
+    "Each normal set's tab shows its current number-key position (1-9) "
+    "and can be dragged to reorder it -- the numbering always follows "
+    "whatever's on screen. \"All\", Recycle Bin, Confirmed, and \"+\" stay "
+    "fixed in place and can't be dragged; a detached set has no tab "
+    "position and is skipped from numbering until reattached.",
+    "\"Show the active channel only\" and \"Show All Channels\" (particle "
+    "list toolbar, alongside Toggle Colors) show only the active tab's "
+    "set and follow you as you switch tabs (including by number key), "
+    "Recycle Bin/Confirmed included; following \"All\" shows every set "
+    "instead, matching what All itself displays. Turning \"Show the "
+    "active channel only\" off restores exactly the visibility you had "
+    "before; Show All Channels makes every set visible in one click and "
+    "turns it off if it was on.",
 ]
 
 

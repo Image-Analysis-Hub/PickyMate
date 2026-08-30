@@ -34,8 +34,18 @@ SELECTED_COLOR = QtGui.QColor("yellow")
 # once, napari-style -- in-memory only, resets each session.
 _color_offset = 0
 
+# Explicit per-class overrides (persisted -- see metadata.load/save_class_
+# settings) that take priority over everything else: the rotation formula
+# for a normal class, or Recycle Bin/Confirmed's own fixed red/green. Set
+# via the gallery's per-tab color swatch. Not touched by cycle_colors(), so
+# a manual pick is never silently overwritten by clicking Toggle Colors --
+# only the classes still on "automatic" shift when that's clicked.
+_manual_colors = {}  # classid -> QColor
+
 
 def class_color(classid: int) -> QtGui.QColor:
+    if classid in _manual_colors:
+        return _manual_colors[classid]
     if classid in _FIXED_COLORS:
         return _FIXED_COLORS[classid]
     return SETCOLORS[(classid + _color_offset) % len(SETCOLORS)]
@@ -44,6 +54,25 @@ def class_color(classid: int) -> QtGui.QColor:
 def cycle_colors() -> None:
     global _color_offset
     _color_offset = (_color_offset + 1) % len(SETCOLORS)
+
+
+def set_manual_color(classid: int, color: QtGui.QColor) -> None:
+    _manual_colors[classid] = QtGui.QColor(color)
+
+
+def clear_manual_color(classid: int) -> None:
+    _manual_colors.pop(classid, None)
+
+
+def has_manual_color(classid: int) -> bool:
+    return classid in _manual_colors
+
+
+def manual_color_hex(classid: int):
+    """"#rrggbb" for a class with a manual override, else None -- the form
+    saved to config.settings."""
+    color = _manual_colors.get(classid)
+    return color.name() if color is not None else None
 
 
 def category_order(sets: dict) -> list:

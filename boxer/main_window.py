@@ -27,7 +27,7 @@ from PySide6.QtCore import Qt
 from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
 from .thumb_grid import ParticleListPanel
-from .widgets import LabeledSpinBox, RangeSlider, space_key_state
+from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
 from . import categories
 from . import metadata
 from .shapes import Shape
@@ -377,6 +377,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.move_selected_action.setToolTip("Move every currently selected particle to the set named at right.")
         self.move_selected_action.triggered.connect(self._move_selected_via_toolbar)
 
+        # Toggle Colors' QAction is created here (TomoBoxer owns the
+        # behavior), but the button for it lives in the particle list's own
+        # toolbar, not here -- see ParticleListPanel.__init__. A QAction
+        # isn't tied to whichever toolbar displays it, so this is the exact
+        # same object clicking that button triggers.
         self.toggle_colors_action = QtGui.QAction("Toggle Colors", self)
         self.toggle_colors_action.setToolTip(
             "Rotate every normal set to the next color at once. Recycle "
@@ -388,8 +393,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.edit_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.edit_toolbar.addAction(self.undo_action)
         self.edit_toolbar.addAction(self.redo_action)
-        self.edit_toolbar.addSeparator()
-        self.edit_toolbar.addAction(self.toggle_colors_action)
 
         # A separate toolbar (not just a separator inside Edit) so the
         # "acts on whatever's currently selected" actions read as one clear
@@ -407,45 +410,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.selection_toolbar.addAction(self.move_selected_action)
         self.selection_toolbar.addWidget(self.move_to_combo)
 
-        # A QAction-based toolbar button (QToolButton, auto-raise) is flat
-        # and borderless until hovered by default -- that's the standard
-        # toolbar convention, but next to a real QPushButton like
-        # AutoContrast it can read as "not actually a button" rather than
-        # deliberately minimal. Rather than give every toolbar button
-        # AutoContrast's raised 3D chrome (which looks dated for a row with
-        # this many actions), this gives them a flat "chip" look that's
-        # still clearly bounded at rest, with a hover tint, a pressed
-        # state, and -- most importantly for the exclusive Pick/Eraser/
-        # Select tools, which had no strong visual cue for which one was
-        # active -- a solid accent fill while checked. palette(...) roles
-        # keep it adapting to whatever light/dark theme is active, rather
-        # than hardcoding colors that could look wrong on either.
-        self.setStyleSheet(self.styleSheet() + """
-            QToolBar QToolButton {
-                background-color: palette(button);
-                border: 1px solid palette(mid);
-                border-radius: 4px;
-                padding: 3px 9px;
-                margin: 1px;
-            }
-            QToolBar QToolButton:hover {
-                background-color: palette(light);
-                border-color: palette(dark);
-            }
-            QToolBar QToolButton:pressed {
-                background-color: palette(mid);
-            }
-            QToolBar QToolButton:checked {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-                border-color: palette(highlight);
-            }
-            QToolBar QToolButton:disabled {
-                background-color: palette(window);
-                border-color: palette(midlight);
-                color: palette(mid);
-            }
-        """)
+        # Show the active channel only / Show All Channels' QActions are created here
+        # (TomoBoxer owns sets_visible and the solo logic), but -- like
+        # Toggle Colors above -- the buttons for them live in the particle
+        # list's own toolbar, not here; see ParticleListPanel.__init__.
+        self.view_only_selected_action = QtGui.QAction("Show the active channel only", self)
+        self.view_only_selected_action.setCheckable(True)
+        self.view_only_selected_action.setToolTip(
+            "While on, only the active tab's set is shown in the tomogram "
+            "views -- switching tabs (including via number keys) updates "
+            "this live. Turning it off restores whatever visibility you "
+            "had before.")
+        self.view_only_selected_action.toggled.connect(self.toggle_view_only_selected)
+        self._solo_saved_visible = None  # sets_visible snapshot from before solo turned on
+
+        self.show_all_channels_action = QtGui.QAction("Show All Channels", self)
+        self.show_all_channels_action.setToolTip("Make every set visible in the tomogram views.")
+        self.show_all_channels_action.triggered.connect(self.show_all_channels)
+
+        self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
         # A small permanent (right-aligned) status-bar label, like a file
         # manager's "N items selected" -- the only ambient feedback for the
@@ -476,6 +459,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
             sc.activated.connect(lambda n=n: self.select_set_by_number(n))
             self._class_shortcuts.append(sc)
 
+        # Escape-to-clear-selection, also application-wide: it used to only
+        # fire via ImageView2D.keypress, i.e. only while a tomogram view
+        # itself had keyboard focus -- so pressing Escape right after using
+        # a toolbar button or combo box (which grabs focus for itself) did
+        # nothing, leaving a selection that looked "stuck" even though nothing
+        # was actually wrong with the selection itself, just with reaching it.
+        self._escape_shortcut = QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self)
+        self._escape_shortcut.setContext(Qt.ApplicationShortcut)
+        self._escape_shortcut.activated.connect(self._global_escape)
+
         # -- load data ---------------------------------------------------------
         self.datafilename = datafile
 
@@ -501,6 +494,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # tabs. Recycle Bin/Confirmed/"All" don't emit this (see
         # ParticleListPanel.class_activated), matching number-key switching.
         self.boxesviewer.class_activated.connect(self._on_gallery_class_activated)
+        # class_activated above deliberately skips "All"/Recycle Bin/
+        # Confirmed (they can't become the active picking class), but View
+        # Only Selected still needs to follow the gallery to *those* tabs
+        # too -- active_tab_changed fires for every real tab, fixed or not.
+        self.boxesviewer.active_tab_changed.connect(self._on_gallery_tab_changed)
 
         self._arrange_windows()
 
@@ -510,7 +508,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.sets = {}
         self.boxsize = {}
 
-        boxsizes_by_name = metadata.load_boxsizes(self.picksdir)
+        class_settings = metadata.load_class_settings(self.picksdir)
         classnames = metadata.discover_classes(self.picksdir)
         normal_names = [n for n in classnames if n not in categories.FIXED_CLASS_NAMES]
 
@@ -518,7 +516,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         for i, name in enumerate(normal_names):
             self.sets[i] = name
-            self.boxsize[i] = boxsizes_by_name.get(name, metadata.DEFAULT_BOXSIZE)
+            s = class_settings.get(name, {})
+            self.boxsize[i] = s.get("boxsize", metadata.DEFAULT_BOXSIZE)
+            if s.get("color"):
+                categories.set_manual_color(i, QtGui.QColor(s["color"]))
             for x, y, z in metadata.load_class_coords(self.picksdir, name):
                 bdf = [x, y, z, "manual", 0.0, i, self._new_uid()]
                 self.boxes.append(bdf)
@@ -527,7 +528,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # not their pick files were present on disk yet.
         for name, cid in categories.FIXED_CLASS_NAMES.items():
             self.sets[cid] = name
-            self.boxsize[cid] = boxsizes_by_name.get(name, metadata.DEFAULT_BOXSIZE)
+            s = class_settings.get(name, {})
+            self.boxsize[cid] = s.get("boxsize", metadata.DEFAULT_BOXSIZE)
+            if s.get("color"):
+                categories.set_manual_color(cid, QtGui.QColor(s["color"]))
             for x, y, z in metadata.load_class_coords(self.picksdir, name):
                 bdf = [x, y, z, "manual", 0.0, cid, self._new_uid()]
                 self.boxes.append(bdf)
@@ -677,6 +681,21 @@ class TomoBoxer(QtWidgets.QMainWindow):
         like a matching crop."""
         proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
         return proj[0]
+
+    def _refresh_thumbnail(self, i):
+        """Regenerate box i's cached gallery-thumbnail crop -- needed
+        whenever its effective box size could have changed: a direct
+        size edit (_resize_boxes), Avg Slices changing what a crop looks
+        like (event_nlayers), or reassigning it to a class with its own
+        different box size, which get_boxsize looks up by the box's
+        *current* class. update_box_shape alone (used by every reassign
+        path) only touches the drawn marker in the tomogram views, not
+        this cached crop -- without also calling this, a particle
+        confirmed/recycled/moved into a class with a different box size
+        kept showing its old class's box size in the gallery thumbnail."""
+        for _ in range(len(self.boxesimgs), i + 1):
+            self.boxesimgs.append(None)
+        self.boxesimgs[i] = self._thumbnail_crop(self.boxes[i])
 
     def get_slice(self, idx, thk=1, axis="z"):
         return self.data.slab_projection(axis, idx, int(thk - 1))
@@ -907,8 +926,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
             coords = [(b[0], b[1], b[2]) for b in self.boxes if b[5] == clsid]
             metadata.save_class_coords(self.picksdir, name, coords)
         if only is None:
-            boxsizes_by_name = {self.sets[k]: self.boxsize[k] for k in self.sets}
-            metadata.save_boxsizes(self.picksdir, boxsizes_by_name)
+            settings_by_name = {
+                self.sets[k]: {"boxsize": self.boxsize[k], "color": categories.manual_color_hex(k)}
+                for k in self.sets
+            }
+            metadata.save_class_settings(self.picksdir, settings_by_name)
 
     # -- slice view update ----------------------------------------------------------
     def update_sliceview(self, axis=("x", "y", "z"), reslice=True, only_indices=None):
@@ -1060,6 +1082,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         for i, _prev_class in changed:
             self.boxes[i][5] = target_id
             self.update_box_shape(i, self.boxes[i])
+            self._refresh_thumbnail(i)
         self._push_undo({"type": "reassign", "changes": changed, "new_class": target_id})
         # Deliberately not forcing target_id into sets_visible here: if the
         # user has Recycle Bin/Confirmed (or any class) hidden, sending
@@ -1184,7 +1207,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # fired for unrelated reasons like a set's visibility being
         # toggled back on, since that removes and re-adds gallery items
         # the same way a real delete/restore does).
-        self.boxesviewer.grid.replace_selection([box_copy[6] for _, box_copy, _ in removed])
+        self.boxesviewer.replace_selection([box_copy[6] for _, box_copy, _ in removed])
 
     def _undo_reassign(self, action):
         uids = [self.boxes[i][6] for i, _ in action["changes"] if 0 <= i < len(self.boxes)]
@@ -1208,6 +1231,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if 0 <= i < len(self.boxes):
                 self.boxes[i][5] = target_id if target_id is not None else prev_class
                 self.update_box_shape(i, self.boxes[i])
+                self._refresh_thumbnail(i)
         if target_id is not None:
             affected_classes.add(target_id)
         if self.initialized:
@@ -1408,20 +1432,43 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     # Toggle-select, exactly like Ctrl+click in the gallery --
                     # writes into the same selection list the gallery owns,
                     # so both windows and the Selection panel always agree.
-                    self.boxesviewer.grid.toggle_uid_selection(self.boxes[i][6])
+                    self.boxesviewer.toggle_uid(self.boxes[i][6])
                 else:
                     # A plain click on some other particle is "start doing
                     # something else" -- clear whatever multi-selection was
                     # active first, the same way clicking a file in a file
                     # manager deselects the others unless you hold Ctrl.
-                    self.boxesviewer.grid.clear_selection()
+                    self.boxesviewer.clear_selection()
                     self.dragging = i
                     self.curbox = i
-                    self.scroll_to(x, y, z, axis)
+                    # Move the other two views onto this particle's own
+                    # stored coordinate, not the raw click position -- a
+                    # click only needs to land within the box's radius to
+                    # select it (see inside_box), so it's almost never
+                    # pixel-exact on the particle's true center. Panning
+                    # alone (scroll_to) isn't enough either: each of those
+                    # views' background slice depth is governed by its own
+                    # x_loc/y_loc/z_loc, unrelated to this particle's
+                    # position along that axis, so without also moving the
+                    # depth and reslicing, the pan lands on the right pixel
+                    # but the wrong slice -- the particle usually doesn't
+                    # even render there. The view actually clicked in is
+                    # deliberately left alone (no jump, no reslice), same
+                    # as scroll_to's own axis exclusion.
+                    box = self.boxes[i]
+                    if axis != "x":
+                        self.x_loc = box[0]
+                    if axis != "y":
+                        self.y_loc = box[1]
+                    if axis != "z":
+                        self.z_loc = box[2]
+                    self.scroll_to(box[0], box[1], box[2], axis)
+                    other_axes = tuple(a for a in ("x", "y", "z") if a != axis)
+                    self.update_sliceview(axis=other_axes)
                 break
         else:
             if not event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
-                self.boxesviewer.grid.clear_selection()
+                self.boxesviewer.clear_selection()
                 self.x_loc, self.y_loc, self.z_loc = x, y, z
                 self.scroll_to(x, y, z, axis)
                 self.curbox = len(self.boxes)
@@ -1576,7 +1623,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         uids = self._select_hit_test(drawing)
         drawing["view"].select_preview = None
         self._select_drawing = None
-        self.boxesviewer.grid.replace_selection(uids)
+        self.boxesviewer.replace_selection(uids)
 
     def _update_select_preview(self):
         drawing = self._select_drawing
@@ -1632,7 +1679,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         uids = self._select_hit_test(drawing)
         drawing["view"].select_preview = None
         self._select_drawing = None
-        self.boxesviewer.grid.replace_selection(uids)
+        self.boxesviewer.replace_selection(uids)
 
     def _select_hit_test(self, drawing):
         axis = drawing["axis"]
@@ -1716,6 +1763,59 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def set_current_set(self, name):
         self.currentset = parse_setname(name)
         self.wboxsize.setValue(self.get_boxsize())
+        self._sync_solo_visibility()
+        self.update_all()
+
+    def is_solo_active(self):
+        return self.view_only_selected_action.isChecked()
+
+    def _sync_solo_visibility(self):
+        """While Show the active channel only is active, force sets_visible back to
+        exactly {currentset}. Called from everywhere currentset can change
+        (or sets_visible can otherwise drift away from it) -- not just
+        set_current_set's own callers -- since a couple of paths bypass
+        set_current_set entirely: _on_gallery_class_activated skips it
+        outright when the clicked tab's class already equals currentset
+        (a cheap-looking optimization that predates solo mode and doesn't
+        account for sets_visible having changed since, e.g. after
+        visiting "All" or a fixed tab and back), and delete_set reassigns
+        currentset directly when the active set itself gets deleted.
+        Returns whether it actually changed anything, so callers taking a
+        shortcut around update_all() know whether one is still needed."""
+        if not self.view_only_selected_action.isChecked():
+            return False
+        if self.sets_visible == {self.currentset}:
+            return False
+        self.sets_visible = {self.currentset}
+        self.boxesviewer.refresh_visibility_checkboxes()
+        return True
+
+    def toggle_view_only_selected(self, checked):
+        if checked:
+            self._solo_saved_visible = set(self.sets_visible)
+            # The tab actually being viewed, not self.currentset -- which
+            # never changes for "All"/Recycle Bin/Confirmed, so turning
+            # solo on while looking at one of those used to solo onto
+            # whatever normal class happened to be the picking class
+            # instead, making the tab you were actually looking at go
+            # invisible.
+            cid = self.boxesviewer.active_view_classid()
+            self.sets_visible = set(self.sets.keys()) if cid is None else {cid}
+        elif self._solo_saved_visible is not None:
+            self.sets_visible = self._solo_saved_visible
+            self._solo_saved_visible = None
+        self.boxesviewer.set_visibility_controls_locked(checked)
+        self.boxesviewer.refresh_visibility_checkboxes()
+        self.update_all()
+
+    def show_all_channels(self):
+        if self.view_only_selected_action.isChecked():
+            # Turns solo off (restoring its pre-solo snapshot first) --
+            # then immediately overridden below to "everything visible",
+            # which is what this button actually promises.
+            self.view_only_selected_action.setChecked(False)
+        self.sets_visible = set(self.sets.keys())
+        self.boxesviewer.refresh_visibility_checkboxes()
         self.update_all()
 
     def hide_set(self, name):
@@ -1759,14 +1859,42 @@ class TomoBoxer(QtWidgets.QMainWindow):
             remaining = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)
             self.currentset = remaining[0] if remaining else self.new_set("particles_00")
             self.wboxsize.setValue(self.get_boxsize())
+            self._sync_solo_visibility()
         self._refresh_move_to_combo()
         self.update_all(reslice=False, only_indices=[])
 
     def toggle_colors(self):
-        """Rotate every normal class to the next color in the remaining
-        (non-reserved) palette at once, napari-style. Recycle Bin/Confirmed
-        and the selection highlight are fixed and unaffected."""
+        """Rotate every normal class still on its automatic color to the
+        next one in the palette at once, napari-style. A class with a
+        manually-set color (including Recycle Bin/Confirmed, which can
+        also be recolored via the gallery's color swatch -- see
+        set_class_color) is untouched: cycle_colors() only shifts the
+        rotation offset the automatic formula uses, never a manual
+        override, so a deliberate choice never gets silently overwritten
+        by this. The selection highlight is separate and always fixed."""
         categories.cycle_colors()
+        self._recolor_and_refresh()
+
+    def set_class_color(self, classid, color):
+        """Explicitly set one class's color (the gallery's color-swatch
+        menu's "Choose Color..."). Works for any class, including Recycle
+        Bin/Confirmed -- persisted like box sizes (see save_picks), and
+        left alone by Toggle Colors once set."""
+        if classid not in self.sets:
+            return
+        categories.set_manual_color(classid, color)
+        self._recolor_and_refresh()
+
+    def reset_class_color(self, classid):
+        """Clear a class's manual color override, reverting it to the
+        automatic palette (or, for Recycle Bin/Confirmed, back to their
+        own fixed red/green)."""
+        if classid not in self.sets:
+            return
+        categories.clear_manual_color(classid)
+        self._recolor_and_refresh()
+
+    def _recolor_and_refresh(self):
         for i in range(len(self.boxes)):
             self.update_box_shape(i, self.boxes[i])
         self.update_all(reslice=False)
@@ -1808,10 +1936,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def delete_particles_by_uid(self, uids):
         idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
         self.send_to_recycle_bin(idx)
+        # The selection has been acted on and is "done" -- carrying it
+        # forward would just leave these particles looking selected
+        # afterward for no reason, the same way a file manager doesn't
+        # keep files selected in the destination once you've moved them.
+        self.boxesviewer.clear_selection()
 
     def confirm_particles_by_uid(self, uids):
         idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
         self.send_to_confirmed(idx)
+        self.boxesviewer.clear_selection()
 
     def move_particles_by_uid(self, uids, target_classname):
         """Reassign the given particles (by uid) to target_classname,
@@ -1831,6 +1965,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         for i in idx:
             self.boxes[i][5] = target_id
             self.update_box_shape(i, self.boxes[i])
+            self._refresh_thumbnail(i)
         self._push_undo({"type": "reassign", "changes": prev, "new_class": target_id})
         # new_set() above already makes a brand-new class visible; an
         # existing target class that the user deliberately hid should stay
@@ -1838,6 +1973,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         affected_classes = {target_id} | {prev for _, prev in prev}
         if self.initialized:
             self.save_picks(only=affected_classes)
+        self.boxesviewer.clear_selection()
         self.update_all(reslice=False, only_indices=idx)
 
     # -- help -----------------------------------------------------------
@@ -1855,42 +1991,79 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 self._select_finish_freeform()
                 return
-            if event.key() == Qt.Key_Escape:
-                self._select_cancel_drawing()
-                return
             if event.key() == Qt.Key_Backspace:
                 if drawing["points"]:
                     drawing["points"].pop()
                 self._update_select_preview_freeform()
                 return
-        if event.key() == Qt.Key_Escape:
-            # Cancelling an in-progress freeform (above) takes priority --
-            # otherwise Escape clears the current multi-selection, the
-            # standard "back out of what you're doing" key.
-            self.boxesviewer.grid.clear_selection()
-            return
+            # Escape while freeform-drawing is handled by _global_escape
+            # (application-wide shortcut) instead of here -- see there.
         self.keyPress.emit(event)
+
+    def _global_escape(self):
+        """Escape, application-wide (see the QShortcut set up in __init__)
+        rather than only while a tomogram view happens to have keyboard
+        focus: cancelling an in-progress freeform selection takes priority
+        (matching key_press's old in-focus behavior), otherwise this clears
+        the current multi-selection -- the standard "back out of what
+        you're doing" key, and the one place that selection can actually be
+        cleared from, so it's never unreachable regardless of which widget
+        focus happens to be sitting on."""
+        drawing = self._select_drawing
+        if drawing is not None and drawing["kind"] == "freeform":
+            self._select_cancel_drawing()
+            return
+        self.boxesviewer.clear_selection()
 
     def select_set_by_number(self, n):
         """Bare 1-9 keys switch the active picking class to the nth normal
-        set (Recycle Bin/Confirmed are reached only via shift/space+click,
-        not by number -- they aren't something you pick new particles
-        into), ordered the same way the gallery's tabs list them."""
-        order = categories.category_order(self.sets)
-        normal = [cid for cid in order if cid not in categories.FIXED_CLASS_IDS]
+        set AND switch the gallery to that set's own tab -- the same
+        number shown on the tab itself (ParticleListPanel._renumber_tabs),
+        which always matches whatever order the tabs are currently in
+        (drag to rearrange them; the numbering follows). A detached set
+        has no tab position, so it's skipped from the numbered sequence
+        entirely; Recycle Bin/Confirmed are reached only via shift/
+        space+click, not by number -- they aren't something you pick new
+        particles into."""
+        normal = self.boxesviewer.normal_class_order()
         if not (1 <= n <= len(normal)):
             return
-        cid = normal[n - 1]
-        if cid == self.currentset:
-            return
-        self.set_current_set(f"{cid}::")
+        self.boxesviewer.activate_class_tab(normal[n - 1])
 
     def _on_gallery_class_activated(self, cid):
         """A set's tab becoming the active one in the gallery also makes it
-        the active picking class -- see ParticleListPanel.class_activated."""
+        the active picking class -- see ParticleListPanel.class_activated.
+        cid can already equal currentset here (e.g. clicking back onto a
+        class's tab after visiting "All" or a fixed category, which don't
+        change currentset) -- set_current_set itself is skippable then,
+        but the solo-visibility resync isn't: sets_visible could still
+        have drifted since the last time it was forced, and this tab
+        becoming current is exactly the moment that should be corrected."""
         if cid == self.currentset:
+            if self._sync_solo_visibility():
+                self.update_all()
             return
         self.set_current_set(f"{cid}::")
+
+    def _on_gallery_tab_changed(self, cid):
+        """Show the active channel only has to follow the gallery to *every* tab,
+        not just the ones that can become the active picking class --
+        unlike class_activated (which only ever fires for normal sets),
+        active_tab_changed also fires for Recycle Bin, Confirmed, and
+        "All" (cid is None here), none of which touch currentset at all.
+        Without this, switching to one of those three while solo is on
+        left it not shown and whatever was visible before still visible,
+        since nothing was listening for exactly that tab change. "All"
+        means "show everything" -- the same thing that tab itself
+        displays -- since there's no single class to isolate to there."""
+        if not self.view_only_selected_action.isChecked():
+            return
+        target = set(self.sets.keys()) if cid is None else {cid}
+        if self.sets_visible == target:
+            return
+        self.sets_visible = target
+        self.boxesviewer.refresh_visibility_checkboxes()
+        self.update_all()
 
     # -- persistence -----------------------------------------------------------
     # Backward-compatible alias, kept in case anything still calls save_json().

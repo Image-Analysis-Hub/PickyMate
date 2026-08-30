@@ -8,6 +8,7 @@ inside a "<basename>_picks" folder next to the tomogram:
         Ribosomes.txt      # "x y z" per line
         FAS.txt
         config.settings    # optional, only present if a box size != default
+                           # or a color was manually set
 
 Every "*.txt" file found in the picks folder (other than config.settings)
 is treated as a class, named after the file (without extension). Drop any
@@ -15,15 +16,20 @@ whitespace-separated x/y/z coordinate text file into the folder and it
 will show up as a class next time the tomogram is opened.
 
 Box size is a purely cosmetic (visualization/extraction box) setting and
-defaults to DEFAULT_BOXSIZE for every class. It is only ever recorded in
-config.settings when a class's box size differs from the default, and the
-file is not required to exist at all.
+defaults to DEFAULT_BOXSIZE for every class. Color is likewise cosmetic
+and defaults to whatever the automatic palette (or, for Recycle Bin/
+Confirmed, their own fixed red/green) would assign. Both live together in
+config.settings, one "name boxsize [color]" line per class that has
+either set -- a class needing neither gets no line at all, and the file
+itself isn't required to exist.
 """
 from __future__ import annotations
 
 import os
+import re
 
 DEFAULT_BOXSIZE = 32
+_COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 CONFIG_FILENAME = "config.settings"
 
 
@@ -99,37 +105,62 @@ def rename_class_file(pdir: str, oldname: str, newname: str) -> None:
         os.replace(oldpath, newpath)
 
 
-def load_boxsizes(pdir: str) -> dict:
-    """Read config.settings (whitespace-separated "name boxsize" per
-    line). Missing file simply means every class uses DEFAULT_BOXSIZE."""
+def load_class_settings(pdir: str) -> dict:
+    """Read config.settings: whitespace-separated "name boxsize [color]"
+    per line, color an optional "#rrggbb" hex string. Returns
+    {name: {"boxsize": int, "color": str or None}}. Missing file simply
+    means every class uses the default box size and automatic color.
+
+    Parsed from the *right*, not split on the first token: a class name
+    can itself contain spaces ("Recycle Bin" always has one), so the
+    boundary between "the name" and "the boxsize [color] that follow it"
+    has to be found from the trailing, unambiguously-shaped fields
+    (boxsize is always an int, color always "#rrggbb") inward, not by
+    assuming the name is a single token."""
     path = config_path(pdir)
-    sizes = {}
+    settings = {}
     if not os.path.isfile(path):
-        return sizes
+        return settings
     with open(path) as f:
         for line in f:
             parts = line.split()
             if len(parts) < 2:
                 continue
-            name = parts[0]
+            color = None
+            if _COLOR_RE.fullmatch(parts[-1]):
+                color = parts[-1]
+                parts = parts[:-1]
+            if len(parts) < 2:
+                continue
             try:
-                sizes[name] = int(float(parts[1]))
+                boxsize = int(float(parts[-1]))
             except ValueError:
                 continue
-    return sizes
+            name = " ".join(parts[:-1])
+            if not name:
+                continue
+            settings[name] = {"boxsize": boxsize, "color": color}
+    return settings
 
 
-def save_boxsizes(pdir: str, boxsizes: dict) -> None:
-    """Write config.settings with only the non-default entries. If there
-    are none, remove the file (or don't create it) rather than leaving an
-    empty file around."""
-    non_default = {name: bs for name, bs in boxsizes.items() if int(bs) != DEFAULT_BOXSIZE}
+def save_class_settings(pdir: str, settings: dict) -> None:
+    """settings: {name: {"boxsize": int, "color": str or None}}. Only a
+    class with a non-default box size or an explicit color gets a line
+    written; if none do, the file is removed rather than left empty."""
+    to_write = {
+        name: s for name, s in settings.items()
+        if int(s.get("boxsize", DEFAULT_BOXSIZE)) != DEFAULT_BOXSIZE or s.get("color")
+    }
     path = config_path(pdir)
-    if not non_default:
+    if not to_write:
         if os.path.isfile(path):
             os.remove(path)
         return
     os.makedirs(pdir, exist_ok=True)
     with open(path, "w") as out:
-        for name in sorted(non_default):
-            out.write(f"{name} {non_default[name]}\n")
+        for name in sorted(to_write):
+            s = to_write[name]
+            line = f"{name} {int(s.get('boxsize', DEFAULT_BOXSIZE))}"
+            if s.get("color"):
+                line += f" {s['color']}"
+            out.write(line + "\n")

@@ -5,6 +5,50 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+# A QAction-based toolbar button (QToolButton, auto-raise) is flat and
+# borderless until hovered by default -- that's the standard toolbar
+# convention, but next to a real QPushButton like AutoContrast it can read
+# as "not actually a button" rather than deliberately minimal. Rather than
+# give every toolbar button AutoContrast's raised 3D chrome (which looks
+# dated for a row with this many actions), this gives them a flat "chip"
+# look that's still clearly bounded at rest, with a hover tint, a pressed
+# state, and -- most importantly for the exclusive Pick/Eraser/Select
+# tools, which had no strong visual cue for which one was active -- a
+# solid accent fill while checked. palette(...) roles keep it adapting to
+# whatever light/dark theme is active, rather than hardcoding colors that
+# could look wrong on either.
+#
+# Shared here (rather than defined once inline) because it's applied to
+# two separate top-level windows -- the tomogram window and the particle
+# list -- which don't share a widget hierarchy for a stylesheet set on one
+# to cascade to the other.
+TOOLBAR_BUTTON_STYLE = """
+    QToolBar QToolButton {
+        background-color: palette(button);
+        border: 1px solid palette(mid);
+        border-radius: 4px;
+        padding: 3px 9px;
+        margin: 1px;
+    }
+    QToolBar QToolButton:hover {
+        background-color: palette(light);
+        border-color: palette(dark);
+    }
+    QToolBar QToolButton:pressed {
+        background-color: palette(mid);
+    }
+    QToolBar QToolButton:checked {
+        background-color: palette(highlight);
+        color: palette(highlighted-text);
+        border-color: palette(highlight);
+    }
+    QToolBar QToolButton:disabled {
+        background-color: palette(window);
+        border-color: palette(midlight);
+        color: palette(mid);
+    }
+"""
+
 
 class RangeSlider(QtWidgets.QWidget):
     """A single horizontal slider with two draggable handles marking a

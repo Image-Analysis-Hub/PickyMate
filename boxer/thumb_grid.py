@@ -33,7 +33,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import categories
-from .widgets import space_key_state
+from .widgets import TOOLBAR_BUTTON_STYLE, space_key_state
 
 THUMB_SIZE = 96
 MIN_THUMB = 24
@@ -91,7 +91,9 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                                  # so a particle brought back by undo returns to the
                                  # same spot instead of being appended at the end)
         self._next_slot = 0
-        self._selected = []      # ordered list of selected uids
+        self._selected = set()   # cache of MY currently-highlighted uids, kept in sync
+                                  # via apply_selection() -- never set directly by a
+                                  # gesture; see ParticleListPanel._commit_selection
         self._selection_rects = {}  # uid -> QGraphicsRectItem
         self._last_clicked_uid = None
         self._labels = {}        # uid -> (bg QGraphicsRectItem, text QGraphicsSimpleTextItem)
@@ -127,32 +129,30 @@ class ParticleGrid(QtWidgets.QGraphicsView):
     def selected_uids(self):
         return list(self._selected)
 
-    def clear_selection(self, emit=True):
+    def apply_selection(self, selected_uids):
+        """Show/hide this grid's own selection rects to match the given
+        selection -- the one place that actually renders "is this uid
+        selected." Called by ParticleListPanel whenever the shared
+        selection changes (from any grid, or the tomogram window, or an
+        Escape key press) and whenever this grid's own items get
+        resynced, so a particle moved into a new class picks up its
+        highlight immediately here instead of just losing it, and one
+        removed from a class it's leaving quietly stops being highlighted
+        here without that meaning it's not selected anymore elsewhere."""
+        selected_uids = set(selected_uids) & self._items.keys()
         for uid in list(self._selection_rects.keys()):
-            self._hide_selection(uid)
-        self._selected = []
+            if uid not in selected_uids:
+                self._hide_selection(uid)
+        for uid in selected_uids:
+            self._show_selection(uid)
+        self._selected = selected_uids
+
+    def clear_selection(self):
+        """Request the shared selection be cleared -- the actual clearing/
+        rendering happens via apply_selection(), echoed back once
+        ParticleListPanel updates the selection every grid shares."""
         self._last_clicked_uid = None
-        if emit:
-            self.selection_changed.emit([])
-
-    def toggle_uid_selection(self, uid):
-        """Toggle one uid in/out of the selection, as if Ctrl+clicked here --
-        used by TomoBoxer for Ctrl+click in the main tomogram views, so
-        both windows always share the exact same selection list."""
-        sel = list(self._selected)
-        if uid in sel:
-            sel.remove(uid)
-        else:
-            sel.append(uid)
-        self._last_clicked_uid = uid
-        self._set_selection(sel)
-
-    def replace_selection(self, uids):
-        """Replace the selection outright -- used by TomoBoxer's shape-based
-        select tool (rectangle/circle/freeform) in the main tomogram views."""
-        uids = list(uids)
-        self._last_clicked_uid = uids[-1] if uids else None
-        self._set_selection(uids)
+        self.selection_changed.emit([])
 
 
     # -- syncing particles -----------------------------------------------
@@ -262,8 +262,10 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         rect = self._border_rects.pop(uid, None)
         if rect is not None:
             self._scene.removeItem(rect)
-        if uid in self._selected:
-            self._selected.remove(uid)
+        # Only a local rendering-cache cleanup -- this uid may well still
+        # be selected overall (see ParticleListPanel._selected_uids); it
+        # just doesn't have an item here anymore to show that on.
+        self._selected.discard(uid)
 
     def _update_pixmap(self, uid, img):
         self._images[uid] = img
@@ -414,17 +416,6 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         if rect is not None:
             self._scene.removeItem(rect)
 
-    def _set_selection(self, uids, emit=True):
-        uids = list(dict.fromkeys(uids))  # de-dup, preserve order
-        for uid in list(self._selection_rects.keys()):
-            if uid not in uids:
-                self._hide_selection(uid)
-        for uid in uids:
-            self._show_selection(uid)
-        self._selected = uids
-        if emit:
-            self.selection_changed.emit(list(uids))
-
     # -- zoom (mouse wheel) -----------------------------------------------
     def zoom_in(self):
         self._thumb_size = min(MAX_THUMB, int(round(self._thumb_size * 1.15)))
@@ -494,16 +485,16 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 if mods & QtCore.Qt.AltModifier and self._last_clicked_uid is not None:
                     self._range_select(self._last_clicked_uid, uid)
                 elif mods & QtCore.Qt.ControlModifier:
-                    sel = list(self._selected)
+                    sel = set(self._selected)
                     if uid in sel:
-                        sel.remove(uid)
+                        sel.discard(uid)
                     else:
-                        sel.append(uid)
+                        sel.add(uid)
                     self._last_clicked_uid = uid
-                    self._set_selection(sel)
+                    self.selection_changed.emit(list(sel))
                 else:
                     self._last_clicked_uid = uid
-                    self._set_selection([uid])
+                    self.selection_changed.emit([uid])
                     self.mx_image_selected.emit(event, [uid])
                 event.accept()
                 return
@@ -537,13 +528,13 @@ class ParticleGrid(QtWidgets.QGraphicsView):
 
     def _range_select(self, from_uid, to_uid):
         if from_uid not in self._slot_of_uid or to_uid not in self._slot_of_uid:
-            self._set_selection([to_uid])
+            self.selection_changed.emit([to_uid])
             return
         lo, hi = sorted((self._slot_of_uid[from_uid], self._slot_of_uid[to_uid]))
         uids = [u for u, s in self._slot_of_uid.items() if lo <= s <= hi]
         uids.sort(key=lambda u: self._slot_of_uid[u])
         self._last_clicked_uid = to_uid
-        self._set_selection(uids)
+        self.selection_changed.emit(uids)
 
 
 def _thumbnail_pixmap(img: np.ndarray, levels=None) -> QtGui.QPixmap:
@@ -573,7 +564,7 @@ class DetachedGridWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(int)  # classid
 
-    def __init__(self, classid, grid, title, visibility_checkbox):
+    def __init__(self, classid, grid, title, visibility_checkbox, color_swatch):
         super().__init__()
         self.classid = classid
         self.grid = grid
@@ -581,13 +572,19 @@ class DetachedGridWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # The docked tab's visibility checkbox goes away with the tab when
-        # detaching (it's embedded in the tab bar) -- without a replacement
-        # here, there'd be no way to show/hide this set's particles in the
-        # tomogram views while its window is floating.
+        # The docked tab's visibility checkbox and color swatch both go
+        # away with the tab when detaching (they're embedded in the tab
+        # bar) -- without replacements here, there'd be no way to
+        # show/hide this set or see/change its color while its window is
+        # floating.
+        toprow = QtWidgets.QHBoxLayout()
         self.visibility_checkbox = visibility_checkbox
         self.visibility_checkbox.setText("Visible in tomogram view")
-        layout.addWidget(self.visibility_checkbox)
+        toprow.addWidget(self.visibility_checkbox)
+        toprow.addStretch(1)
+        self.color_swatch = color_swatch
+        toprow.addWidget(self.color_swatch)
+        layout.addLayout(toprow)
 
         layout.addWidget(grid)
         # QTabWidget/QStackedWidget explicitly hide()s a page when it is
@@ -602,6 +599,56 @@ class DetachedGridWindow(QtWidgets.QWidget):
     def closeEvent(self, event):
         self.closed.emit(self.classid)
         super().closeEvent(event)
+
+
+class _ConstrainedTabBar(QtWidgets.QTabBar):
+    """A movable QTabBar that only lets normal-set tabs actually be picked
+    up for dragging -- "All", Recycle Bin, Confirmed, and "+" stay exactly
+    where ParticleListPanel puts them, without disabling movable tabs
+    altogether. `locked_check(index)` and `drag_bounds()` are filled in by
+    the owning panel once it exists (this class has no knowledge of
+    classids itself).
+
+    Blocking a locked tab from *starting* its own drag (mousePressEvent
+    below) stops it from ever moving, but Qt's native drag-reorder still
+    physically swaps whatever tab a dragged one is passing over -- so
+    without more, dragging a normal tab far enough would still shove "+"
+    or a fixed category out of place for the rest of the gesture (visibly
+    flickering) before a corrective moveTab() elsewhere snapped it back.
+    Clamping the event position actually fed to Qt's own drag handling in
+    mouseMoveEvent, to a fixed pixel range recorded at press-time, keeps
+    the drag from ever reaching those tabs in the first place -- nothing
+    to correct after the fact, no flicker."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.locked_check = lambda index: False
+        self.drag_bounds = lambda: None  # () -> (lo, hi) local-x clamp, or None
+        self._clamp = None
+
+    def mousePressEvent(self, event):
+        idx = self.tabAt(event.pos())
+        if idx >= 0 and self.locked_check(idx):
+            self.setCurrentIndex(idx)
+            event.accept()
+            return
+        self._clamp = self.drag_bounds() if idx >= 0 else None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._clamp is not None:
+            lo, hi = self._clamp
+            pos = event.position()
+            x = min(max(pos.x(), lo), hi)
+            if x != pos.x():
+                event = QtGui.QMouseEvent(
+                    event.type(), QtCore.QPointF(x, pos.y()), event.globalPosition(),
+                    event.button(), event.buttons(), event.modifiers())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._clamp = None
+        super().mouseReleaseEvent(event)
 
 
 class ParticleListPanel(QtWidgets.QWidget):
@@ -621,14 +668,44 @@ class ParticleListPanel(QtWidgets.QWidget):
     mx_image_selected = QtCore.Signal(object, object)
     selection_changed = QtCore.Signal(object)  # list of uids currently selected
     class_activated = QtCore.Signal(int)  # classid, when a normal class's tab becomes current
+    active_tab_changed = QtCore.Signal(object)  # classid (any -- normal or fixed), or None for "All"
 
     def __init__(self, target=None, parent=None):
         super().__init__(parent)
         self._target = weakref.ref(target) if target is not None else None
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+        # Matches the flat "chip" look of the tomogram window's own
+        # toolbars -- shared rather than redefined here since this is a
+        # separate top-level window with no widget-hierarchy stylesheet
+        # cascade from that one.
+        self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
+
+        # Toggle Colors / Show the active channel only / Show All Channels: the
+        # QActions themselves live on TomoBoxer (it owns sets_visible and
+        # the color rotation), but the buttons for them live here instead
+        # of the tomogram window -- a QAction isn't tied to whichever
+        # toolbar displays it, so this is the exact same objects, just
+        # shown in a different window, with no duplicated logic.
+        if target is not None:
+            self.view_toolbar = QtWidgets.QToolBar()
+            self.view_toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+            self.view_toolbar.addAction(target.toggle_colors_action)
+            self.view_toolbar.addSeparator()
+            self.view_toolbar.addAction(target.view_only_selected_action)
+            self.view_toolbar.addAction(target.show_all_channels_action)
+            layout.addWidget(self.view_toolbar)
 
         self.tabs = QtWidgets.QTabWidget()
+        # setTabBar must happen before any tabs are added (Qt requirement).
+        # setMovable(True) plus _ConstrainedTabBar is what lets normal sets
+        # be dragged into any order while "All"/Recycle Bin/Confirmed/"+"
+        # stay pinned -- see _is_tab_locked and _on_tab_moved below.
+        self.tabs.setTabBar(_ConstrainedTabBar())
+        self.tabs.tabBar().locked_check = self._is_tab_locked
+        self.tabs.tabBar().drag_bounds = self._tab_drag_bounds
+        self.tabs.setMovable(True)
+        self.tabs.tabBar().tabMoved.connect(self._on_tab_moved)
         layout.addWidget(self.tabs)
 
         self.grid = ParticleGrid()
@@ -638,11 +715,13 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._class_grids = {}     # classid -> ParticleGrid (docked, in a tab)
         self._class_names = {}     # classid -> name currently shown
         self._detached = {}        # classid -> DetachedGridWindow
-        self._all_class_order = []  # classids, fixed categories first then alphabetical
         self._levels_state = None  # (lo, hi) currently applied, so a newly created grid gets it too
         self._pending_entries = {}  # classid -> [(uid, img), ...] not yet applied to a
                                      # not-currently-shown docked tab's grid (see sync_particles)
         self._visibility_checkboxes = {}  # classid -> QCheckBox, embedded in that tab
+        self._color_swatches = {}  # classid -> QToolButton (color swatch), embedded in that tab
+        self._pinning_fixed_tabs = False  # reentrancy guard, see _pin_fixed_tabs
+        self._selected_uids = set()  # the one authoritative selection -- see _commit_selection
 
         self._plus_placeholder = QtWidgets.QWidget()
         self.tabs.addTab(self._plus_placeholder, "+")
@@ -686,6 +765,17 @@ class ParticleListPanel(QtWidgets.QWidget):
                 return cid
         return None
 
+    def active_view_classid(self):
+        """Classid of whichever tab the gallery is actually showing right
+        now -- a normal set *or* a fixed category (Recycle Bin/Confirmed)
+        -- or None for "All". Unlike TomoBoxer.currentset (which only
+        tracks the active *picking* class and never changes for "All" or
+        the fixed categories) or class_activated (which only fires for
+        normal classes), this always reflects literally what's on screen;
+        used by Show the active channel only / Show All Channels to key off the tab
+        you're actually looking at rather than the picking class."""
+        return self._active_classid()
+
     def _on_tab_changed(self, index):
         widget = self.tabs.widget(index)
         if widget is self._plus_placeholder:
@@ -700,12 +790,19 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.empty_recycle_button.setVisible(cid == categories.RECYCLE_BIN_ID)
         if cid is not None and not is_fixed:
             self.class_activated.emit(cid)
+        # Unlike class_activated (only normal/pickable classes), this
+        # fires for *every* real tab -- Recycle Bin, Confirmed, and "All"
+        # (cid None) included -- since Show the active channel only needs to follow
+        # whatever the gallery is showing regardless of whether that tab
+        # could ever become the active picking class.
+        self.active_tab_changed.emit(cid)
 
         for classid, grid in self._class_grids.items():
             if grid is widget:
                 pending = self._pending_entries.pop(classid, None)
                 if pending is not None:
                     grid.sync_particles(pending)
+                    grid.apply_selection(self._selected_uids)
                 break
 
     # -- sets management (New/Rename/Delete/visibility/Save/Empty Bin) ------
@@ -792,10 +889,15 @@ class ParticleListPanel(QtWidgets.QWidget):
         if reply == QtWidgets.QMessageBox.Yes:
             target.empty_recycle_bin()
 
+    _LOCKED_VISIBILITY_TIP = 'Turn off "Show the active channel only" to change visibility.'
+    _NORMAL_VISIBILITY_TIP = "Show/hide this set's particles in the tomogram views."
+
     def _make_visibility_checkbox(self, classid):
         cb = QtWidgets.QCheckBox()
-        cb.setToolTip("Show/hide this set's particles in the tomogram views.")
         target = self._target_or_none()
+        locked = target is not None and target.is_solo_active()
+        cb.setEnabled(not locked)
+        cb.setToolTip(self._LOCKED_VISIBILITY_TIP if locked else self._NORMAL_VISIBILITY_TIP)
         cb.setChecked(target is not None and classid in target.sets_visible)
         cb.toggled.connect(lambda checked, cid=classid: self._set_visibility(cid, checked))
         return cb
@@ -809,9 +911,147 @@ class ParticleListPanel(QtWidgets.QWidget):
         else:
             target.hide_set(f"{classid}::")
 
+    def refresh_visibility_checkboxes(self):
+        """Resync every checkbox's checked state from the model -- needed
+        whenever sets_visible changes by some means other than a checkbox
+        click itself (Show the active channel only turning on/off, Show All
+        Channels)."""
+        target = self._target_or_none()
+        if target is None:
+            return
+        for cid, cb in self._visibility_checkboxes.items():
+            cb.blockSignals(True)
+            cb.setChecked(cid in target.sets_visible)
+            cb.blockSignals(False)
+        for cid, win in self._detached.items():
+            cb = win.visibility_checkbox
+            cb.blockSignals(True)
+            cb.setChecked(cid in target.sets_visible)
+            cb.blockSignals(False)
+
+    def set_visibility_controls_locked(self, locked):
+        """Gray out every visibility checkbox while Show the active channel only is
+        active -- clicking one wouldn't do anything useful right now since
+        it'd just be overridden on the next tab switch, and the tooltip
+        explains why on hover (Qt shows tooltips on disabled widgets)."""
+        tip = self._LOCKED_VISIBILITY_TIP if locked else self._NORMAL_VISIBILITY_TIP
+        for cb in self._visibility_checkboxes.values():
+            cb.setEnabled(not locked)
+            cb.setToolTip(tip)
+        for win in self._detached.values():
+            win.visibility_checkbox.setEnabled(not locked)
+            win.visibility_checkbox.setToolTip(tip)
+
+    # -- per-tab color swatch -------------------------------------------
+    def _make_color_swatch(self, classid):
+        btn = QtWidgets.QToolButton()
+        btn.setFixedSize(14, 14)
+        btn.setAutoRaise(True)
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setToolTip("This set's color -- click to change it.")
+        btn.clicked.connect(lambda checked=False, cid=classid, b=btn: self._open_color_menu(cid, b))
+        self._refresh_color_swatch(classid, btn)
+        return btn
+
+    def _refresh_color_swatch(self, classid, btn=None):
+        btn = btn if btn is not None else self._color_swatches.get(classid)
+        if btn is None:
+            return
+        color = categories.class_color(classid)
+        btn.setStyleSheet(
+            f"QToolButton {{ background-color: {color.name()}; "
+            "border: 1px solid palette(mid); border-radius: 3px; }")
+
+    def _refresh_all_color_swatches(self):
+        for classid in self._color_swatches:
+            self._refresh_color_swatch(classid)
+        # A detached window's swatch isn't in _color_swatches (it lives in
+        # its own top-level window, not the tab bar) -- refresh it too, so
+        # e.g. Toggle Colors doesn't leave a detached class's swatch stale.
+        for classid, win in self._detached.items():
+            self._refresh_color_swatch(classid, win.color_swatch)
+
+    @staticmethod
+    def _revert_label(classid):
+        if classid == categories.RECYCLE_BIN_ID:
+            return "Revert to Red"
+        if classid == categories.CONFIRMED_ID:
+            return "Revert to Green"
+        return "Reset to Automatic"
+
+    def _build_color_menu(self, classid):
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Choose Color...", lambda: self._choose_color(classid))
+        menu.addAction(self._revert_label(classid), lambda: self._reset_color(classid))
+        return menu
+
+    def _open_color_menu(self, classid, anchor):
+        menu = self._build_color_menu(classid)
+        menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
+
+    def _choose_color(self, classid):
+        target = self._target_or_none()
+        if target is None:
+            return
+        color = QtWidgets.QColorDialog.getColor(categories.class_color(classid), self, "Choose Color")
+        if color.isValid():
+            # Triggers rebuild_tabs() downstream (via update_all), which
+            # already refreshes every swatch -- no separate call needed here.
+            target.set_class_color(classid, color)
+
+    def _reset_color(self, classid):
+        target = self._target_or_none()
+        if target is None:
+            return
+        target.reset_class_color(classid)
+
     def _connect_grid(self, grid):
         grid.mx_image_selected.connect(self.mx_image_selected)
-        grid.selection_changed.connect(self.selection_changed)
+        grid.selection_changed.connect(self._commit_selection)
+
+    # -- selection (single source of truth, shared by every grid) -------
+    # Each ParticleGrid used to own its selection independently, so which
+    # uids looked "selected" depended on which grid instance happened to
+    # handle the gesture -- Ctrl+click in the tomogram window always wrote
+    # into "All"'s own grid specifically, invisible in whichever tab you
+    # were actually viewing, and a particle moved to a different class
+    # silently lost its highlight (the old grid dropped it with no
+    # notification, the new one never knew to apply it). _selected_uids
+    # here is the one place that's actually authoritative; every grid is
+    # a "dumb" renderer of it via apply_selection().
+    def selected_uids(self):
+        return list(self._selected_uids)
+
+    def toggle_uid(self, uid):
+        """Toggle one uid in/out of the selection -- used by TomoBoxer for
+        Ctrl+click in the tomogram views, so it affects the real selection
+        regardless of which tab happens to be docked/visible right now."""
+        sel = set(self._selected_uids)
+        if uid in sel:
+            sel.discard(uid)
+        else:
+            sel.add(uid)
+        self._commit_selection(sel)
+
+    def replace_selection(self, uids):
+        """Replace the selection outright -- used by TomoBoxer's undo/redo
+        restore-highlight and shape-based select tool in the tomogram
+        views."""
+        self._commit_selection(uids)
+
+    def clear_selection(self):
+        self._commit_selection([])
+
+    def _commit_selection(self, uids):
+        """The one place the selection actually changes, regardless of
+        which grid (or the tomogram window) requested it: updates the
+        shared set, pushes the result out to every grid this panel
+        manages so all of them render it consistently, then re-emits
+        selection_changed for TomoBoxer."""
+        self._selected_uids = set(uids or [])
+        for g in self._all_grids():
+            g.apply_selection(self._selected_uids)
+        self.selection_changed.emit(list(self._selected_uids))
 
     def _active_grid(self):
         w = self.tabs.currentWidget()
@@ -840,13 +1080,15 @@ class ParticleListPanel(QtWidgets.QWidget):
 
     # -- tabs / classes -----------------------------------------------------
     def rebuild_tabs(self, sets: dict):
-        """sets: {classid: name}. Adds/removes/renames class tabs to match,
-        ordered with the fixed Recycle Bin / Confirmed categories first and
-        everything else alphabetically after (see categories.category_order).
-        Detached windows are left alone (they aren't tabs), just their title
-        is refreshed on rename."""
+        """sets: {classid: name}. Adds/removes/renames class tabs to match.
+        A brand new tab always lands at the end of the normal-sets group
+        (just before "+"); an existing one's position is never touched
+        here -- the user may have dragged it, and only _pin_fixed_tabs
+        (fixed categories) and explicit drags (normal sets) ever move a
+        tab once it exists. Detached windows are left alone (they aren't
+        tabs), just their title is refreshed on rename."""
         wanted = dict(sets)
-        self._all_class_order = categories.category_order(wanted)
+        creation_order = categories.category_order(wanted)
 
         for classid in list(self._class_grids.keys()):
             if classid not in wanted:
@@ -854,6 +1096,7 @@ class ParticleListPanel(QtWidgets.QWidget):
                 self._class_names.pop(classid, None)
                 self._pending_entries.pop(classid, None)
                 self._visibility_checkboxes.pop(classid, None)
+                self._color_swatches.pop(classid, None)
                 idx = self.tabs.indexOf(grid)
                 if idx >= 0:
                     self.tabs.removeTab(idx)
@@ -863,7 +1106,7 @@ class ParticleListPanel(QtWidgets.QWidget):
                 win = self._detached.pop(classid)
                 win.close()
 
-        for classid in self._all_class_order:
+        for classid in creation_order:
             name = wanted[classid]
             if classid in self._detached:
                 win = self._detached[classid]
@@ -871,12 +1114,15 @@ class ParticleListPanel(QtWidgets.QWidget):
                 self._class_names[classid] = name
                 continue
             if classid in self._class_grids:
-                grid = self._class_grids[classid]
                 if self._class_names.get(classid) != name:
-                    idx = self.tabs.indexOf(grid)
-                    if idx >= 0:
-                        self.tabs.setTabText(idx, name)
                     self._class_names[classid] = name
+                    # Normal sets get their number-prefixed label repainted
+                    # by _renumber_tabs() below; fixed categories aren't
+                    # numbered, so they need setting directly here.
+                    if classid in categories.FIXED_CLASS_IDS:
+                        idx = self.tabs.indexOf(self._class_grids[classid])
+                        if idx >= 0:
+                            self.tabs.setTabText(idx, name)
                 continue
             grid = ParticleGrid()
             self._connect_grid(grid)
@@ -885,32 +1131,167 @@ class ParticleListPanel(QtWidgets.QWidget):
             self._class_grids[classid] = grid
             self._class_names[classid] = name
             # Insert before "+" (which addTab would otherwise land after,
-            # since it's always the last tab) -- _reorder_tabs fixes up the
-            # rest of the ordering below regardless.
+            # since it's always the last tab) -- this alone is what puts a
+            # brand new set at the end of the normal-sets group.
             self.tabs.insertTab(self.tabs.indexOf(self._plus_placeholder), grid, name)
+            idx = self.tabs.indexOf(grid)
             cb = self._make_visibility_checkbox(classid)
             self._visibility_checkboxes[classid] = cb
-            self.tabs.tabBar().setTabButton(self.tabs.indexOf(grid), QtWidgets.QTabBar.LeftSide, cb)
+            self.tabs.tabBar().setTabButton(idx, QtWidgets.QTabBar.LeftSide, cb)
+            swatch = self._make_color_swatch(classid)
+            self._color_swatches[classid] = swatch
+            self.tabs.tabBar().setTabButton(idx, QtWidgets.QTabBar.RightSide, swatch)
 
-        self._reorder_tabs()
+        self._pin_fixed_tabs()
+        self._renumber_tabs()
+        # A class's color can change for reasons this method doesn't see
+        # directly (Toggle Colors' rotation, or a swatch on some other
+        # already-existing tab) -- refreshing every swatch here, on every
+        # call, keeps them always correct rather than tracking each
+        # possible trigger individually. Cheap: just a handful of classes.
+        self._refresh_all_color_swatches()
 
-    def _reorder_tabs(self):
-        """Move docked class tabs into _all_class_order (tab 0 is always
-        "All"), and pin "+" to the very last position. Needed both after
-        rebuild_tabs adds/removes tabs and after reattaching a detached
-        tab, since insertTab there just appends."""
+    def _is_tab_locked(self, index):
+        """"All", "+", and the fixed categories can't be dragged -- only
+        normal sets can (see _ConstrainedTabBar)."""
+        widget = self.tabs.widget(index)
+        if widget is self.grid or widget is self._plus_placeholder:
+            return True
+        for cid, grid in self._class_grids.items():
+            if grid is widget:
+                return cid in categories.FIXED_CLASS_IDS
+        return False
+
+    def _tab_drag_bounds(self):
+        """Pixel x-range (tab-bar-local) a normal tab may be dragged
+        within -- right after "All" and whichever fixed categories exist,
+        up to just before "+". Computed fresh at the start of each drag
+        (see _ConstrainedTabBar.mousePressEvent), not cached, so it
+        reflects the pinned tabs' actual current widths."""
         bar = self.tabs.tabBar()
-        for pos, classid in enumerate(self._all_class_order, start=1):
-            grid = self._class_grids.get(classid)
-            if grid is None:
-                continue
-            cur = self.tabs.indexOf(grid)
-            if cur >= 0 and cur != pos:
-                bar.moveTab(cur, pos)
+        fixed_count = 1 + sum(1 for cid in categories.FIXED_CLASS_IDS if cid in self._class_grids)
+        lo = bar.tabRect(fixed_count - 1).right() + 1
         plus_idx = self.tabs.indexOf(self._plus_placeholder)
-        last = self.tabs.count() - 1
-        if plus_idx >= 0 and plus_idx != last:
-            bar.moveTab(plus_idx, last)
+        hi = bar.tabRect(plus_idx).left() - 1
+        return (lo, hi)
+
+    def _pin_fixed_tabs(self):
+        """Keep "All" at position 0, Recycle Bin/Confirmed (whichever
+        exist) pinned right after it in that order, and "+" pinned last.
+        Normal sets are deliberately left alone here -- their relative
+        order is up to the user (drag to rearrange) now, not recomputed
+        on every call. Needed both after rebuild_tabs adds/removes tabs
+        and after reattaching a detached tab, since insertTab/addTab
+        there just appends.
+
+        Reentrancy-guarded: moveTab() below emits tabMoved synchronously,
+        which _on_tab_moved handles by calling straight back into this
+        method -- without the guard, that nested call would repeat the
+        very same corrections the outer call hasn't finished making yet,
+        recursing arbitrarily deep instead of the two or three moveTab
+        calls this actually ever needs."""
+        if self._pinning_fixed_tabs:
+            return
+        self._pinning_fixed_tabs = True
+        try:
+            bar = self.tabs.tabBar()
+            all_idx = self.tabs.indexOf(self.grid)
+            if all_idx >= 0 and all_idx != 0:
+                bar.moveTab(all_idx, 0)
+            pos = 1
+            for cid in categories.FIXED_CLASS_IDS:
+                grid = self._class_grids.get(cid)
+                if grid is None:
+                    continue
+                cur = self.tabs.indexOf(grid)
+                if cur >= 0 and cur != pos:
+                    bar.moveTab(cur, pos)
+                pos += 1
+            plus_idx = self.tabs.indexOf(self._plus_placeholder)
+            last = self.tabs.count() - 1
+            if plus_idx >= 0 and plus_idx != last:
+                bar.moveTab(plus_idx, last)
+        finally:
+            self._pinning_fixed_tabs = False
+
+    def _on_tab_moved(self, from_index, to_index):
+        """Re-pin "All"/Recycle Bin/Confirmed/"+" after every single step
+        of a drag, not just check whether the dragged tab's own landing
+        spot looks in-range: a mouseMoveEvent clamp (_ConstrainedTabBar)
+        stops most out-of-bounds drags before they happen, but Qt's own
+        per-pixel drag-reorder can still resolve one large/fast mouse move
+        as several internal swaps at once, and a narrow "is to_index
+        within [fixed_count, plus_index-1]" check can pass even though a
+        normal tab ended up wedged *between* two fixed categories (e.g.
+        Recycle Bin and Confirmed swapped past each other, each only
+        partially). _pin_fixed_tabs() moving a fixed tab back to its own
+        slot naturally shoves whatever normal tab was squatting there into
+        the first free normal slot instead (moveTab's own semantics), so
+        unconditionally re-pinning after every reorder step self-heals any
+        scramble, not just the single-boundary-overshoot case."""
+        self._pin_fixed_tabs()
+        self._renumber_tabs()
+
+    def _current_class_order(self):
+        """Fixed categories, then normal sets, in whatever order their
+        tabs actually sit in right now -- the live source of truth for
+        display order, since drag-reordering only ever moves the real
+        QTabWidget's tabs and nothing else needs to track it separately."""
+        order = []
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            if widget is self.grid or widget is self._plus_placeholder:
+                continue
+            for cid, grid in self._class_grids.items():
+                if grid is widget:
+                    order.append(cid)
+                    break
+        return order
+
+    def _all_visible_class_order(self):
+        """Every class that can have particles shown in the "All" tab --
+        fixed categories and normal sets in their current docked tab
+        order, plus any *detached* class (fixed or normal) appended at
+        the end. Unlike _current_class_order() alone, this doesn't drop a
+        detached class: its tab isn't in the bar to read an order from,
+        but its particles are still just as visible in the tomogram
+        views and still need their own group in "All" -- omitting it here
+        left its uids sitting in this grid's _items with no _slot_of_uid
+        entry at all (sync_particles_grouped only assigns one to classids
+        it's told about), crashing the very next relayout."""
+        docked = self._current_class_order()
+        seen = set(docked)
+        detached_only = [cid for cid in self._detached if cid not in seen]
+        detached_only.sort(key=lambda cid: (cid not in categories.FIXED_CLASS_IDS, self._class_names.get(cid, "")))
+        return docked + detached_only
+
+    def normal_class_order(self):
+        """Normal (non-fixed) classids in current tab order, skipping any
+        that are currently detached -- a detached set has no tab position
+        to switch to, so number-key selection skips it entirely (see
+        TomoBoxer.select_set_by_number)."""
+        return [cid for cid in self._current_class_order() if cid not in categories.FIXED_CLASS_IDS]
+
+    def _renumber_tabs(self):
+        """Label each normal set's tab with its current position (1-9) --
+        exactly what the number-key shortcuts switch to, so the mapping
+        is always visible and always matches whatever's on screen,
+        dragged or not."""
+        for position, cid in enumerate(self.normal_class_order(), start=1):
+            grid = self._class_grids.get(cid)
+            idx = self.tabs.indexOf(grid) if grid is not None else -1
+            if idx >= 0:
+                name = self._class_names.get(cid, "")
+                label = f"{position}  {name}" if position <= 9 else name
+                self.tabs.setTabText(idx, label)
+
+    def activate_class_tab(self, classid):
+        """Switch to a class's own tab -- used by number-key shortcuts so
+        the gallery stays in sync with whichever class just became active
+        for picking, the same as clicking the tab directly would."""
+        grid = self._class_grids.get(classid)
+        if grid is not None:
+            self.tabs.setCurrentWidget(grid)
 
     def _detach_current_tab(self):
         classid = self._active_classid()
@@ -924,6 +1305,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         # the time DetachedGridWindow might otherwise try to reuse it. A
         # fresh one is made just below instead (same as _reattach does).
         self._visibility_checkboxes.pop(classid, None)
+        self._color_swatches.pop(classid, None)
         # Switch away from the tab being removed *first* -- otherwise, when
         # it's the last real class tab, Qt shifts the current tab onto
         # whatever ends up in its place, which is the "+" placeholder,
@@ -934,7 +1316,10 @@ class ParticleListPanel(QtWidgets.QWidget):
         idx = self.tabs.indexOf(grid)
         if idx >= 0:
             self.tabs.removeTab(idx)
-        win = DetachedGridWindow(classid, grid, name, self._make_visibility_checkbox(classid))
+        self._renumber_tabs()  # close the numbering gap left behind
+        win = DetachedGridWindow(
+            classid, grid, name,
+            self._make_visibility_checkbox(classid), self._make_color_swatch(classid))
         win.closed.connect(self._reattach)
         self._detached[classid] = win
         win.show()
@@ -948,17 +1333,23 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._class_grids[classid] = grid
         grid.setVisible(True)
         self.tabs.addTab(grid, name)
+        idx = self.tabs.indexOf(grid)
         cb = self._make_visibility_checkbox(classid)
         self._visibility_checkboxes[classid] = cb
-        self.tabs.tabBar().setTabButton(self.tabs.indexOf(grid), QtWidgets.QTabBar.LeftSide, cb)
-        self._reorder_tabs()
+        self.tabs.tabBar().setTabButton(idx, QtWidgets.QTabBar.LeftSide, cb)
+        swatch = self._make_color_swatch(classid)
+        self._color_swatches[classid] = swatch
+        self.tabs.tabBar().setTabButton(idx, QtWidgets.QTabBar.RightSide, swatch)
+        self._pin_fixed_tabs()  # a reattached tab lands at the end of the normal group
+        self._renumber_tabs()
         self.tabs.setCurrentWidget(grid)
 
     # -- particle sync --------------------------------------------------------
     def sync_particles(self, entries):
         """entries: iterable of (uid, img, classid)."""
         entries = list(entries)
-        self.grid.sync_particles_grouped(entries, self._all_class_order)
+        self.grid.sync_particles_grouped(entries, self._all_visible_class_order())
+        self.grid.apply_selection(self._selected_uids)
         by_class = {}
         for uid, img, cid in entries:
             by_class.setdefault(cid, []).append((uid, img))
@@ -967,6 +1358,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             class_entries = by_class.get(classid, [])
             if grid is current_widget:
                 grid.sync_particles(class_entries)
+                grid.apply_selection(self._selected_uids)
                 self._pending_entries.pop(classid, None)
             else:
                 # Not the tab on screen right now -- its thumbnails aren't
@@ -986,6 +1378,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             # top-level windows, not tab pages Qt can tell us are hidden --
             # always keep them eagerly in sync.
             win.grid.sync_particles(by_class.get(classid, []))
+            win.grid.apply_selection(self._selected_uids)
 
     def closeEvent(self, event):
         target = self._target() if self._target is not None else None

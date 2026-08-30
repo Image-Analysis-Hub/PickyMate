@@ -61,9 +61,12 @@ Two fixed categories always exist alongside your own sets:
 - Sending particles into a class never overrides a visibility you've
   already set — a hidden set stays hidden even as more particles land in it.
 - **Number keys 1-9** switch the active picking class to the 1st-9th normal
-  set (in the same order the gallery's tabs list them); Recycle Bin/Confirmed
-  aren't reachable this way since you never pick new particles into them
-  directly.
+  set and switch the gallery to that set's own tab — the same number shown
+  right on the tab, which always matches whatever order the tabs are
+  currently in (see "Reordering tabs" below), so the mapping is never a
+  guess. A detached set has no tab to number, so it's skipped; Recycle
+  Bin/Confirmed aren't reachable this way either, since you never pick new
+  particles into them directly.
 
 ## Box size and contrast
 
@@ -96,9 +99,39 @@ Sets window:
 - Each set's tab has its own **visibility checkbox**, independent of which
   tab you're currently looking at — any number of sets can be visible in
   the tomogram views at once.
+- Each tab also has a **color swatch** showing that set's current color —
+  click it for **Choose Color...** (any color, not just the palette) or to
+  revert it (**Reset to Automatic** for a normal set, **Revert to
+  Red**/**Revert to Green** for Recycle Bin/Confirmed, which can be
+  recolored too). A manually-set color is remembered across restarts and
+  is never touched by Toggle Colors.
 - **Empty Recycle Bin** only appears while the Recycle Bin tab is active.
 - Switching to a set's tab also makes it the active picking class — the
   same as clicking a Sets-panel row used to.
+- **Reordering tabs** — drag a normal set's tab to put your own sets in
+  whatever order you like; number keys then follow that order (tab 1 is
+  always whichever set is currently first). "All", Recycle Bin, Confirmed,
+  and "+" stay fixed in place and can't be dragged.
+
+The particle list also has its own toolbar, above the tabs:
+
+- **Toggle Colors** rotates every set still on its automatic color to the
+  next one in the palette at once — Recycle Bin/Confirmed's own red/green
+  (and the yellow selection highlight, which is always fixed) aren't part
+  of that rotation, though either can still be recolored manually via its
+  own tab's color swatch. Any manually-set color, on any set, is left
+  alone by Toggle Colors too.
+- **Show the active channel only** shows only the active tab's set, hiding every
+  other one, and keeps following whichever tab you switch to (including
+  by number key, and Recycle Bin/Confirmed, without making either the
+  active picking class) — handy for flipping through channels one at a
+  time. Following the **All** tab shows every set instead, matching what
+  All itself displays. Turning it off restores exactly the visibility you
+  had before turning it on. While it's on, the gallery's per-tab
+  visibility checkboxes are grayed out (hover one for a reminder to turn
+  it off first).
+- **Show All Channels** is a one-shot button that makes every set visible
+  and turns Show the active channel only off if it was on.
 
 Beyond sets management:
 
@@ -124,12 +157,13 @@ Beyond sets management:
   uses, so it works interchangeably with Ctrl/Alt+click in the gallery.
 - A small label at the bottom-right of the tomogram window shows "N
   particle(s) selected", the way a file manager shows a selection count.
-- The **Edit** toolbar acts on that selection directly: **Confirm
+- The **Selection** toolbar acts on that selection directly: **Confirm
   Selected**, **Recycle Selected**, and **Move Selected** (type a set name
-  — existing or new — into the box beside it, then Move Selected).
-- **Toggle Colors** (Edit toolbar) rotates every normal set to the next
-  color in the palette at once — Recycle Bin's red, Confirmed's green, and
-  the yellow selection highlight are reserved and never change.
+  — existing or new — into the box beside it, then Move Selected). Each
+  one clears the selection afterward, the same way a file manager doesn't
+  keep files selected once you've moved them.
+- **Escape** clears the current selection from anywhere in the app, not
+  just while a tomogram view has keyboard focus.
 
 ## Undo / redo
 
@@ -159,7 +193,8 @@ The **File** menu offers:
 |---|---|
 | Add particle | Click empty space (tomogram view, Pick tool) |
 | Move particle | Click + drag (tomogram view, Pick tool) |
-| Switch active picking class | 1-9 |
+| Switch active picking class + gallery tab | 1-9 |
+| Reorder a set's tab | Drag it in the gallery |
 | Pan | Right-click + drag (tomogram view or gallery) |
 | Zoom | Mouse wheel |
 | Step depth/slice | Shift + wheel (tomogram view) |
@@ -173,6 +208,7 @@ The **File** menu offers:
 | Finish freeform selection | Double-click, Enter, or click near the start point |
 | Undo last freeform point | Backspace (while placing points) |
 | Cancel freeform selection | Escape |
+| Clear the current selection (anywhere in the app) | Escape |
 | New set | Click the gallery's "+" tab |
 | Rename set | Double-click its tab |
 | Undo | Ctrl+Z |
