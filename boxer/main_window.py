@@ -6,9 +6,9 @@ outside the EMAN2 environment, built on plain PySide6 + numpy + mrcfile.
 Feature-complete for v1: orthogonal XY/XZ/ZY slice viewing, 2D or 3D particle
 picking with mouse (move/drag/shift-delete), an eraser tool, multiple
 picking "sets" (classes) with visibility toggles, per-class box size, slab
-thickness averaging, saving/loading picks to a JSON sidecar next to the
-tomogram, saving picks as a plain text coordinate file, and saving
-extracted particles as an MRC stack (2D) or a folder of MRC volumes (3D).
+thickness averaging, autosaving picks as one plain text coordinate file per
+class next to the tomogram, and importing/exporting copies of those files
+from the File menu.
 
 Deferred to a later pass (noted in the code where relevant): PCA-based
 tomogram "flatten" re-orientation, GIF export, and window-geometry
@@ -17,20 +17,31 @@ persistence.
 from __future__ import annotations
 
 import os
+import shutil
 import weakref
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
+from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
 from .thumb_grid import ParticleListPanel
 from .widgets import LabeledSpinBox, RangeSlider, space_key_state
 from . import categories
 from . import metadata
-from .metadata import base_name
 from .shapes import Shape
-from .volume import Volume, normalize, ParticleStackWriter
+from .volume import Volume
+
+# Shared by the shape-select tool (rectangle/circle/freeform) below: index
+# of each axis into a box's [x, y, z, ...] entry, and which two axes are
+# "in-plane" for a given view's depth axis -- matching the exact (a1, a2)
+# order update_box_shape already uses when building each view's own Shape
+# geometry (xyview: x,y; xzview: x,z; zyview: z,y).
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+_VIEW_PLANE_AXES = {"z": ("x", "y"), "y": ("x", "z"), "x": ("z", "y")}
+_SELECT_PREVIEW_COLOR = (1.0, 1.0, 1.0)  # white -- distinct from every reserved/class color
+_SELECT_CLOSE_PIXELS = 8  # screen-pixel radius for "clicked near the first freeform point"
 
 
 def parse_setname(name):
@@ -64,9 +75,22 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         # -- menu ---------------------------------------------------------
         self.mfile = self.menuBar().addMenu("File")
+        self.mfile_save_all = self.mfile.addAction("Save")
+        self.mfile.addSeparator()
         self.mfile_read_boxloc = self.mfile.addAction("Read Box Coord")
         self.mfile_save_boxloc = self.mfile.addAction("Save Box Coord")
-        self.mfile_save_boxes_stack = self.mfile.addAction("Save Boxes as Stack")
+
+        # Populated further down, once undo()/redo() and the undo/redo
+        # stacks exist -- created here so File/Edit/Help land in that order
+        # on the menu bar regardless.
+        self.medit = self.menuBar().addMenu("Edit")
+
+        self._shortcuts_dialog = None
+        self.mhelp = self.menuBar().addMenu("Help")
+        self.mhelp_shortcuts_action = self.mhelp.addAction("Keyboard Shortcuts...")
+        self.mhelp_shortcuts_action.setShortcut(QtGui.QKeySequence("F1"))
+        self.mhelp_shortcuts_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.mhelp_shortcuts_action.triggered.connect(self.show_shortcuts_dialog)
 
         # -- central layout: 3 orthogonal views + control panel ------------
         self.setCentralWidget(QtWidgets.QWidget())
@@ -110,37 +134,58 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wbautoc = QtWidgets.QPushButton("AutoContrast")
         self.wbautoc.setCheckable(True)
         self.wbautoc.setChecked(True)
+        self.wbautoc.setToolTip(
+            "Continuously auto-stretch contrast per slice/thumbnail. "
+            "Turned off automatically when you drag the Contrast slider.")
         gbl3.addWidget(self.wbautoc)
 
         self.wcontrast = RangeSlider(minimum=0.0, maximum=1.0, low=0.0, high=1.0)
+        self.wcontrast.setToolTip(
+            "Manual black/white display levels. Dragging a handle switches "
+            "off AutoContrast; the new levels apply once you release the "
+            "mouse, not while dragging. Affects the tomogram views and "
+            "every gallery thumbnail identically.")
         self.gbl2.addWidget(self.wcontrast, 1, 0, 1, 2)
 
         self.wboxsize = LabeledSpinBox(label="Box Size:", value=0, minimum=1, maximum=8192)
+        self.wboxsize.setToolTip(
+            "Box size in pixels. Applies once you press Enter, click "
+            "elsewhere, or use the arrows -- not on every keystroke.")
         self.gbl2.addWidget(self.wboxsize, 2, 0)
 
         self.wboxsize_allsets = QtWidgets.QCheckBox("Apply to All Sets")
         self.wboxsize_allsets.setChecked(True)
+        self.wboxsize_allsets.setToolTip(
+            "Keep every set at the same box size, and size a newly created "
+            "set to match. Checking this also immediately resizes every "
+            "set to the number currently shown, even if you don't change it.")
         self.gbl2.addWidget(self.wboxsize_allsets, 2, 1)
 
-        label0 = QtWidgets.QLabel("Thickness")
+        label0 = QtWidgets.QLabel("Avg Slices:")
+        label0.setToolTip(
+            "Averages this many slices, centered on the current depth, into "
+            "each view -- reduces noise without changing overall brightness "
+            "(it's a mean, not a sum).")
         self.gbl2.addWidget(label0, 3, 0)
         self.wnlayers = QtWidgets.QSpinBox()
         self.wnlayers.setRange(1, 256)
         self.wnlayers.setValue(1)
+        self.wnlayers.setToolTip(label0.toolTip())
         self.gbl2.addWidget(self.wnlayers, 3, 1)
 
         self.curbox = -1
         self.boxes = []       # [x, y, z, method, score, class_id, uid]
         self.boxesimgs = []
         self.dragging = -1
+        self._select_drawing = None  # in-progress shape-select gesture, or None
         self._next_uid = 0
         self._undo_stack = []
         self._redo_stack = []
 
         # -- wiring -----------------------------------------------------------
+        self.mfile_save_all.triggered.connect(self.menu_file_save_all)
         self.mfile_read_boxloc.triggered.connect(self.menu_file_read_boxloc)
         self.mfile_save_boxloc.triggered.connect(self.menu_file_save_boxloc)
-        self.mfile_save_boxes_stack.triggered.connect(self.save_boxes)
 
         self.wdepth.valueChanged[int].connect(self.event_depth)
         self.wnlayers.valueChanged[int].connect(self.event_nlayers)
@@ -154,6 +199,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xyview.mousedrag.connect(self.xy_drag)
         self.xyview.mouseup.connect(self.mouse_up)
         self.xyview.mousewheel.connect(self.xy_wheel)
+        self.xyview.mousedoubleclick.connect(self.xy_doubleclick)
         self.xyview.signal_set_scale.connect(self.event_scale)
         self.xyview.origin_update.connect(self.xy_origin)
 
@@ -161,6 +207,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xzview.mousedrag.connect(self.xz_drag)
         self.xzview.mouseup.connect(self.mouse_up)
         self.xzview.mousewheel.connect(self.xz_wheel)
+        self.xzview.mousedoubleclick.connect(self.xz_doubleclick)
         self.xzview.signal_set_scale.connect(self.event_scale)
         self.xzview.origin_update.connect(self.xz_origin)
         self.xzview.mousemove.connect(self.xz_move)
@@ -169,44 +216,268 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.zyview.mousedrag.connect(self.zy_drag)
         self.zyview.mouseup.connect(self.mouse_up)
         self.zyview.mousewheel.connect(self.zy_wheel)
+        self.zyview.mousedoubleclick.connect(self.zy_doubleclick)
         self.zyview.signal_set_scale.connect(self.event_scale)
         self.zyview.origin_update.connect(self.zy_origin)
         self.zyview.mousemove.connect(self.zy_move)
 
         self.xyview.keypress.connect(self.key_press)
+        # Freeform select's Enter/Escape/Backspace need to work no matter
+        # which of the 3 views the polygon is being drawn in, not just the
+        # main XY one.
+        self.xzview.keypress.connect(self.key_press)
+        self.zyview.keypress.connect(self.key_press)
 
-        self.undo_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Undo, self)
-        self.undo_shortcut.setContext(Qt.ApplicationShortcut)
-        self.undo_shortcut.activated.connect(self.undo)
+        # -- tool selector: Pick / Eraser / Select ---------------------------
+        # These are mutually exclusive *tools* (Photoshop/GIMP-style), not
+        # independent settings -- exactly one is ever active, and each has
+        # its own small set of options that only matter while it's the
+        # active one. QActionGroup gives the exclusivity for free (checking
+        # one unchecks the others) instead of the manual cross-wiring a set
+        # of independent checkboxes would need.
+        self.tool_pick_action = QtGui.QAction("Pick", self)
+        self.tool_pick_action.setCheckable(True)
+        self.tool_pick_action.setChecked(True)
+        self.tool_pick_action.setToolTip(
+            "Normal picking: click empty space to add, click + drag an "
+            "existing particle to move it. Shift/Space/Ctrl+click still "
+            "work for Recycle Bin/Confirmed/multi-select.")
+
+        self.tool_eraser_action = QtGui.QAction("Eraser", self)
+        self.tool_eraser_action.setCheckable(True)
+        self.tool_eraser_action.setToolTip(
+            "Click-drag in a tomogram view to send every particle within "
+            "Radius of the cursor to the Recycle Bin.")
+
+        self.tool_select_action = QtGui.QAction("Select", self)
+        self.tool_select_action.setCheckable(True)
+        self.tool_select_action.setToolTip(
+            "Draw a shape in a tomogram view to select every particle "
+            "inside it (replacing the current selection), instead of "
+            "picking/moving particles. Use Confirm/Recycle Selected or "
+            "Move Selected to act on the result.")
+
+        self.tool_group = QtGui.QActionGroup(self)
+        self.tool_group.setExclusive(True)
+        for a in (self.tool_pick_action, self.tool_eraser_action, self.tool_select_action):
+            self.tool_group.addAction(a)
+        self.tool_group.triggered.connect(self._on_tool_changed)
+
+        # Per-tool options: all shown at fixed positions all the time,
+        # simply grayed out unless their tool is active -- rather than a
+        # QStackedWidget that swaps a differently-sized page in per tool.
+        # That was tried first, but QToolBar's own layout only computes
+        # each added widget's position once, from its sizeHint() at the
+        # time it was added; it does not reflow later items when an
+        # earlier one's size changes afterwards the way an ordinary layout
+        # would, and letting the toolbar's total width change every time
+        # the tool changed could make the whole row overflow and rearrange
+        # unpredictably. Nothing here ever changes size or position, so
+        # that whole class of problem doesn't come up: switching tools
+        # only ever flips enabled states in place.
+        self.eraser_radius = LabeledSpinBox(label="Radius:", value=128, minimum=1, maximum=8192)
+        self.eraser_radius.setToolTip(
+            "Eraser radius in pixels. Applies once you press Enter, click "
+            "elsewhere, or use the arrows -- not on every keystroke.")
+        self.eraser_radius.setEnabled(False)
+
+        self.select_shape_rect = QtWidgets.QRadioButton("Rectangle")
+        self.select_shape_circle = QtWidgets.QRadioButton("Circle")
+        self.select_shape_freeform = QtWidgets.QRadioButton("Freeform")
+        self.select_shape_rect.setChecked(True)
+        self.select_shape_group = QtWidgets.QButtonGroup(self)
+        for rb in (self.select_shape_rect, self.select_shape_circle, self.select_shape_freeform):
+            self.select_shape_group.addButton(rb)
+            rb.setEnabled(False)
+            # Switching shape mid-drag is ambiguous, so cancel whatever
+            # shape-select was in progress rather than apply the new choice
+            # retroactively to an old gesture.
+            rb.toggled.connect(self._select_cancel_drawing)
+
+        # One shared 2D/3D toggle rather than a separate one per tool: it's
+        # the same concept either way (only affect what's visible on the
+        # current slice, or not), and sharing it means switching tools
+        # doesn't silently reset a choice you already made. Meaningless for
+        # Pick, so disabled while Pick is active.
+        self.tool_3d_checkbox = QtWidgets.QCheckBox("3D")
+        self.tool_3d_checkbox.setToolTip(
+            "2D: only affects/selects particles actually visible on the "
+            "current slice. 3D: Eraser affects a full sphere of Radius "
+            "regardless of depth; Select drops the depth limit entirely, "
+            "extruding the shape (cuboid/cylinder/tube) through the whole "
+            "volume.")
+        self.tool_3d_checkbox.setEnabled(False)
+        self.tool_3d_checkbox.toggled.connect(self._select_cancel_drawing)
+
+        self.tools_toolbar = self.addToolBar("Tools")
+        self.tools_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.tools_toolbar.addAction(self.tool_pick_action)
+        self.tools_toolbar.addAction(self.tool_eraser_action)
+        self.tools_toolbar.addAction(self.tool_select_action)
+        self.tools_toolbar.addSeparator()
+        self.tools_toolbar.addWidget(self.eraser_radius)
+        self.tools_toolbar.addWidget(self.select_shape_rect)
+        self.tools_toolbar.addWidget(self.select_shape_circle)
+        self.tools_toolbar.addWidget(self.select_shape_freeform)
+        self.tools_toolbar.addWidget(self.tool_3d_checkbox)
+
+        # QAction rather than a bare QShortcut for both: it gives Undo/Redo
+        # a visible Edit-menu entry (with the shortcut shown alongside it
+        # for free) and a toolbar button, in addition to still responding
+        # to the keyboard shortcut -- one object serves all three.
+        self.undo_action = QtGui.QAction("Undo", self)
+        self.undo_action.setShortcut(QtGui.QKeySequence.Undo)
+        self.undo_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.undo_action.setToolTip("Undo (Ctrl+Z)")
+        self.undo_action.triggered.connect(self.undo)
 
         # QKeySequence.Redo resolves to whatever the desktop theme defines
         # as "the" redo key -- on Linux (GNOME/KDE) that's normally
-        # Ctrl+Shift+Z, not Ctrl+Y (the Windows convention), so a plain
-        # QShortcut(QKeySequence.Redo, self) left Ctrl+Y doing nothing.
-        # Merge Ctrl+Y into the same shortcut's key list (rather than
-        # registering it as a second separate QShortcut) so it works
-        # everywhere without ever colliding with the native binding as an
-        # "ambiguous shortcut" on platforms where they're already the same.
+        # Ctrl+Shift+Z, not Ctrl+Y (the Windows convention), so relying on
+        # just QKeySequence.Redo left Ctrl+Y doing nothing. Merge Ctrl+Y
+        # into the same action's key list (rather than a second action for
+        # it) so it works everywhere without ever colliding with the native
+        # binding as an "ambiguous shortcut" on platforms where they're
+        # already the same.
         redo_keys = QtGui.QKeySequence.keyBindings(QtGui.QKeySequence.Redo)
         ctrl_y = QtGui.QKeySequence("Ctrl+Y")
         if ctrl_y not in redo_keys:
             redo_keys.append(ctrl_y)
-        self.redo_shortcut = QtGui.QShortcut(self)
-        self.redo_shortcut.setKeys(redo_keys)
-        self.redo_shortcut.setContext(Qt.ApplicationShortcut)
-        self.redo_shortcut.activated.connect(self.redo)
+        self.redo_action = QtGui.QAction("Redo", self)
+        self.redo_action.setShortcuts(redo_keys)
+        self.redo_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.redo_action.setToolTip("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+        self.redo_action.triggered.connect(self.redo)
+
+        self.medit.addAction(self.undo_action)
+        self.medit.addAction(self.redo_action)
+
+        self.confirm_selected_action = QtGui.QAction("Confirm Selected", self)
+        self.confirm_selected_action.setToolTip("Send every currently selected particle to Confirmed.")
+        self.confirm_selected_action.triggered.connect(lambda: self.confirm_particles_by_uid(self._selected_uids))
+
+        self.recycle_selected_action = QtGui.QAction("Recycle Selected", self)
+        self.recycle_selected_action.setToolTip("Send every currently selected particle to the Recycle Bin.")
+        self.recycle_selected_action.triggered.connect(lambda: self.delete_particles_by_uid(self._selected_uids))
+
+        # Editable so you can type a brand-new set name too, not just pick
+        # an existing one (matches move_particles_by_uid, which creates the
+        # class if it doesn't exist yet).
+        self.move_to_combo = QtWidgets.QComboBox()
+        self.move_to_combo.setEditable(True)
+        self.move_to_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+        self.move_to_combo.setMinimumWidth(120)
+        self.move_to_combo.setToolTip("Type an existing or new set name, then Move Selected to.")
+        # A placeholder rather than leaving it blank -- an empty editable
+        # combo box otherwise gives no visual hint that there's an input
+        # here at all, as opposed to just dead space next to the button.
+        self.move_to_combo.lineEdit().setPlaceholderText("..........")
+
+        self.move_selected_action = QtGui.QAction("Move Selected to", self)
+        self.move_selected_action.setToolTip("Move every currently selected particle to the set named at right.")
+        self.move_selected_action.triggered.connect(self._move_selected_via_toolbar)
+
+        self.toggle_colors_action = QtGui.QAction("Toggle Colors", self)
+        self.toggle_colors_action.setToolTip(
+            "Rotate every normal set to the next color at once. Recycle "
+            "Bin (red), Confirmed (green), and the yellow selection "
+            "highlight never change.")
+        self.toggle_colors_action.triggered.connect(self.toggle_colors)
+
+        self.edit_toolbar = self.addToolBar("Edit")
+        self.edit_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.edit_toolbar.addAction(self.undo_action)
+        self.edit_toolbar.addAction(self.redo_action)
+        self.edit_toolbar.addSeparator()
+        self.edit_toolbar.addAction(self.toggle_colors_action)
+
+        # A separate toolbar (not just a separator inside Edit) so the
+        # "acts on whatever's currently selected" actions read as one clear
+        # group at a glance, with its own label, rather than blending into
+        # Undo/Redo/Toggle Colors. addToolBarBreak() forces it onto its own
+        # row unconditionally -- without it, Qt packs toolbars side by side
+        # on the same row whenever they happen to fit, so which row this
+        # landed on would depend on the window's current width.
+        self.addToolBarBreak()
+        self.selection_toolbar = self.addToolBar("Selection")
+        self.selection_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.selection_toolbar.addWidget(QtWidgets.QLabel(" Selection: "))
+        self.selection_toolbar.addAction(self.confirm_selected_action)
+        self.selection_toolbar.addAction(self.recycle_selected_action)
+        self.selection_toolbar.addAction(self.move_selected_action)
+        self.selection_toolbar.addWidget(self.move_to_combo)
+
+        # A QAction-based toolbar button (QToolButton, auto-raise) is flat
+        # and borderless until hovered by default -- that's the standard
+        # toolbar convention, but next to a real QPushButton like
+        # AutoContrast it can read as "not actually a button" rather than
+        # deliberately minimal. Rather than give every toolbar button
+        # AutoContrast's raised 3D chrome (which looks dated for a row with
+        # this many actions), this gives them a flat "chip" look that's
+        # still clearly bounded at rest, with a hover tint, a pressed
+        # state, and -- most importantly for the exclusive Pick/Eraser/
+        # Select tools, which had no strong visual cue for which one was
+        # active -- a solid accent fill while checked. palette(...) roles
+        # keep it adapting to whatever light/dark theme is active, rather
+        # than hardcoding colors that could look wrong on either.
+        self.setStyleSheet(self.styleSheet() + """
+            QToolBar QToolButton {
+                background-color: palette(button);
+                border: 1px solid palette(mid);
+                border-radius: 4px;
+                padding: 3px 9px;
+                margin: 1px;
+            }
+            QToolBar QToolButton:hover {
+                background-color: palette(light);
+                border-color: palette(dark);
+            }
+            QToolBar QToolButton:pressed {
+                background-color: palette(mid);
+            }
+            QToolBar QToolButton:checked {
+                background-color: palette(highlight);
+                color: palette(highlighted-text);
+                border-color: palette(highlight);
+            }
+            QToolBar QToolButton:disabled {
+                background-color: palette(window);
+                border-color: palette(midlight);
+                color: palette(mid);
+            }
+        """)
+
+        # A small permanent (right-aligned) status-bar label, like a file
+        # manager's "N items selected" -- the only ambient feedback for the
+        # current selection now that there's no dedicated Selection panel.
+        self.selection_status_label = QtWidgets.QLabel("")
+        self.statusBar().addPermanentWidget(self.selection_status_label)
+
+        # All start disabled (nothing to undo/redo/act on yet); kept in
+        # sync by _refresh_undo_redo_actions() (end of _push_undo/undo/redo/
+        # set_data) and set_selected_uids() respectively.
+        self._refresh_undo_redo_actions()
+        self.confirm_selected_action.setEnabled(False)
+        self.recycle_selected_action.setEnabled(False)
+        self.move_to_combo.setEnabled(False)
+        self.move_selected_action.setEnabled(False)
+
+        # Bare 1-9 switch the active picking class (Photoshop/Lightroom-
+        # style). Application-wide like undo/redo above, so it works no
+        # matter which window has focus -- but a QSpinBox/QLineEdit/editable
+        # QComboBox with focus (box size, eraser radius, the "Move to" class
+        # combo, ...) still claims plain digit keys for itself first via
+        # Qt's own shortcut-override mechanism, so typing a number into one
+        # of those fields is unaffected.
+        self._class_shortcuts = []
+        for n in range(1, 10):
+            sc = QtGui.QShortcut(QtGui.QKeySequence(str(n)), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(lambda n=n: self.select_set_by_number(n))
+            self._class_shortcuts.append(sc)
 
         # -- load data ---------------------------------------------------------
         self.datafilename = datafile
-        self.basename = base_name(datafile)
-        p0 = datafile.find("__")
-        if p0 > 0:
-            p1 = datafile.rfind(".")
-            self.filetag = datafile[p0:p1]
-            if self.filetag[-1] != "_":
-                self.filetag += "_"
-        else:
-            self.filetag = "__"
 
         data = Volume.from_file(datafile)
         if options.apix:
@@ -222,16 +493,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxesviewer.set_mouse_mode("App")
         self.boxesviewer.show()
 
-        self.setspanel = TomoSetsPanel(self)
-        self.selectionpanel = SelectionPanel(self)
-        self.optionviewer = TomoBoxerOptions(self)
-        self.optionviewer.add_panel(self.setspanel, "Sets")
-        self.optionviewer.add_panel(self.selectionpanel, "Selection")
-        self.optionviewer.show()
-
         self.boxesviewer.mx_image_selected.connect(self.img_selected)
-        self.boxesviewer.selection_changed.connect(self.selectionpanel.set_selection)
         self.boxesviewer.selection_changed.connect(self.set_selected_uids)
+        # A set's tab becoming the active one in the gallery also makes it
+        # the active picking class -- the Sets list this used to require a
+        # separate click in is gone now that sets live in the gallery's own
+        # tabs. Recycle Bin/Confirmed/"All" don't emit this (see
+        # ParticleListPanel.class_activated), matching number-key switching.
+        self.boxesviewer.class_activated.connect(self._on_gallery_class_activated)
 
         self._arrange_windows()
 
@@ -284,11 +553,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # tucked out of the way until you deliberately want to review them.
         self.sets_visible.update(self.sets.keys())
         self.sets_visible.discard(categories.RECYCLE_BIN_ID)
-        self.setspanel.update_sets()
         self.wboxsize.setValue(self.get_boxsize())
 
         if options.clean:
-            self.optionviewer.erasercheckbox.setChecked(True)
+            self.tool_eraser_action.setChecked(True)
+            self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
 
         for i in range(len(self.boxes)):
             self.update_box(i)
@@ -305,8 +574,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _arrange_windows(self):
         """Split the screen evenly between this window (tomogram) and the
-        particle list, and put the options window on top, centered, so it
-        can be minimized out of the way without affecting the other two."""
+        particle list."""
         # self.screen() is meaningless before the window has ever been
         # shown (Qt just returns some default/primary screen), which is
         # why everything used to always land on the primary monitor. Use
@@ -328,14 +596,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.setGeometry(avail.x(), avail.y(), half_w, avail.height())
         self.boxesviewer.setGeometry(avail.x() + half_w, avail.y(), avail.width() - half_w, avail.height())
-
-        opt_w = min(420, avail.width() // 3)
-        opt_h = min(640, avail.height())
-        opt_x = avail.x() + (avail.width() - opt_w) // 2
-        opt_y = avail.y() + (avail.height() - opt_h) // 2
-        self.optionviewer.setGeometry(opt_x, opt_y, opt_w, opt_h)
-        self.optionviewer.raise_()
-        self.optionviewer.activateWindow()
 
     def sync_splitters(self, source, target):
         target.blockSignals(True)
@@ -363,6 +623,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._undo_stack = []
         self._redo_stack = []
         self._selected_uids = set()
+        self._refresh_undo_redo_actions()
+        self.confirm_selected_action.setEnabled(False)
+        self.recycle_selected_action.setEnabled(False)
+        self.move_to_combo.setEnabled(False)
+        self.move_selected_action.setEnabled(False)
+        self.selection_status_label.setText("")
 
         self._init_contrast_slider(data)
 
@@ -385,12 +651,32 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wcontrast.set_values(*self._contrast_defaults, emit=False)
 
     def eraser_width(self):
-        return int(self.optionviewer.eraser_radius.getValue())
+        return int(self.eraser_radius.getValue())
 
     def get_cube(self, x, y, z, centerslice=False, boxsz=-1):
         bs = self.get_boxsize() if boxsz < 0 else boxsz
-        bz = 1 if centerslice else bs
-        return self.data.get_clip_centered(x, y, z, bs, bs, bz)
+        if centerslice:
+            # Same slice-count formula as get_slice/slab_projection below,
+            # so a gallery thumbnail is averaged over exactly the same
+            # slices "Avg Slices" would put into the tomogram views at
+            # this position -- not always a single slice regardless of
+            # that setting.
+            half_thickness = self.nlayers() - 1
+            dz = 2 * half_thickness + 1
+            cube = self.data.get_clip_centered(x, y, z, bs, bs, dz)
+            return cube.mean(axis=0, keepdims=True)
+        return self.data.get_clip_centered(x, y, z, bs, bs, bs)
+
+    def _thumbnail_crop(self, box):
+        """Raw-intensity gallery-thumbnail crop for one box (shared by
+        update_box and event_nlayers). Kept as raw intensities, not
+        normalize()'d -- the gallery thumbnail is rendered with the exact
+        same contrast code and levels as the tomogram views (see
+        thumb_grid._thumbnail_pixmap and ParticleGrid.set_levels), so it
+        needs to be on the same intensity scale as them to actually look
+        like a matching crop."""
+        proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
+        return proj[0]
 
     def get_slice(self, idx, thk=1, axis="z"):
         return self.data.slab_projection(axis, idx, int(thk - 1))
@@ -444,6 +730,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.update_sliceview()
 
     def event_nlayers(self):
+        # Avg Slices changes what a gallery thumbnail should look like too
+        # (it's averaged over the same slices as the tomogram views -- see
+        # get_cube), so every existing particle's cached crop needs
+        # regenerating here, not just the 3 main views re-sliced below.
+        for n, box in enumerate(self.boxes):
+            for _ in range(len(self.boxesimgs), n + 1):
+                self.boxesimgs.append(None)
+            self.boxesimgs[n] = self._thumbnail_crop(box)
         self.update_all()
 
     # -- contrast -----------------------------------------------------------
@@ -490,37 +784,110 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return int(self.wnlayers.value())
 
     # -- file menu -----------------------------------------------------------
+    def menu_file_save_all(self):
+        # Picks autosave continuously already; this is a manual "force it
+        # now" for reassurance, plus the one thing autosave doesn't cover:
+        # box sizes only get written to config.settings when the app fully
+        # closes otherwise, so this flushes that immediately too.
+        self.save_picks()
+        QtWidgets.QMessageBox.information(
+            self, "Save",
+            f"Every set's picks and box sizes have been saved to:\n{self.picksdir}")
+
     def menu_file_read_boxloc(self):
-        fsp, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select box coordinate text file")
+        """Import an "x y z" coordinate text file as a brand new set, named
+        after the file (auto-disambiguated if that name's already taken) --
+        rather than dumping the imported particles into whichever set
+        happens to be selected, which left no way to tell them apart from
+        picks made by hand."""
+        fsp, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select box coordinate text file", "", "Text files (*.txt);;All files (*)")
         if not fsp or not os.path.isfile(fsp):
             return
+        coords = []
         with open(fsp) as f:
             for line in f:
                 parts = line.split()[:3]
                 if len(parts) < 3:
                     continue
-                b2 = [int(float(v)) for v in parts]
-                bdf = [0, 0, 0, "manual", 0.0, self.currentset]
-                for j in range(len(b2)):
-                    bdf[j] = b2[j]
-                bdf.append(self._new_uid())
-                self.boxes.append(bdf)
-                self.update_box(len(self.boxes) - 1)
+                try:
+                    coords.append(tuple(int(float(v)) for v in parts))
+                except ValueError:
+                    continue
+        if not coords:
+            QtWidgets.QMessageBox.information(self, "Read Box Coord", "No coordinates found in that file.")
+            return
+
+        name = metadata.base_name(fsp)
+        unique_name = name
+        n = 1
+        while unique_name in self.sets.values():
+            n += 1
+            unique_name = f"{name}_{n}"
+
+        clsid = self.new_set(unique_name)
+
+        self.initialized = False
+        shape = [self.data.nx, self.data.ny, self.data.nz]
+        start = len(self.boxes)
+        for x, y, z in coords:
+            x = int(np.clip(round(x), 1, shape[0] - 1))
+            y = int(np.clip(round(y), 1, shape[1] - 1))
+            z = int(np.clip(round(z), 1, shape[2] - 1))
+            self.boxes.append([x, y, z, "manual", 0.0, clsid, self._new_uid()])
+        for i in range(start, len(self.boxes)):
+            self.update_box(i)
+        self.initialized = True
+        self.save_json(only={clsid})
+        self.update_all()
+
+        msg = f"Imported {len(coords)} particle(s) into new set \"{unique_name}\"."
+        if unique_name != name:
+            msg += f' (renamed from "{name}", which was already in use.)'
+        QtWidgets.QMessageBox.information(self, "Read Box Coord", msg)
 
     def menu_file_save_boxloc(self):
-        fsp, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Select output text file")
-        if not fsp:
+        """Picks are already autosaved continuously (see save_picks) -- this
+        just copies the already-written coordinate file(s), all sets or one
+        you choose, to a folder of your own for safekeeping/mental sanity,
+        rather than re-deriving and writing them again from scratch."""
+        order = categories.category_order(self.sets)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Save Box Coord")
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.addWidget(QtWidgets.QLabel(
+            "Picks are saved automatically already. Save a copy of:"))
+        combo = QtWidgets.QComboBox()
+        combo.addItem("All sets", None)
+        for cid in order:
+            combo.addItem(self.sets[cid], cid)
+        layout.addWidget(combo)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        clsid = list(self.sets_visible)
-        if not clsid:
-            print("No visible particles to save")
-            return
-        self._write_coords(fsp, [b for b in self.boxes if int(b[5]) in clsid])
+        chosen = combo.currentData()
 
-    def _write_coords(self, path, boxes):
-        with open(path, "w") as out:
-            for b in boxes:
-                out.write(f"{b[0]} {b[1]} {b[2]}\n")
+        destdir = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose destination folder")
+        if not destdir:
+            return
+
+        classids = list(self.sets.keys()) if chosen is None else [chosen]
+        copied = []
+        for cid in classids:
+            name = self.sets[cid]
+            src = metadata.class_file(self.picksdir, name)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(destdir, os.path.basename(src)))
+                copied.append(name)
+
+        if copied:
+            QtWidgets.QMessageBox.information(
+                self, "Save Box Coord", f"Saved a copy of {len(copied)} set(s) to {destdir}.")
+        else:
+            QtWidgets.QMessageBox.information(self, "Save Box Coord", "Nothing to save yet.")
 
     def save_picks(self, only=None):
         """Write every class's particles to its own "<name>.txt" file in
@@ -542,54 +909,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if only is None:
             boxsizes_by_name = {self.sets[k]: self.boxsize[k] for k in self.sets}
             metadata.save_boxsizes(self.picksdir, boxsizes_by_name)
-
-    def save_boxes(self, clsid=None):
-        clsid = clsid or []
-        defaultname = "ptcls.mrcs" if not clsid else "_".join(self.sets[i] for i in clsid) + ".mrcs"
-        name, ok = QtWidgets.QInputDialog.getText(self, "Save particles", "Filename suffix:", text=defaultname)
-        if not ok:
-            return
-        name = self.filetag + str(name)
-
-        is2d = self.options.mode != "3D"
-        dr = "particles" if is2d else "particles3d"
-        os.makedirs(dr, exist_ok=True)
-
-        if is2d:
-            if not name.lower().endswith((".mrc", ".mrcs")):
-                name += ".mrcs"
-            fsp = os.path.join(dr, self.basename) + name
-        else:
-            fsp = os.path.join(dr, self.basename) + os.path.splitext(name)[0]
-
-        print(f"Saving {self.options.mode} particles to {fsp}")
-
-        progress = QtWidgets.QProgressDialog("Saving", "Abort", 0, len(self.boxes), None)
-        writer = ParticleStackWriter(fsp, is3d=not is2d, apix=self.apix)
-
-        boxsz = -1
-        sz = [s // 2 for s in self.datasize]
-        for i, b in enumerate(self.boxes):
-            if clsid and int(b[5]) not in clsid:
-                continue
-            bs = self.get_boxsize(b[5])
-            if boxsz < 0:
-                boxsz = bs
-            elif boxsz != bs:
-                print(f"Inconsistent box size in the particles to save.. Using {boxsz}..")
-                bs = boxsz
-
-            img = self.get_cube(b[0], b[1], b[2], centerslice=is2d, boxsz=bs)
-            if not is2d:
-                img = normalize(img)
-                img = img * -1
-            writer.add(img[0] if is2d else img)
-
-            progress.setValue(i + 1)
-            if progress.wasCanceled():
-                break
-
-        writer.close()
 
     # -- slice view update ----------------------------------------------------------
     def update_sliceview(self, axis=("x", "y", "z"), reslice=True, only_indices=None):
@@ -779,6 +1098,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # stack (see below) rather than through here, precisely so that
         # replaying history doesn't wipe out the history it's replaying.
         self._redo_stack = []
+        self._refresh_undo_redo_actions()
+
+    def _refresh_undo_redo_actions(self):
+        """Keep the Edit menu/toolbar's Undo/Redo entries enabled exactly
+        when there's something on the corresponding stack -- standard
+        editor convention, and the only feedback that an undo/redo actually
+        did something (there's no other status message anywhere)."""
+        self.undo_action.setEnabled(bool(self._undo_stack))
+        self.redo_action.setEnabled(bool(self._redo_stack))
 
     def undo(self):
         if not self._undo_stack:
@@ -790,6 +1118,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self._undo_delete(action)
         elif action["type"] == "reassign":
             self._undo_reassign(action)
+        self._refresh_undo_redo_actions()
 
     def redo(self):
         if not self._redo_stack:
@@ -801,6 +1130,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self._redo_delete(action)
         elif action["type"] == "reassign":
             self._redo_reassign(action)
+        self._refresh_undo_redo_actions()
 
     def _undo_add(self, action):
         idx = self._index_for_uid(action["uid"])
@@ -848,6 +1178,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.initialized:
             self.save_json(only=affected_classes)
         self.update_all(reslice=False)
+        # Highlight exactly the particles this undo/redo actually brought
+        # back -- explicit, rather than the gallery guessing "a uid
+        # reappeared" (it used to auto-select on that alone, which also
+        # fired for unrelated reasons like a set's visibility being
+        # toggled back on, since that removes and re-adds gallery items
+        # the same way a real delete/restore does).
+        self.boxesviewer.grid.replace_selection([box_copy[6] for _, box_copy, _ in removed])
 
     def _undo_reassign(self, action):
         uids = [self.boxes[i][6] for i, _ in action["changes"] if 0 <= i < len(self.boxes)]
@@ -905,12 +1242,36 @@ class TomoBoxer(QtWidgets.QMainWindow):
         new_selected = set(uids or [])
         changed_uids = self._selected_uids ^ new_selected
         self._selected_uids = new_selected
+        has_selection = bool(self._selected_uids)
+        self.confirm_selected_action.setEnabled(has_selection)
+        self.recycle_selected_action.setEnabled(has_selection)
+        self.move_to_combo.setEnabled(has_selection)
+        self.move_selected_action.setEnabled(has_selection)
+        if has_selection:
+            self._refresh_move_to_combo()
+        n = len(self._selected_uids)
+        self.selection_status_label.setText(f"{n} particle(s) selected" if n else "")
         if not changed_uids:
             return
         changed_indices = [i for i, b in enumerate(self.boxes) if b[6] in changed_uids]
         for i in changed_indices:
             self.update_box_shape(i, self.boxes[i])
         self.update_all(reslice=False, only_indices=changed_indices)
+
+    def _refresh_move_to_combo(self):
+        current = self.move_to_combo.currentText()
+        self.move_to_combo.blockSignals(True)
+        self.move_to_combo.clear()
+        self.move_to_combo.addItems(sorted(self.sets.values()))
+        self.move_to_combo.setCurrentText(current)
+        self.move_to_combo.blockSignals(False)
+
+    def _move_selected_via_toolbar(self):
+        name = self.move_to_combo.currentText().strip()
+        if not name or not self._selected_uids:
+            return
+        self.move_particles_by_uid(self._selected_uids, name)
+        self.move_to_combo.setCurrentText("")
 
     def update_box(self, n, quiet=False, axis=("x", "y", "z")):
         if n < 0 or n >= len(self.boxes):
@@ -922,20 +1283,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.update_sliceview(axis)
 
         if not quiet:
-            proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
-            # Keep raw intensities here (not normalize()'d) -- the gallery
-            # thumbnail is rendered with the exact same contrast code and
-            # levels as the tomogram views (see thumb_grid._thumbnail_pixmap
-            # and ParticleGrid.set_levels), so it needs to be on the same
-            # intensity scale as them to actually look like a matching crop.
-            # Unrelated to save_boxes()'s own normalize() call below, which
-            # is about the exported particle stack's data format, not
-            # on-screen display.
-            proj = proj[0]
-
             for _ in range(len(self.boxesimgs), n + 1):
                 self.boxesimgs.append(None)
-            self.boxesimgs[n] = proj
+            self.boxesimgs[n] = self._thumbnail_crop(box)
 
             if self.initialized:
                 self.save_json()
@@ -979,15 +1329,42 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.scroll_to(self.x_loc, self.y_loc, self.z_loc)
             self.update_sliceview()
 
-    def del_region_xy(self, x=-1, y=-1, z=-1, rad=-1):
+    def del_region_xy(self, x=-1, y=-1, z=-1, rad=-1, axis="z", is_3d=True):
+        """3D (default, unchanged): a literal sphere of radius rad, exactly
+        as before -- a bounded eraser "brush", like a sculpting tool's, not
+        an unbounded volume the way Select's 3D mode is (that's fine: this
+        tool destroys data immediately with no confirmation, so it should
+        stay a bounded brush rather than growing to "the entire depth" the
+        way a non-destructive selection reasonably can).
+
+        2D (new): a circle of radius rad in the current view's own two
+        in-plane axes only, additionally restricted to particles actually
+        visible on the current slice (same in-plane test used for
+        rendering/Select's own 2D mode) -- so it only erases what's drawn
+        on screen, never reaching into depths you can't see."""
         if rad < 0:
             rad = self.eraser_width()
         delids = []
-        for i, b in enumerate(self.boxes):
-            if b[5] not in self.sets_visible:
-                continue
-            if (x >= 0) * (b[0] - x) ** 2 + (y >= 0) * (b[1] - y) ** 2 + (z >= 0) * (b[2] - z) ** 2 < rad ** 2:
-                delids.append(i)
+        if is_3d:
+            for i, b in enumerate(self.boxes):
+                if b[5] not in self.sets_visible:
+                    continue
+                if (x >= 0) * (b[0] - x) ** 2 + (y >= 0) * (b[1] - y) ** 2 + (z >= 0) * (b[2] - z) ** 2 < rad ** 2:
+                    delids.append(i)
+        else:
+            a1, a2 = _VIEW_PLANE_AXES[axis]
+            i1, i2 = _AXIS_INDEX[a1], _AXIS_INDEX[a2]
+            depth_idx = _AXIS_INDEX[axis]
+            click = (x, y, z)
+            p1_click, p2_click, depth_click = click[i1], click[i2], click[depth_idx]
+            for i, b in enumerate(self.boxes):
+                if b[5] not in self.sets_visible:
+                    continue
+                bs = self.get_boxsize(b[5])
+                if abs(b[depth_idx] - depth_click) >= bs / 2:
+                    continue
+                if (b[i1] - p1_click) ** 2 + (b[i2] - p2_click) ** 2 < rad ** 2:
+                    delids.append(i)
         self.send_to_recycle_bin(delids)
 
     def scroll_to(self, x, y, z, axis=""):
@@ -1014,8 +1391,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def mouse_down(self, event, x, y, z, axis):
         if min(x, y, z) < 0:
             return
-        if self.optionviewer.erasercheckbox.isChecked():
-            self.del_region_xy(x, y, z, -1)
+        if self.tool_eraser_action.isChecked():
+            self.del_region_xy(x, y, z, -1, axis=axis, is_3d=self.tool_3d_checkbox.isChecked())
+            return
+        if self.tool_select_action.isChecked():
+            self._select_mouse_down(event, x, y, z, axis)
             return
 
         for i in range(len(self.boxes)):
@@ -1024,13 +1404,24 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     self.send_to_recycle_bin(i)
                 elif space_key_state().held:
                     self.send_to_confirmed(i)
+                elif event.modifiers() & Qt.ControlModifier:
+                    # Toggle-select, exactly like Ctrl+click in the gallery --
+                    # writes into the same selection list the gallery owns,
+                    # so both windows and the Selection panel always agree.
+                    self.boxesviewer.grid.toggle_uid_selection(self.boxes[i][6])
                 else:
+                    # A plain click on some other particle is "start doing
+                    # something else" -- clear whatever multi-selection was
+                    # active first, the same way clicking a file in a file
+                    # manager deselects the others unless you hold Ctrl.
+                    self.boxesviewer.grid.clear_selection()
                     self.dragging = i
                     self.curbox = i
                     self.scroll_to(x, y, z, axis)
                 break
         else:
-            if not event.modifiers() & Qt.ShiftModifier:
+            if not event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier):
+                self.boxesviewer.grid.clear_selection()
                 self.x_loc, self.y_loc, self.z_loc = x, y, z
                 self.scroll_to(x, y, z, axis)
                 self.curbox = len(self.boxes)
@@ -1051,7 +1442,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mouse_move(event, self.zyview)
 
     def mouse_move(self, event, view):
-        if self.optionviewer.erasercheckbox.isChecked():
+        if self.tool_eraser_action.isChecked():
             self.xyview.eraser_shape = self.xzview.eraser_shape = self.zyview.eraser_shape = None
             x, y = view.scr_to_img((event.position().x(), event.position().y()))
             view.eraser_shape = Shape("circle", (1, 1, 1), [x, y, self.eraser_width()], 2)
@@ -1078,21 +1469,215 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.dragging >= 0:
             x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
             self.mouse_drag(x, y, self.z_loc, skip_axis="z")
+        elif self._select_drawing is not None:
+            x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
+            self._select_mouse_drag(self.xyview, "z", x, y, self.z_loc)
 
     def xz_drag(self, event):
         if self.dragging >= 0:
             x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
             self.mouse_drag(x, self.y_loc, z, skip_axis="y")
+        elif self._select_drawing is not None:
+            x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
+            self._select_mouse_drag(self.xzview, "y", x, self.y_loc, z)
 
     def zy_drag(self, event):
         if self.dragging >= 0:
             z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
             self.mouse_drag(self.x_loc, y, z, skip_axis="x")
+        elif self._select_drawing is not None:
+            z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
+            self._select_mouse_drag(self.zyview, "x", self.x_loc, y, z)
 
     def mouse_up(self, event):
         if self.dragging >= 0:
             self.update_box(self.dragging)
-        self.dragging = -1
+            self.dragging = -1
+            return
+        if self._select_drawing is not None:
+            self._select_mouse_up()
+
+    def xy_doubleclick(self, event):
+        self._select_doubleclick(self.xyview)
+
+    def xz_doubleclick(self, event):
+        self._select_doubleclick(self.xzview)
+
+    def zy_doubleclick(self, event):
+        self._select_doubleclick(self.zyview)
+
+    def _select_doubleclick(self, view):
+        drawing = self._select_drawing
+        if drawing is not None and drawing["kind"] == "freeform" and drawing["view"] is view:
+            self._select_finish_freeform()
+
+    # -- tool selector (Pick/Eraser/Select) ----------------------------------
+    def _on_tool_changed(self, action):
+        is_eraser = action is self.tool_eraser_action
+        is_select = action is self.tool_select_action
+        self.eraser_radius.setEnabled(is_eraser)
+        for rb in (self.select_shape_rect, self.select_shape_circle, self.select_shape_freeform):
+            rb.setEnabled(is_select)
+        self.tool_3d_checkbox.setEnabled(is_eraser or is_select)
+        cursor = Qt.CrossCursor if is_select else None
+        for view in (self.xyview, self.xzview, self.zyview):
+            if cursor is not None:
+                view.setCursor(cursor)
+            else:
+                view.unsetCursor()
+        # Switching tools mid-gesture is ambiguous, so cancel whatever
+        # shape-select was in progress rather than leave a stale preview.
+        self._select_cancel_drawing()
+
+    # -- shape-based multi-select tool (rectangle/circle/freeform, 2D/3D) ---
+    # Non-destructive: it only replaces the gallery's selection list (same
+    # one Ctrl+click above and the gallery itself write into), never
+    # deletes/moves anything by itself -- act on the result via the
+    # toolbar's Confirm/Recycle/Move Selected.
+    def _select_shape_kind(self):
+        if self.select_shape_circle.isChecked():
+            return "circle"
+        if self.select_shape_freeform.isChecked():
+            return "freeform"
+        return "rect"
+
+    def _select_is_3d(self):
+        return self.tool_3d_checkbox.isChecked()
+
+    def _select_cancel_drawing(self, *_args):
+        if self._select_drawing is None:
+            return
+        self._select_drawing["view"].select_preview = None
+        self._select_drawing = None
+
+    def _select_mouse_down(self, event, x, y, z, axis):
+        view = {"z": self.xyview, "y": self.xzview, "x": self.zyview}[axis]
+        kind = self._select_shape_kind()
+        if kind == "freeform":
+            self._select_freeform_click(view, axis, x, y, z)
+            return
+        self._select_drawing = {
+            "view": view, "axis": axis, "kind": kind,
+            "start": (x, y, z), "current": (x, y, z),
+        }
+        self._update_select_preview()
+
+    def _select_mouse_drag(self, view, axis, x, y, z):
+        drawing = self._select_drawing
+        if drawing is None or drawing["view"] is not view or drawing["kind"] == "freeform":
+            return
+        drawing["current"] = (x, y, z)
+        self._update_select_preview()
+
+    def _select_mouse_up(self):
+        drawing = self._select_drawing
+        if drawing is None or drawing["kind"] == "freeform":
+            return  # freeform commits by closing the loop/double-click/Enter, not on release
+        uids = self._select_hit_test(drawing)
+        drawing["view"].select_preview = None
+        self._select_drawing = None
+        self.boxesviewer.grid.replace_selection(uids)
+
+    def _update_select_preview(self):
+        drawing = self._select_drawing
+        a1, a2 = _VIEW_PLANE_AXES[drawing["axis"]]
+        i1, i2 = _AXIS_INDEX[a1], _AXIS_INDEX[a2]
+        p1_0, p2_0 = drawing["start"][i1], drawing["start"][i2]
+        p1_1, p2_1 = drawing["current"][i1], drawing["current"][i2]
+        if drawing["kind"] == "rect":
+            shape = Shape("rect", _SELECT_PREVIEW_COLOR, [p1_0, p2_0, p1_1, p2_1], 2)
+        else:  # circle
+            r = ((p1_1 - p1_0) ** 2 + (p2_1 - p2_0) ** 2) ** 0.5
+            shape = Shape("circle", _SELECT_PREVIEW_COLOR, [p1_0, p2_0, r], 2)
+        drawing["view"].select_preview = shape
+
+    def _select_freeform_click(self, view, axis, x, y, z):
+        drawing = self._select_drawing
+        if drawing is not None and drawing["kind"] == "freeform" and drawing["view"] is not view:
+            return  # a freeform is already in progress in a different view -- finish/cancel it first
+        if drawing is None or drawing["kind"] != "freeform" or drawing["view"] is not view:
+            drawing = {"view": view, "axis": axis, "kind": "freeform", "points": []}
+            self._select_drawing = drawing
+
+        a1, a2 = _VIEW_PLANE_AXES[axis]
+        p1, p2 = (x, y, z)[_AXIS_INDEX[a1]], (x, y, z)[_AXIS_INDEX[a2]]
+        pts = drawing["points"]
+        if len(pts) >= 3 and self._select_screen_close(view, pts[0], (p1, p2)):
+            self._select_finish_freeform()
+            return
+        pts.append((p1, p2))
+        self._update_select_preview_freeform()
+
+    def _select_screen_close(self, view, plane_pt1, plane_pt2):
+        s1 = view.img_to_scr(*plane_pt1)
+        s2 = view.img_to_scr(*plane_pt2)
+        return (s1[0] - s2[0]) ** 2 + (s1[1] - s2[1]) ** 2 <= _SELECT_CLOSE_PIXELS ** 2
+
+    def _update_select_preview_freeform(self):
+        drawing = self._select_drawing
+        pts = drawing["points"]
+        if len(pts) < 2:
+            drawing["view"].select_preview = None
+            return
+        geom = [c for p in pts for c in p]
+        drawing["view"].select_preview = Shape("polygon", _SELECT_PREVIEW_COLOR, geom, 2)
+
+    def _select_finish_freeform(self):
+        drawing = self._select_drawing
+        if drawing is None or drawing["kind"] != "freeform":
+            return
+        if len(drawing["points"]) < 3:
+            self._select_cancel_drawing()
+            return
+        uids = self._select_hit_test(drawing)
+        drawing["view"].select_preview = None
+        self._select_drawing = None
+        self.boxesviewer.grid.replace_selection(uids)
+
+    def _select_hit_test(self, drawing):
+        axis = drawing["axis"]
+        a1, a2 = _VIEW_PLANE_AXES[axis]
+        i1, i2 = _AXIS_INDEX[a1], _AXIS_INDEX[a2]
+        is_3d = self._select_is_3d()
+
+        if drawing["kind"] == "freeform":
+            path = QtGui.QPainterPath()
+            pts = drawing["points"]
+            path.moveTo(pts[0][0], pts[0][1])
+            for p1, p2 in pts[1:]:
+                path.lineTo(p1, p2)
+            path.closeSubpath()
+
+            def contains(p1, p2):
+                return path.contains(QtCore.QPointF(p1, p2))
+        elif drawing["kind"] == "rect":
+            p1_0, p2_0 = drawing["start"][i1], drawing["start"][i2]
+            p1_1, p2_1 = drawing["current"][i1], drawing["current"][i2]
+            lo1, hi1 = sorted((p1_0, p1_1))
+            lo2, hi2 = sorted((p2_0, p2_1))
+
+            def contains(p1, p2):
+                return lo1 <= p1 <= hi1 and lo2 <= p2 <= hi2
+        else:  # circle
+            p1_0, p2_0 = drawing["start"][i1], drawing["start"][i2]
+            p1_1, p2_1 = drawing["current"][i1], drawing["current"][i2]
+            r2 = (p1_1 - p1_0) ** 2 + (p2_1 - p2_0) ** 2
+
+            def contains(p1, p2):
+                return (p1 - p1_0) ** 2 + (p2 - p2_0) ** 2 <= r2
+
+        current_depth = {"x": self.x_loc, "y": self.y_loc, "z": self.z_loc}[axis]
+        uids = []
+        for b in self.boxes:
+            if b[5] not in self.sets_visible:
+                continue
+            if not is_3d:
+                bs = self.get_boxsize(b[5])
+                if abs(b[_AXIS_INDEX[axis]] - current_depth) >= bs / 2:
+                    continue
+            if contains(b[i1], b[i2]):
+                uids.append(b[6])
+        return uids
 
     # -- keep the same origin across the 3 views ---------------------------------
     def xy_origin(self, newor):
@@ -1150,12 +1735,31 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if name in categories.FIXED_CLASS_IDS:
             return  # Recycle Bin / Confirmed are fixed and can't be deleted
         delids = [i for i, b in enumerate(self.boxes) if b[5] == int(name)]
-        self.del_box(delids, record_undo=False)
+        if delids:
+            # Move to the Recycle Bin rather than destroying them outright --
+            # deleting a whole set shouldn't be more permanent than deleting
+            # one particle at a time is. Not undoable as a single step
+            # (matching this method's prior behavior): the set definition
+            # itself is removed right after, so undoing just the reassign
+            # would leave particles pointing at a class id that no longer
+            # exists in self.sets.
+            self._apply_reassign([(i, name) for i in delids], target_id=categories.RECYCLE_BIN_ID)
         self.sets_visible.discard(name)
         classname = self.sets.pop(name, None)
         self.boxsize.pop(name, None)
         if classname is not None:
             metadata.delete_class_file(self.picksdir, classname)
+        if self.currentset == name:
+            # The active picking class just vanished -- without this, the
+            # next click-to-add still targeted this now-nonexistent class
+            # id (self.currentset was never touched here), which is why
+            # get_boxsize(that id) started failing ("No box size saved for
+            # ..") and every new particle silently fell back to a default
+            # box size instead of the set it was supposedly created in.
+            remaining = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)
+            self.currentset = remaining[0] if remaining else self.new_set("particles_00")
+            self.wboxsize.setValue(self.get_boxsize())
+        self._refresh_move_to_combo()
         self.update_all(reslice=False, only_indices=[])
 
     def toggle_colors(self):
@@ -1165,7 +1769,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         categories.cycle_colors()
         for i in range(len(self.boxes)):
             self.update_box_shape(i, self.boxes[i])
-        self.setspanel.update_sets()
         self.update_all(reslice=False)
 
     def rename_set(self, oldname, newname):
@@ -1177,6 +1780,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.sets[name] = newname
             if self.initialized:
                 self.save_picks()
+            self._refresh_move_to_combo()
 
     def new_set(self, name):
         i = 0
@@ -1193,10 +1797,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.boxsize[i] = self.get_boxsize()
         else:
             self.boxsize[i] = metadata.DEFAULT_BOXSIZE
+        # Otherwise a set created while a selection was already active (so
+        # set_selected_uids' own refresh already fired earlier and won't
+        # fire again) never showed up in "Move Selected to" until you
+        # cleared and remade the selection.
+        self._refresh_move_to_combo()
         return i
-
-    def save_set(self):
-        self.save_boxes(list(self.sets_visible))
 
     # -- multi-selection actions (used by the Options window's Selection panel) --
     def delete_particles_by_uid(self, uids):
@@ -1234,14 +1840,57 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.save_picks(only=affected_classes)
         self.update_all(reslice=False, only_indices=idx)
 
+    # -- help -----------------------------------------------------------
+    def show_shortcuts_dialog(self):
+        if self._shortcuts_dialog is None:
+            self._shortcuts_dialog = ShortcutsDialog(self)
+        self._shortcuts_dialog.show()
+        self._shortcuts_dialog.raise_()
+        self._shortcuts_dialog.activateWindow()
+
     # -- keyboard -----------------------------------------------------------
     def key_press(self, event):
-        if event.key() == 96:  # `
-            self.wdepth.setValue(int(round(self.z_loc + 1)))
-        elif event.key() == 49:  # 1
-            self.wdepth.setValue(int(round(self.z_loc - 1)))
-        else:
-            self.keyPress.emit(event)
+        drawing = self._select_drawing
+        if drawing is not None and drawing["kind"] == "freeform":
+            if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._select_finish_freeform()
+                return
+            if event.key() == Qt.Key_Escape:
+                self._select_cancel_drawing()
+                return
+            if event.key() == Qt.Key_Backspace:
+                if drawing["points"]:
+                    drawing["points"].pop()
+                self._update_select_preview_freeform()
+                return
+        if event.key() == Qt.Key_Escape:
+            # Cancelling an in-progress freeform (above) takes priority --
+            # otherwise Escape clears the current multi-selection, the
+            # standard "back out of what you're doing" key.
+            self.boxesviewer.grid.clear_selection()
+            return
+        self.keyPress.emit(event)
+
+    def select_set_by_number(self, n):
+        """Bare 1-9 keys switch the active picking class to the nth normal
+        set (Recycle Bin/Confirmed are reached only via shift/space+click,
+        not by number -- they aren't something you pick new particles
+        into), ordered the same way the gallery's tabs list them."""
+        order = categories.category_order(self.sets)
+        normal = [cid for cid in order if cid not in categories.FIXED_CLASS_IDS]
+        if not (1 <= n <= len(normal)):
+            return
+        cid = normal[n - 1]
+        if cid == self.currentset:
+            return
+        self.set_current_set(f"{cid}::")
+
+    def _on_gallery_class_activated(self, cid):
+        """A set's tab becoming the active one in the gallery also makes it
+        the active picking class -- see ParticleListPanel.class_activated."""
+        if cid == self.currentset:
+            return
+        self.set_current_set(f"{cid}::")
 
     # -- persistence -----------------------------------------------------------
     # Backward-compatible alias, kept in case anything still calls save_json().
@@ -1269,7 +1918,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
         print("Exiting")
         self.save_picks()
         self.boxesviewer.close()
-        self.optionviewer.close()
         try:
             self.xyview.close()
             self.xzview.close()
@@ -1288,267 +1936,3 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._do_close_all()
         self.close()
 
-
-class SelectionPanel(QtWidgets.QWidget):
-    """Shows how many particles are currently multi-selected in the
-    particle list and lets you delete them or move them to another (or a
-    new) class. Inert ("No selection") when nothing is selected."""
-
-    def __init__(self, target):
-        super().__init__()
-        self.target = weakref.ref(target)
-        self._uids = []
-
-        vbl = QtWidgets.QVBoxLayout(self)
-        self.status_label = QtWidgets.QLabel("No selection")
-        vbl.addWidget(self.status_label)
-
-        self.delete_button = QtWidgets.QPushButton("Send to Recycle Bin")
-        vbl.addWidget(self.delete_button)
-
-        self.confirm_button = QtWidgets.QPushButton("Send to Confirmed")
-        vbl.addWidget(self.confirm_button)
-
-        moverow = QtWidgets.QHBoxLayout()
-        self.class_combo = QtWidgets.QComboBox()
-        self.class_combo.setEditable(True)
-        self.class_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        moverow.addWidget(self.class_combo)
-        self.move_button = QtWidgets.QPushButton("Move to")
-        moverow.addWidget(self.move_button)
-        vbl.addLayout(moverow)
-        vbl.addStretch(1)
-
-        self.delete_button.clicked.connect(self._delete)
-        self.confirm_button.clicked.connect(self._confirm)
-        self.move_button.clicked.connect(self._move)
-
-        self._set_active(False)
-
-    def refresh_classes(self):
-        target = self.target()
-        if target is None:
-            return
-        current = self.class_combo.currentText()
-        self.class_combo.blockSignals(True)
-        self.class_combo.clear()
-        self.class_combo.addItems(sorted(target.sets.values()))
-        self.class_combo.setCurrentText(current)
-        self.class_combo.blockSignals(False)
-
-    def set_selection(self, uids):
-        self._uids = list(uids or [])
-        active = len(self._uids) > 0
-        self._set_active(active)
-        if active:
-            self.status_label.setText(f"{len(self._uids)} particle(s) selected")
-            self.refresh_classes()
-        self._update_delete_label()
-
-    def _update_delete_label(self):
-        # Sending an already-recycled particle to the Recycle Bin again
-        # permanently deletes it (see TomoBoxer.send_to_recycle_bin) --
-        # reflect that on the button so it isn't a surprise.
-        target = self.target()
-        already_binned = bool(self._uids) and target is not None and all(
-            b[5] == categories.RECYCLE_BIN_ID for b in target.boxes if b[6] in self._uids)
-        self.delete_button.setText("Delete Permanently" if already_binned else "Send to Recycle Bin")
-
-    def _set_active(self, active):
-        self.status_label.setText(f"{len(self._uids)} particle(s) selected" if active else "No selection")
-        self.delete_button.setEnabled(active)
-        self.confirm_button.setEnabled(active)
-        self.move_button.setEnabled(active)
-        self.class_combo.setEnabled(active)
-
-    def _delete(self):
-        target = self.target()
-        if target is None or not self._uids:
-            return
-        target.delete_particles_by_uid(self._uids)
-        self.set_selection([])
-
-    def _confirm(self):
-        target = self.target()
-        if target is None or not self._uids:
-            return
-        target.confirm_particles_by_uid(self._uids)
-        self.set_selection([])
-
-    def _move(self):
-        target = self.target()
-        name = self.class_combo.currentText().strip()
-        if target is None or not self._uids or not name:
-            return
-        target.move_particles_by_uid(self._uids, name)
-        self.set_selection([])
-
-
-class TomoBoxerOptions(QtWidgets.QWidget):
-    def __init__(self, target):
-        super().__init__()
-        self.setWindowTitle("Options")
-        self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
-        self.target = weakref.ref(target)
-
-        gbl = QtWidgets.QGridLayout(self)
-        self.erasercheckbox = QtWidgets.QCheckBox("Eraser")
-        gbl.addWidget(self.erasercheckbox, 0, 0)
-
-        self.eraser_radius = LabeledSpinBox(label="Radius:", value=128, minimum=1, maximum=8192)
-        gbl.addWidget(self.eraser_radius, 0, 1)
-
-        self.tabwidget = QtWidgets.QTabWidget()
-        gbl.addWidget(self.tabwidget, 1, 0, 1, 2)
-
-    def add_panel(self, widget, name):
-        self.tabwidget.addTab(widget, name)
-
-    def closeEvent(self, event):
-        target = self.target()
-        if target is not None and not getattr(target, "_closing", False):
-            event.ignore()
-            target.request_close_all()
-            return
-        event.accept()
-
-
-class TomoSetsPanel(QtWidgets.QWidget):
-    """The set (class) display / management panel."""
-
-    def __init__(self, target):
-        super().__init__()
-        self.target = weakref.ref(target)
-        self.initialized = False
-
-        hbl = QtWidgets.QHBoxLayout(self)
-        self.setlist = QtWidgets.QListWidget()
-        self.setlist.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding)
-        hbl.addWidget(self.setlist)
-
-        vbl = QtWidgets.QVBoxLayout()
-        self.new_set_button = QtWidgets.QPushButton("New")
-        vbl.addWidget(self.new_set_button)
-        self.rename_set_button = QtWidgets.QPushButton("Rename")
-        vbl.addWidget(self.rename_set_button)
-        self.save_set_button = QtWidgets.QPushButton("Save")
-        vbl.addWidget(self.save_set_button)
-        self.delete_set_button = QtWidgets.QPushButton("Delete")
-        vbl.addWidget(self.delete_set_button)
-        self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
-        vbl.addWidget(self.empty_recycle_button)
-        self.toggle_colors_button = QtWidgets.QPushButton("Toggle Colors")
-        vbl.addWidget(self.toggle_colors_button)
-        hbl.addLayout(vbl)
-
-        self.save_set_button.clicked.connect(self.save_set)
-        self.new_set_button.clicked.connect(self.new_set)
-        self.rename_set_button.clicked.connect(self.rename_set)
-        self.delete_set_button.clicked.connect(self.delete_set)
-        self.empty_recycle_button.clicked.connect(self.empty_recycle_bin)
-        self.toggle_colors_button.clicked.connect(self.toggle_colors)
-        self.setlist.itemChanged.connect(self.set_list_item_changed)
-        self.setlist.currentRowChanged.connect(self.set_list_row_changed)
-
-    def toggle_colors(self):
-        target = self.target()
-        if target is None:
-            return
-        target.toggle_colors()  # this also refreshes update_sets() for us
-
-    def set_list_row_changed(self, i):
-        if not self.initialized:
-            return
-        item = self.setlist.item(i)
-        if item is None:
-            return
-        self.target().set_current_set(item.text())
-
-    def set_list_item_changed(self, item):
-        name = item.text()
-        if item.checkState() == Qt.Checked:
-            self.target().show_set(name)
-        else:
-            self.target().hide_set(name)
-
-    def delete_set(self, unused=None):
-        selections = self.setlist.selectedItems()
-        if not selections:
-            return
-        names = [i.text() for i in selections]
-        if parse_setname(names[0]) in categories.FIXED_CLASS_IDS:
-            QtWidgets.QMessageBox.information(
-                self, "Delete set", "Recycle Bin and Confirmed are fixed categories and can't be deleted.")
-            return
-        cancel = QtWidgets.QMessageBox.question(
-            self, "Delete set",
-            f"Are you sure to delete {names[0]}? This will remove all particles in that class",
-            QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
-        if cancel == QtWidgets.QMessageBox.Yes:
-            self.target().delete_set(names[0])
-            self.update_sets()
-
-    def empty_recycle_bin(self, unused=None):
-        target = self.target()
-        count = sum(1 for b in target.boxes if b[5] == categories.RECYCLE_BIN_ID)
-        if count == 0:
-            return
-        reply = QtWidgets.QMessageBox.question(
-            self, "Empty Recycle Bin",
-            f"Permanently delete {count} particle(s) in the Recycle Bin? (Undo-able with Ctrl+Z right after.)",
-            QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
-        if reply == QtWidgets.QMessageBox.Yes:
-            target.empty_recycle_bin()
-            self.update_sets()
-
-    def new_set(self, unused=None):
-        name, ok = QtWidgets.QInputDialog.getText(self, "Set Name", "Enter a name for the new set:")
-        if not ok:
-            return
-        name = str(name)
-        if name in self.target().sets.values():
-            print("Set name exists")
-            return
-        self.target().new_set(name)
-        self.update_sets()
-
-    def rename_set(self, unused=None):
-        selections = self.setlist.selectedItems()
-        if not selections:
-            return
-        if parse_setname(selections[0].text()) in categories.FIXED_CLASS_IDS:
-            QtWidgets.QMessageBox.information(
-                self, "Rename set", "Recycle Bin and Confirmed are fixed categories and can't be renamed.")
-            return
-        name, ok = QtWidgets.QInputDialog.getText(self, "Set Name", "Enter a name for the new set:")
-        if not ok:
-            return
-        name = str(name)
-        if name in self.target().sets.values():
-            print("Set name exists")
-            return
-        self.target().rename_set(selections[0].text(), name)
-        self.update_sets()
-
-    def save_set(self):
-        self.target().save_set()
-        self.update_sets()
-
-    def update_sets(self):
-        target = self.target()
-        keys = categories.category_order(target.sets)
-        viskeys = set(target.sets_visible)
-        self.setlist.blockSignals(True)
-        self.setlist.clear()
-
-        for k in keys:
-            kname = f"{int(k):02d} :: {target.sets[k]}"
-            item = QtWidgets.QListWidgetItem(kname)
-            item.setFlags(Qt.ItemIsEditable | Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            item.setForeground(QtGui.QBrush(categories.class_color(k)))
-            self.setlist.addItem(item)
-            item.setCheckState(Qt.Checked if k in viskeys else Qt.Unchecked)
-            if not self.initialized and k == target.currentset:
-                self.setlist.setCurrentItem(item)
-                self.initialized = True
-        self.setlist.blockSignals(False)

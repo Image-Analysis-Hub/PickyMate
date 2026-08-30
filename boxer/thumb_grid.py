@@ -10,9 +10,13 @@ gaps while preserving relative order.
 
 Particles are tracked by a caller-supplied unique id (uid), not by list
 position, so slot assignment survives additions/removals anywhere else in
-the particle list. A uid that reappears after being removed (only possible
-via undo, since uids are never reused) returns to its old slot and is
-shown selected/highlighted, rather than being appended at the end.
+the particle list. A uid that reappears after being removed -- via undo,
+or because its set's visibility checkbox was toggled off and back on, or
+detach/reattach -- returns to its old slot rather than being appended at
+the end. It is deliberately *not* auto-selected just for reappearing here
+(a uid reappearing isn't always an undo -- see the point above); undoing a
+delete instead has TomoBoxer explicitly select the particles it actually
+restored, in _reinsert_boxes.
 
 The "All" tab is the one exception to the stable-slot rule: it groups
 particles by class (Recycle Bin and Confirmed first, then alphabetically),
@@ -76,6 +80,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self.setRenderHints(QtGui.QPainter.Antialiasing | QtGui.QPainter.SmoothPixmapTransform)
         self.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom)
         self.setDragMode(QtWidgets.QGraphicsView.NoDrag)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)  # so Escape (clear selection) reaches keyPressEvent below
 
         self._thumb_size = THUMB_SIZE
         self._mouse_mode = "App"
@@ -92,7 +97,6 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._labels = {}        # uid -> (bg QGraphicsRectItem, text QGraphicsSimpleTextItem)
         self._border_rects = {}  # uid -> QGraphicsRectItem (class-color border, grouped views only)
         self._border_colors = {}  # uid -> QColor
-        self._pending_restore = []  # uids re-added this sync that were previously removed
         self._pan_last = None    # last screen pos while right-button panning
         self._levels = None      # (lo, hi) contrast override; None = per-thumbnail autocontrast
 
@@ -131,6 +135,25 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         if emit:
             self.selection_changed.emit([])
 
+    def toggle_uid_selection(self, uid):
+        """Toggle one uid in/out of the selection, as if Ctrl+clicked here --
+        used by TomoBoxer for Ctrl+click in the main tomogram views, so
+        both windows always share the exact same selection list."""
+        sel = list(self._selected)
+        if uid in sel:
+            sel.remove(uid)
+        else:
+            sel.append(uid)
+        self._last_clicked_uid = uid
+        self._set_selection(sel)
+
+    def replace_selection(self, uids):
+        """Replace the selection outright -- used by TomoBoxer's shape-based
+        select tool (rectangle/circle/freeform) in the main tomogram views."""
+        uids = list(uids)
+        self._last_clicked_uid = uids[-1] if uids else None
+        self._set_selection(uids)
+
 
     # -- syncing particles -----------------------------------------------
     def sync_particles(self, uid_img_pairs):
@@ -138,21 +161,18 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         New uids are appended to the next free slot (bottom-left first);
         uids no longer present are removed, leaving their slot empty;
         uids already shown just get their thumbnail image refreshed. A uid
-        that reappears after having been removed (only possible via undo,
-        since uids are never reused) returns to its old slot and gets
-        highlighted -- see _add_item."""
+        that reappears after having been removed returns to its old slot --
+        see _add_item."""
         wanted = dict(uid_img_pairs)
         for uid in list(self._items.keys()):
             if uid not in wanted:
                 self._remove_item(uid)
-        self._pending_restore = []
         for uid, img in uid_img_pairs:
             if uid in self._items:
                 self._update_pixmap(uid, img)
             else:
                 self._add_item(uid, img)
         self._update_scene_rect()
-        self._finish_restore_highlight()
 
     def sync_particles_grouped(self, entries, class_order):
         """Like sync_particles, but groups items by class: entries is an
@@ -173,7 +193,6 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         for uid, img, cid in entries:
             by_class.setdefault(cid, []).append((uid, img))
 
-        self._pending_restore = []
         self._slot_of_uid = {}
         cols = self._cols()
         slot = 0
@@ -196,12 +215,6 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._next_slot = slot
         self._relayout_all()
         self._update_scene_rect()
-        self._finish_restore_highlight()
-
-    def _finish_restore_highlight(self):
-        if self._pending_restore:
-            self._set_selection(self._pending_restore)
-        self._pending_restore = []
 
     def reorganize(self):
         """Compact the grid: drop gaps left by deleted particles while
@@ -220,10 +233,10 @@ class ParticleGrid(QtWidgets.QGraphicsView):
     # -- internal item management -----------------------------------------
     def _add_item(self, uid, img, slot=None):
         self._images[uid] = img
-        restored = uid in self._known_slot
         if slot is None:
-            if restored and self._known_slot[uid] not in self._slot_of_uid.values():
-                slot = self._known_slot[uid]
+            known = self._known_slot.get(uid)
+            if known is not None and known not in self._slot_of_uid.values():
+                slot = known
             else:
                 slot = self._next_slot
                 self._next_slot += 1
@@ -236,8 +249,6 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._items[uid] = item
         self._add_label(uid)
         self._position_item(uid)
-        if restored:
-            self._pending_restore.append(uid)
 
     def _remove_item(self, uid):
         item = self._items.pop(uid, None)
@@ -442,6 +453,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._relayout_all()
 
     def mousePressEvent(self, event):
+        self.setFocus(QtCore.Qt.MouseFocusReason)  # so Escape works right after clicking here
         if event.button() == QtCore.Qt.RightButton:
             # Grab-and-pan: right-click and drag to scroll the grid, same
             # gesture as the tomogram views (ImageView2D). A plain
@@ -516,6 +528,13 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             return
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Escape:
+            self.clear_selection()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _range_select(self, from_uid, to_uid):
         if from_uid not in self._slot_of_uid or to_uid not in self._slot_of_uid:
             self._set_selection([to_uid])
@@ -554,13 +573,22 @@ class DetachedGridWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(int)  # classid
 
-    def __init__(self, classid, grid, title):
+    def __init__(self, classid, grid, title, visibility_checkbox):
         super().__init__()
         self.classid = classid
         self.grid = grid
         self.setWindowTitle(title)
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+
+        # The docked tab's visibility checkbox goes away with the tab when
+        # detaching (it's embedded in the tab bar) -- without a replacement
+        # here, there'd be no way to show/hide this set's particles in the
+        # tomogram views while its window is floating.
+        self.visibility_checkbox = visibility_checkbox
+        self.visibility_checkbox.setText("Visible in tomogram view")
+        layout.addWidget(self.visibility_checkbox)
+
         layout.addWidget(grid)
         # QTabWidget/QStackedWidget explicitly hide()s a page when it is
         # removed (removeTab), and that explicit-hidden flag survives being
@@ -578,12 +606,21 @@ class DetachedGridWindow(QtWidgets.QWidget):
 
 class ParticleListPanel(QtWidgets.QWidget):
     """Wraps a tabbed set of ParticleGrids: an "All" tab showing every
-    visible particle, plus one tab per class (rebuilt via rebuild_tabs()).
-    Any class tab can be "detached" into its own floating window with the
-    Detach button, and reattached by closing that window."""
+    visible particle, one tab per class (rebuilt via rebuild_tabs()), and a
+    permanent "+" tab at the end that prompts for a name and creates a new
+    set instead of ever actually being shown. Any class tab can be
+    "detached" into its own floating window with the Detach button, and
+    reattached by closing that window.
+
+    This is also where Sets management now lives, replacing the standalone
+    Options window's Sets panel: New/Rename/Delete/visibility all act on
+    tabs directly (a new tab, double-click to rename, a Delete Set button,
+    a per-tab visibility checkbox), rather than duplicating that as a
+    separate list somewhere else."""
 
     mx_image_selected = QtCore.Signal(object, object)
     selection_changed = QtCore.Signal(object)  # list of uids currently selected
+    class_activated = QtCore.Signal(int)  # classid, when a normal class's tab becomes current
 
     def __init__(self, target=None, parent=None):
         super().__init__(parent)
@@ -605,26 +642,172 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._levels_state = None  # (lo, hi) currently applied, so a newly created grid gets it too
         self._pending_entries = {}  # classid -> [(uid, img), ...] not yet applied to a
                                      # not-currently-shown docked tab's grid (see sync_particles)
+        self._visibility_checkboxes = {}  # classid -> QCheckBox, embedded in that tab
+
+        self._plus_placeholder = QtWidgets.QWidget()
+        self.tabs.addTab(self._plus_placeholder, "+")
+        self.tabs.setTabToolTip(self.tabs.indexOf(self._plus_placeholder), "Create a new set")
+        self._last_tab_index = 0
 
         btnrow = QtWidgets.QHBoxLayout()
         self.organize_button = QtWidgets.QPushButton("Organize Grid")
+        self.organize_button.setToolTip("Compact the grid, removing gaps left by deleted particles.")
         btnrow.addWidget(self.organize_button)
         self.detach_button = QtWidgets.QPushButton("Detach Tab")
+        self.detach_button.setToolTip("Pop the current tab's grid into its own floating window.")
+        self.detach_button.setEnabled(False)  # starts on "All", which can't be detached
         btnrow.addWidget(self.detach_button)
+        self.delete_set_button = QtWidgets.QPushButton("Delete Set")
+        self.delete_set_button.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
+        self.delete_set_button.setEnabled(False)
+        btnrow.addWidget(self.delete_set_button)
+        self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
+        self.empty_recycle_button.setToolTip(
+            "Permanently delete everything currently in the Recycle Bin "
+            "(undoable with Ctrl+Z right after).")
+        self.empty_recycle_button.setVisible(False)  # only shown while viewing the Recycle Bin tab
+        btnrow.addWidget(self.empty_recycle_button)
         layout.addLayout(btnrow)
 
         self.organize_button.clicked.connect(lambda: self._active_grid().reorganize())
         self.detach_button.clicked.connect(self._detach_current_tab)
+        self.delete_set_button.clicked.connect(self._delete_current_set)
+        self.empty_recycle_button.clicked.connect(self._empty_recycle_bin)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
+
+    def _target_or_none(self):
+        return self._target() if self._target is not None else None
+
+    def _active_classid(self):
+        w = self.tabs.currentWidget()
+        for cid, grid in self._class_grids.items():
+            if grid is w:
+                return cid
+        return None
 
     def _on_tab_changed(self, index):
         widget = self.tabs.widget(index)
+        if widget is self._plus_placeholder:
+            self._prompt_new_set()
+            return
+        self._last_tab_index = index
+
+        cid = self._active_classid()
+        is_fixed = cid in categories.FIXED_CLASS_IDS if cid is not None else False
+        self.delete_set_button.setEnabled(cid is not None and not is_fixed)
+        self.detach_button.setEnabled(cid is not None)  # "All" can't be detached
+        self.empty_recycle_button.setVisible(cid == categories.RECYCLE_BIN_ID)
+        if cid is not None and not is_fixed:
+            self.class_activated.emit(cid)
+
         for classid, grid in self._class_grids.items():
             if grid is widget:
                 pending = self._pending_entries.pop(classid, None)
                 if pending is not None:
                     grid.sync_particles(pending)
                 break
+
+    # -- sets management (New/Rename/Delete/visibility/Save/Empty Bin) ------
+    def _prompt_new_set(self):
+        target = self._target_or_none()
+        self.tabs.setCurrentIndex(self._last_tab_index)  # never linger on "+"
+        if target is None:
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, "New Set", "Enter a name for the new set:")
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name:
+            return
+        if name in target.sets.values():
+            QtWidgets.QMessageBox.information(self, "New Set", "A set with that name already exists.")
+            return
+        cid = target.new_set(name)
+        self.rebuild_tabs(target.sets)
+        grid = self._class_grids.get(cid)
+        if grid is not None:
+            self.tabs.setCurrentWidget(grid)
+
+    def _on_tab_double_clicked(self, index):
+        widget = self.tabs.widget(index)
+        if widget is self.grid or widget is self._plus_placeholder:
+            return  # "All" and "+" aren't renamable
+        target = self._target_or_none()
+        classid = None
+        for cid, grid in self._class_grids.items():
+            if grid is widget:
+                classid = cid
+                break
+        if target is None or classid is None:
+            return
+        if classid in categories.FIXED_CLASS_IDS:
+            QtWidgets.QMessageBox.information(
+                self, "Rename Set", "Recycle Bin and Confirmed are fixed categories and can't be renamed.")
+            return
+        oldname = target.sets[classid]
+        name, ok = QtWidgets.QInputDialog.getText(self, "Rename Set", "Enter a new name:", text=oldname)
+        if not ok:
+            return
+        name = str(name).strip()
+        if not name or name == oldname:
+            return
+        if name in target.sets.values():
+            QtWidgets.QMessageBox.information(self, "Rename Set", "A set with that name already exists.")
+            return
+        target.rename_set(f"{classid}::{oldname}", name)
+        self.rebuild_tabs(target.sets)
+
+    def _delete_current_set(self):
+        target = self._target_or_none()
+        cid = self._active_classid()
+        if target is None or cid is None or cid in categories.FIXED_CLASS_IDS:
+            return
+        name = target.sets.get(cid)
+        reply = QtWidgets.QMessageBox.question(
+            self, "Delete Set",
+            f'Are you sure you want to delete "{name}"? Every particle in it will be sent to the Recycle Bin.',
+            QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            # Switch away from the tab being removed *before* removing it --
+            # otherwise Qt shifts the current tab onto whatever ends up in
+            # its place, which (when deleting the last real class) is the
+            # "+" placeholder, immediately firing an unwanted "create a new
+            # set" prompt as a side effect of deleting one.
+            self.tabs.setCurrentWidget(self.grid)
+            target.delete_set(f"{cid}::{name}")
+            self.rebuild_tabs(target.sets)
+
+    def _empty_recycle_bin(self):
+        target = self._target_or_none()
+        if target is None:
+            return
+        count = sum(1 for b in target.boxes if b[5] == categories.RECYCLE_BIN_ID)
+        if count == 0:
+            return
+        reply = QtWidgets.QMessageBox.question(
+            self, "Empty Recycle Bin",
+            f"Permanently delete {count} particle(s) in the Recycle Bin? (Undo-able with Ctrl+Z right after.)",
+            QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            target.empty_recycle_bin()
+
+    def _make_visibility_checkbox(self, classid):
+        cb = QtWidgets.QCheckBox()
+        cb.setToolTip("Show/hide this set's particles in the tomogram views.")
+        target = self._target_or_none()
+        cb.setChecked(target is not None and classid in target.sets_visible)
+        cb.toggled.connect(lambda checked, cid=classid: self._set_visibility(cid, checked))
+        return cb
+
+    def _set_visibility(self, classid, checked):
+        target = self._target_or_none()
+        if target is None:
+            return
+        if checked:
+            target.show_set(f"{classid}::")
+        else:
+            target.hide_set(f"{classid}::")
 
     def _connect_grid(self, grid):
         grid.mx_image_selected.connect(self.mx_image_selected)
@@ -670,6 +853,7 @@ class ParticleListPanel(QtWidgets.QWidget):
                 grid = self._class_grids.pop(classid)
                 self._class_names.pop(classid, None)
                 self._pending_entries.pop(classid, None)
+                self._visibility_checkboxes.pop(classid, None)
                 idx = self.tabs.indexOf(grid)
                 if idx >= 0:
                     self.tabs.removeTab(idx)
@@ -700,14 +884,21 @@ class ParticleListPanel(QtWidgets.QWidget):
                 grid.set_levels(*self._levels_state)
             self._class_grids[classid] = grid
             self._class_names[classid] = name
-            self.tabs.addTab(grid, name)
+            # Insert before "+" (which addTab would otherwise land after,
+            # since it's always the last tab) -- _reorder_tabs fixes up the
+            # rest of the ordering below regardless.
+            self.tabs.insertTab(self.tabs.indexOf(self._plus_placeholder), grid, name)
+            cb = self._make_visibility_checkbox(classid)
+            self._visibility_checkboxes[classid] = cb
+            self.tabs.tabBar().setTabButton(self.tabs.indexOf(grid), QtWidgets.QTabBar.LeftSide, cb)
 
         self._reorder_tabs()
 
     def _reorder_tabs(self):
         """Move docked class tabs into _all_class_order (tab 0 is always
-        "All"). Needed both after rebuild_tabs adds/removes tabs and after
-        reattaching a detached tab, since insertTab there just appends."""
+        "All"), and pin "+" to the very last position. Needed both after
+        rebuild_tabs adds/removes tabs and after reattaching a detached
+        tab, since insertTab there just appends."""
         bar = self.tabs.tabBar()
         for pos, classid in enumerate(self._all_class_order, start=1):
             grid = self._class_grids.get(classid)
@@ -716,22 +907,34 @@ class ParticleListPanel(QtWidgets.QWidget):
             cur = self.tabs.indexOf(grid)
             if cur >= 0 and cur != pos:
                 bar.moveTab(cur, pos)
+        plus_idx = self.tabs.indexOf(self._plus_placeholder)
+        last = self.tabs.count() - 1
+        if plus_idx >= 0 and plus_idx != last:
+            bar.moveTab(plus_idx, last)
 
     def _detach_current_tab(self):
-        w = self.tabs.currentWidget()
-        classid = None
-        for cid, grid in self._class_grids.items():
-            if grid is w:
-                classid = cid
-                break
+        classid = self._active_classid()
         if classid is None:
-            return  # "All" tab can't be detached
+            return  # "All"/"+" can't be detached
         grid = self._class_grids.pop(classid)
         name = self._class_names.get(classid, str(classid))
+        # Popped (not reused) here: removeTab below deletes a tab's corner
+        # widget as a side effect of removing the tab, so this Python
+        # reference could already be pointing at a destroyed C++ object by
+        # the time DetachedGridWindow might otherwise try to reuse it. A
+        # fresh one is made just below instead (same as _reattach does).
+        self._visibility_checkboxes.pop(classid, None)
+        # Switch away from the tab being removed *first* -- otherwise, when
+        # it's the last real class tab, Qt shifts the current tab onto
+        # whatever ends up in its place, which is the "+" placeholder,
+        # immediately (and confusingly) firing the "create a new set"
+        # prompt as a side effect of detaching one (same issue as deleting
+        # the last real set -- see _delete_current_set).
+        self.tabs.setCurrentWidget(self.grid)
         idx = self.tabs.indexOf(grid)
         if idx >= 0:
             self.tabs.removeTab(idx)
-        win = DetachedGridWindow(classid, grid, name)
+        win = DetachedGridWindow(classid, grid, name, self._make_visibility_checkbox(classid))
         win.closed.connect(self._reattach)
         self._detached[classid] = win
         win.show()
@@ -745,6 +948,9 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._class_grids[classid] = grid
         grid.setVisible(True)
         self.tabs.addTab(grid, name)
+        cb = self._make_visibility_checkbox(classid)
+        self._visibility_checkboxes[classid] = cb
+        self.tabs.tabBar().setTabButton(self.tabs.indexOf(grid), QtWidgets.QTabBar.LeftSide, cb)
         self._reorder_tabs()
         self.tabs.setCurrentWidget(grid)
 

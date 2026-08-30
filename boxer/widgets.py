@@ -181,9 +181,10 @@ class LabeledSpinBox(QtWidgets.QWidget):
         super().__init__(parent)
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.label = None
         if label:
-            lbl = QtWidgets.QLabel(label)
-            layout.addWidget(lbl)
+            self.label = QtWidgets.QLabel(label)
+            layout.addWidget(self.label)
         self.spin = QtWidgets.QSpinBox()
         self.spin.setKeyboardTracking(False)
         self.spin.setRange(minimum, maximum)
@@ -198,3 +199,13 @@ class LabeledSpinBox(QtWidgets.QWidget):
         self.spin.blockSignals(True)
         self.spin.setValue(int(value))
         self.spin.blockSignals(False)
+
+    def setToolTip(self, text):
+        # A tooltip set on this composite widget wouldn't otherwise be seen
+        # while hovering the label or spin box specifically -- Qt shows a
+        # widget's own tooltip for whichever child is actually under the
+        # cursor, not a parent's, so it has to be applied to both by hand.
+        super().setToolTip(text)
+        self.spin.setToolTip(text)
+        if self.label is not None:
+            self.label.setToolTip(text)

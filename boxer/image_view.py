@@ -71,6 +71,11 @@ class _ShapeItem(QtWidgets.QGraphicsItem):
             xlo, xhi = min(g[0], g[2]), max(g[0], g[2])
             ylo, yhi = min(g[1], g[3]), max(g[1], g[3])
             return QtCore.QRectF(xlo - pad, ylo - pad, xhi - xlo + 2 * pad, yhi - ylo + 2 * pad)
+        if shape.kind == "polygon" and len(g) >= 4:
+            xs, ys = g[0::2], g[1::2]
+            xlo, xhi = min(xs), max(xs)
+            ylo, yhi = min(ys), max(ys)
+            return QtCore.QRectF(xlo - pad, ylo - pad, xhi - xlo + 2 * pad, yhi - ylo + 2 * pad)
         return QtCore.QRectF()
 
     def paint(self, painter, option, widget=None):
@@ -96,6 +101,12 @@ class _ShapeItem(QtWidgets.QGraphicsItem):
             painter.drawRect(QtCore.QRectF(QtCore.QPointF(geo[0], geo[1]), QtCore.QPointF(geo[2], geo[3])))
         elif shape.kind == "line" and len(geo) >= 4:
             painter.drawLine(QtCore.QPointF(geo[0], geo[1]), QtCore.QPointF(geo[2], geo[3]))
+        elif shape.kind == "polygon" and len(geo) >= 4:
+            pts = [QtCore.QPointF(geo[i], geo[i + 1]) for i in range(0, len(geo) - 1, 2)]
+            # drawPolygon always closes back to the first point -- exactly
+            # the "live preview closes back to the start" look the
+            # click-to-place freeform selector wants while it's mid-placement.
+            painter.drawPolygon(QtGui.QPolygonF(pts))
 
 
 class ImageView2D(QtWidgets.QGraphicsView):
@@ -104,6 +115,7 @@ class ImageView2D(QtWidgets.QGraphicsView):
     mouseup = QtCore.Signal(object)
     mousewheel = QtCore.Signal(object)
     mousemove = QtCore.Signal(object)
+    mousedoubleclick = QtCore.Signal(object)
     signal_set_scale = QtCore.Signal(float)
     origin_update = QtCore.Signal(tuple)
     keypress = QtCore.Signal(object)
@@ -163,6 +175,8 @@ class ImageView2D(QtWidgets.QGraphicsView):
         self.shapechange = 0
         self._eraser_shape = None
         self._eraser_item = None
+        self._select_preview = None
+        self._select_preview_item = None
 
         self._apply_view_transform()
 
@@ -270,8 +284,20 @@ class ImageView2D(QtWidgets.QGraphicsView):
         """Renumber self.shapes/self._items (and the visible-keys index) so
         the shape currently at old key key_order[new_key] becomes the shape
         at new_key -- used by TomoBoxer.del_box, where removing some
-        particles shifts every later one's index."""
+        particles shifts every later one's index.
+
+        Any old key *not* present in key_order belongs to a particle that
+        was actually deleted (not just renumbered), and its graphics item
+        needs removing from the scene here -- otherwise it stays in the
+        scene forever under no key at all, frozen at whatever kind/geometry
+        it last had (never hidden again, since nothing iterates it anymore),
+        showing on every slice and unclickable/undeletable since no box
+        index maps to it any more."""
         old_shapes, old_items, old_visible = self.shapes, self._items, self._visible_keys
+        kept_old_keys = set(key_order)
+        for old_key, item in old_items.items():
+            if old_key not in kept_old_keys:
+                self._scene.removeItem(item)
         self.shapes = {}
         self._items = {}
         self._visible_keys = set()
@@ -313,6 +339,29 @@ class ImageView2D(QtWidgets.QGraphicsView):
             self._eraser_item.set_shape(shape)
         self._eraser_item.setVisible(True)
         self._eraser_item.refresh()
+
+    # -- shape-select tool preview (same pattern as eraser_shape above; a
+    # separate property since the two are shown at mutually exclusive times
+    # but there's no reason to make one reuse/clobber the other's item) ----
+    @property
+    def select_preview(self):
+        return self._select_preview
+
+    @select_preview.setter
+    def select_preview(self, shape):
+        self._select_preview = shape
+        if shape is None:
+            if self._select_preview_item is not None:
+                self._select_preview_item.setVisible(False)
+            return
+        if self._select_preview_item is None:
+            self._select_preview_item = _ShapeItem(shape, lambda: self._scale)
+            self._select_preview_item.setZValue(10)
+            self._scene.addItem(self._select_preview_item)
+        else:
+            self._select_preview_item.set_shape(shape)
+        self._select_preview_item.setVisible(True)
+        self._select_preview_item.refresh()
 
     # -- view transform -----------------------------------------------------
     def get_origin(self):
@@ -389,6 +438,15 @@ class ImageView2D(QtWidgets.QGraphicsView):
         if event.button() == QtCore.Qt.LeftButton:
             self.mousedown.emit(event)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Qt delivers a double click as press/release/DOUBLE-CLICK/release --
+        # not a second ordinary press -- so this doesn't also add a
+        # duplicate vertex through mousePressEvent's mousedown above; it's
+        # purely the "finish the freeform selection" signal.
+        if event.button() == QtCore.Qt.LeftButton:
+            self.mousedoubleclick.emit(event)
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):
         if self._pan_last is not None and (event.buttons() & QtCore.Qt.RightButton):
