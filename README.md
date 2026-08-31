@@ -9,12 +9,23 @@ up with a Recycle-Bin / Confirmed workflow, and export coordinates.
 
 ```
 python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
+    [--working_dir DIR] [--particle_lists PATH [PATH ...]]
 ```
 
 - `--box2d` / `--box3d` — pick 2D particles from slices, or 3D sub-volumes (default).
 - `--label NAME` — open with the named set already selected.
 - `--clean` — start with the Eraser tool already active.
 - `--apix` — override the pixel size read from the file header.
+- `--working_dir DIR` — store/load picks from `DIR` instead of the default
+  `<tomogram>_picks` next to the tomogram file. Resolved relative to the
+  current directory.
+- `--particle_lists PATH [PATH ...]` — one or more plain-text `x y z`
+  coordinate files, space-separated; each becomes its own brand new set
+  (named after the file) copied into the working directory immediately,
+  exactly like File > Read Box Coord. A name already in use (including
+  from a previous run against the same working directory) gets a numeric
+  suffix rather than being skipped or overwritten, since the same name can
+  legitimately carry different picks run to run.
 
 Two windows open: the **tomogram window** (orthogonal XY/XZ/ZY views,
 toolbars, and controls) and the **Particle List** (thumbnail gallery, also

@@ -66,8 +66,16 @@ def discover_classes(pdir: str) -> list:
     return sorted(names)
 
 
-def load_class_coords(pdir: str, classname: str) -> list:
-    path = class_file(pdir, classname)
+def load_particle_list(path: str) -> list:
+    """Read a plain-text "x y z" coordinate file, one particle per line
+    (extra whitespace-separated fields after the first three are ignored,
+    short or non-numeric lines are skipped). [] if the file doesn't exist.
+
+    This is the one place that format lives -- both a class's own on-disk
+    pick file (load_class_coords, below) and an ad-hoc imported particle
+    list (TomoBoxer.import_particle_list, for File > Read Box Coord and
+    --particle_lists) go through here, so supporting a different input
+    format later is a change to just this function."""
     coords = []
     if not os.path.isfile(path):
         return coords
@@ -81,6 +89,10 @@ def load_class_coords(pdir: str, classname: str) -> list:
             except ValueError:
                 continue
     return coords
+
+
+def load_class_coords(pdir: str, classname: str) -> list:
+    return load_particle_list(class_file(pdir, classname))
 
 
 def save_class_coords(pdir: str, classname: str, coords) -> None:

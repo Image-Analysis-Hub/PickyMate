@@ -478,8 +478,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.data = None
         self.set_data(data)
 
-        # Per-class plain-text pick files live in "<basename>_picks/".
-        self.picksdir = metadata.picks_dir(datafile)
+        # Per-class plain-text pick files live in "<basename>_picks/" next
+        # to the tomogram by default, or wherever --working_dir points
+        # (resolved relative to the current working directory) instead.
+        self.picksdir = (
+            os.path.abspath(options.working_dir) if getattr(options, "working_dir", None)
+            else metadata.picks_dir(datafile))
 
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle("Particle List")
@@ -541,7 +545,20 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for i in range(3):
                 b[i] = int(np.clip(round(b[i]), 1, shape[i] - 1))
 
-        if not normal_names:
+        # --particle_lists: each path becomes its own brand-new set, copied
+        # (written) into self.picksdir immediately, same as File > Read Box
+        # Coord -- see import_particle_list. live=False since the boxes
+        # appended here are picked up by this __init__'s own per-box
+        # update_box loop just below instead of doing that twice.
+        for lp in getattr(options, "particle_lists", None) or []:
+            result = self.import_particle_list(lp, live=False)
+            if result is None:
+                print(f"warning: no coordinates found in particle list {lp!r}, skipped")
+                continue
+            unique_name, count = result
+            print(f"Imported {count} particle(s) from {lp!r} into new set \"{unique_name}\"")
+
+        if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
             self.new_set("particles_00")
 
         self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
@@ -813,31 +830,36 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self, "Save",
             f"Every set's picks and box sizes have been saved to:\n{self.picksdir}")
 
-    def menu_file_read_boxloc(self):
-        """Import an "x y z" coordinate text file as a brand new set, named
-        after the file (auto-disambiguated if that name's already taken) --
-        rather than dumping the imported particles into whichever set
-        happens to be selected, which left no way to tell them apart from
-        picks made by hand."""
-        fsp, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select box coordinate text file", "", "Text files (*.txt);;All files (*)")
-        if not fsp or not os.path.isfile(fsp):
-            return
-        coords = []
-        with open(fsp) as f:
-            for line in f:
-                parts = line.split()[:3]
-                if len(parts) < 3:
-                    continue
-                try:
-                    coords.append(tuple(int(float(v)) for v in parts))
-                except ValueError:
-                    continue
-        if not coords:
-            QtWidgets.QMessageBox.information(self, "Read Box Coord", "No coordinates found in that file.")
-            return
+    def import_particle_list(self, path, live=True):
+        """Import a plain-text "x y z" coordinate file (metadata.
+        load_particle_list -- see there for the input format) as a brand
+        new set, named after the file (auto-suffixed if that name's
+        already taken -- deliberately: the same name can legitimately
+        show up twice with different picks, e.g. --particle_lists run
+        again against a working directory that already has a same-named
+        set from a previous run) -- rather than dumping the imported
+        particles into whichever set happens to be selected, which left
+        no way to tell them apart from picks made by hand. Shared by the
+        File > Read Box Coord menu action (live=True) and --particle_lists
+        at startup (live=False).
 
-        name = metadata.base_name(fsp)
+        `live` covers what only makes sense once the app is already
+        running: per-box marker/thumbnail generation and a view refresh.
+        During __init__'s own bootstrap (live=False), the boxes appended
+        here are picked up by its own trailing update_box loop instead,
+        so doing that here too would just be redundant work performed
+        before the window is even fully set up. Either way, this set's
+        own coordinate file is always written immediately -- "imported"
+        means "copied into the working directory," not "queued until
+        something else happens to save."
+
+        Returns (unique_name, count) or None if the file had no usable
+        coordinates."""
+        coords = metadata.load_particle_list(path)
+        if not coords:
+            return None
+
+        name = metadata.base_name(path)
         unique_name = name
         n = 1
         while unique_name in self.sets.values():
@@ -846,7 +868,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         clsid = self.new_set(unique_name)
 
-        self.initialized = False
         shape = [self.data.nx, self.data.ny, self.data.nz]
         start = len(self.boxes)
         for x, y, z in coords:
@@ -854,13 +875,32 @@ class TomoBoxer(QtWidgets.QMainWindow):
             y = int(np.clip(round(y), 1, shape[1] - 1))
             z = int(np.clip(round(z), 1, shape[2] - 1))
             self.boxes.append([x, y, z, "manual", 0.0, clsid, self._new_uid()])
-        for i in range(start, len(self.boxes)):
-            self.update_box(i)
-        self.initialized = True
-        self.save_json(only={clsid})
-        self.update_all()
 
-        msg = f"Imported {len(coords)} particle(s) into new set \"{unique_name}\"."
+        if live:
+            self.initialized = False
+            for i in range(start, len(self.boxes)):
+                self.update_box(i)
+            self.initialized = True
+
+        self.save_json(only={clsid})
+
+        if live:
+            self.update_all()
+
+        return unique_name, len(coords)
+
+    def menu_file_read_boxloc(self):
+        fsp, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select box coordinate text file", "", "Text files (*.txt);;All files (*)")
+        if not fsp or not os.path.isfile(fsp):
+            return
+        name = metadata.base_name(fsp)
+        result = self.import_particle_list(fsp, live=True)
+        if result is None:
+            QtWidgets.QMessageBox.information(self, "Read Box Coord", "No coordinates found in that file.")
+            return
+        unique_name, count = result
+        msg = f"Imported {count} particle(s) into new set \"{unique_name}\"."
         if unique_name != name:
             msg += f' (renamed from "{name}", which was already in use.)'
         QtWidgets.QMessageBox.information(self, "Read Box Coord", msg)

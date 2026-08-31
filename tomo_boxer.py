@@ -4,6 +4,7 @@ e2spt_boxer.py that runs outside the EMAN2 environment).
 
 Usage:
     python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
+        [--working_dir DIR] [--particle_lists PATH [PATH ...]]
 """
 from __future__ import annotations
 
@@ -24,6 +25,15 @@ def main():
     parser.add_argument("--label", type=str, default=None, help="Start viewing the specified particle set/label")
     parser.add_argument("--clean", action="store_true", help="Start in eraser (cleaning) mode")
     parser.add_argument("--apix", type=float, default=None, help="Override pixel size (Angstrom/pixel)")
+    parser.add_argument(
+        "--working_dir", type=str, default=None,
+        help="Directory to store/load picks from (default: <tomogram>_picks next to the tomogram), "
+             "resolved relative to the current directory")
+    parser.add_argument(
+        "--particle_lists", type=str, nargs="+", default=None, metavar="PATH",
+        help="One or more 'x y z' coordinate text files, each imported as its own new set "
+             "(named after the file, auto-suffixed on a name collision) and copied into "
+             "the working directory")
     options = parser.parse_args()
 
     options.mode = "2D" if options.box2d and not options.box3d else "3D"
