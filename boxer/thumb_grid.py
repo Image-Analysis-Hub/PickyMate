@@ -24,6 +24,12 @@ via ParticleGrid.sync_particles_grouped, which fully recomputes slots on
 every call so classes stay visually clustered as particles move between
 them. Per-class tabs are unaffected and keep the stable/gap-preserving
 behavior described above.
+
+Because that full recompute touches every particle's thumbnail and layout,
+ParticleListPanel.sync_particles defers it (via _pending_all_entries) the
+same way it already defers per-class tabs that aren't on screen -- "All"
+only gets rebuilt when it's the tab actually being looked at, not on every
+single particle change regardless of which tab is visible.
 """
 from __future__ import annotations
 
@@ -718,6 +724,9 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._levels_state = None  # (lo, hi) currently applied, so a newly created grid gets it too
         self._pending_entries = {}  # classid -> [(uid, img), ...] not yet applied to a
                                      # not-currently-shown docked tab's grid (see sync_particles)
+        self._pending_all_entries = None  # same idea, but for the "All" tab specifically
+                                     # (see sync_particles/_on_tab_changed) -- None means
+                                     # "All" is already current, nothing deferred
         self._visibility_checkboxes = {}  # classid -> QCheckBox, embedded in that tab
         self._color_swatches = {}  # classid -> QToolButton (color swatch), embedded in that tab
         self._pinning_fixed_tabs = False  # reentrancy guard, see _pin_fixed_tabs
@@ -796,6 +805,13 @@ class ParticleListPanel(QtWidgets.QWidget):
         # whatever the gallery is showing regardless of whether that tab
         # could ever become the active picking class.
         self.active_tab_changed.emit(cid)
+
+        if widget is self.grid:
+            if self._pending_all_entries is not None:
+                self.grid.sync_particles_grouped(self._pending_all_entries, self._all_visible_class_order())
+                self.grid.apply_selection(self._selected_uids)
+                self._pending_all_entries = None
+            return
 
         for classid, grid in self._class_grids.items():
             if grid is widget:
@@ -1348,12 +1364,24 @@ class ParticleListPanel(QtWidgets.QWidget):
     def sync_particles(self, entries):
         """entries: iterable of (uid, img, classid)."""
         entries = list(entries)
-        self.grid.sync_particles_grouped(entries, self._all_visible_class_order())
-        self.grid.apply_selection(self._selected_uids)
+        current_widget = self.tabs.currentWidget()
+        if current_widget is self.grid:
+            self.grid.sync_particles_grouped(entries, self._all_visible_class_order())
+            self.grid.apply_selection(self._selected_uids)
+            self._pending_all_entries = None
+        else:
+            # "All" isn't the tab on screen right now -- defer its full
+            # grouped rebuild (sync_particles_grouped fully recomputes every
+            # thumbnail's contrast and every item's layout on every call, by
+            # design -- see its own docstring) until the user actually
+            # switches to it, exactly like the per-class tabs below already
+            # do. At tens of thousands of particles this was the single
+            # biggest per-click cost regardless of which tab was actually
+            # being looked at.
+            self._pending_all_entries = entries
         by_class = {}
         for uid, img, cid in entries:
             by_class.setdefault(cid, []).append((uid, img))
-        current_widget = self.tabs.currentWidget()
         for classid, grid in self._class_grids.items():
             class_entries = by_class.get(classid, [])
             if grid is current_widget:

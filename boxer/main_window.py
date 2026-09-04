@@ -1352,7 +1352,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.boxesimgs[n] = self._thumbnail_crop(box)
 
             if self.initialized:
-                self.save_json()
+                # Scoped to this one box's own class -- a single add/drag
+                # only changes that class's file, so rewriting every other
+                # class's pick file too (a full self.boxes scan per class)
+                # was pure waste, at scale enough to make each pick or
+                # drag-release synchronously stall on disk I/O.
+                self.save_json(only={box[5]})
                 # The gallery thumbnail only needs refreshing when the
                 # particle's own snapshot image changes (just above), which
                 # only happens here in the non-quiet path -- doing this on
