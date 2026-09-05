@@ -28,6 +28,7 @@ _SHORTCUTS = [
     ("Send to Confirmed", "Space + click"),
     ("Multi-select toggle", "Ctrl + click (gallery or tomogram view)"),
     ("Multi-select range", "Alt + click (gallery)"),
+    ("Send every selected particle to Recycle Bin", "Delete"),
     ("Shape-select (rectangle/circle)", "Click + drag, Select tool active"),
     ("Shape-select (freeform)", "Click to place points, Select tool active"),
     ("Finish freeform selection", "Double-click, Enter, or click near the start point"),
@@ -38,6 +39,7 @@ _SHORTCUTS = [
     ("Rename set", "Double-click its tab"),
     ("Undo", "Ctrl+Z"),
     ("Redo", "Ctrl+Y, Ctrl+Shift+Z, or your platform's native Redo key"),
+    ("Force everything to re-derive and redraw", "F5 (Edit > Refresh)"),
     ("This reference", "F1"),
 ]
 
@@ -87,6 +89,15 @@ _NOTES = [
     "active channel only\" off restores exactly the visibility you had "
     "before; Show All Channels makes every set visible in one click and "
     "turns it off if it was on.",
+    "\"Show only selected\" (Selection toolbar) shows only the currently "
+    "selected particle(s) in the tomogram views, regardless of any set's "
+    "own visibility -- if nothing is selected, nothing shows. Updates "
+    "live as the selection changes; unlike \"Show the active channel "
+    "only\", there's nothing to restore when you turn it back off.",
+    "\"Refresh\" (Edit menu, toolbar, or F5) forces everything to fully "
+    "re-derive and redraw -- regenerating every gallery thumbnail from "
+    "the volume and fully re-slicing the tomogram views -- in case "
+    "rendering ever visibly gets stuck. Not needed for normal use.",
 ]
 
 

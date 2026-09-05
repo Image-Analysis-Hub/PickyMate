@@ -41,6 +41,24 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from . import categories
 from .widgets import TOOLBAR_BUTTON_STYLE, space_key_state
 
+_LEAVE_ONE_OUT_HELP = (
+    "Leave-one-out excludes each particle's own contribution from the reference "
+    "distribution before scoring it against the rest of the set -- more correct "
+    "for finding outliers (a particle can't be an outlier relative to a "
+    "distribution that includes itself), but it means recomputing the whole "
+    "distribution once per particle instead of once for the whole set.\n\n"
+    "Real measured cost (independent of embedding dimensionality):\n"
+    "    50 particles      ~10 seconds\n"
+    "    200 particles     ~45 seconds\n"
+    "    1,000 particles   ~4-5 minutes\n"
+    "    3,000 particles   ~15 minutes\n\n"
+    "Only available when the reference and target set are the same (reviewing a "
+    "set against itself) -- comparing one set against a different one always "
+    "uses the whole reference distribution, since a particle that isn't a "
+    "member of the reference set was never part of the distribution it's being "
+    "compared to in the first place."
+)
+
 THUMB_SIZE = 96
 MIN_THUMB = 24
 MAX_THUMB = 256
@@ -93,6 +111,12 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._items = {}        # uid -> QGraphicsPixmapItem
         self._images = {}       # uid -> raw numpy image (kept for re-scaling on zoom)
         self._slot_of_uid = {}  # uid -> stable slot index
+        self._occupied_slots = set()  # always == set(self._slot_of_uid.values()) -- a live
+                                 # mirror kept incrementally so _add_item's "is this old slot
+                                 # free again" check (below) is O(1) instead of an O(current
+                                 # size) dict.values() scan repeated once per re-added
+                                 # particle, which made re-populating a large grid (e.g. after
+                                 # a hidden set becomes visible again) quadratic.
         self._known_slot = {}   # uid -> last slot it ever occupied (survives removal,
                                  # so a particle brought back by undo returns to the
                                  # same spot instead of being appended at the end)
@@ -168,7 +192,10 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         uids no longer present are removed, leaving their slot empty;
         uids already shown just get their thumbnail image refreshed. A uid
         that reappears after having been removed returns to its old slot --
-        see _add_item."""
+        see _add_item. Always un-dims every item -- dimming only means
+        anything relative to apply_score_order's display, and this is the
+        path any ordinary particle change (add/move/delete) goes through,
+        so a stale dimmed particle should never survive one."""
         wanted = dict(uid_img_pairs)
         for uid in list(self._items.keys()):
             if uid not in wanted:
@@ -178,6 +205,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 self._update_pixmap(uid, img)
             else:
                 self._add_item(uid, img)
+            self.set_dimmed(uid, False)
         self._update_scene_rect()
 
     def sync_particles_grouped(self, entries, class_order):
@@ -219,8 +247,107 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 self.set_border_color(uid, color)
                 slot += 1
         self._next_slot = slot
+        self._occupied_slots = set(self._slot_of_uid.values())
         self._relayout_all()
         self._update_scene_rect()
+
+    def apply_score_order(self, scores):
+        """One-shot re-layout of whatever's already in this grid (nothing
+        added or removed -- see sync_particles for that), ordered by the
+        last computed Mahalanobis score:
+
+        1. Particles with an embedding but no score yet (never computed,
+           or reset by a class change) come first, in original-id (uid)
+           order.
+        2. Then every scored particle, ascending by score -- closest to
+           the reference distribution first.
+        3. Then, after a blank divider row and dimmed, anything with no
+           embedding at all -- it can never be scored, so it's never
+           reordered by this and stays out of the way rather than
+           interleaved with particles that can be.
+
+        This is a single snapshot, not an ongoing mode: nothing here
+        remembers that this grid was "sorted by score," so the next
+        particle added or moved just appends normally at the end (see
+        _add_item), the same as if this had never been clicked. Calling
+        it again re-derives the order fresh from whatever's changed
+        since. scores: {uid: (score, has_embedding)} as built by
+        TomoBoxer.update_boximgs; a uid missing from it is treated the
+        same as (None, False) -- no embedding, never scored."""
+        unscored, scored, unscorable = [], [], []
+        for uid in self._items:
+            score, has_embedding = scores.get(uid, (None, False))
+            if not has_embedding:
+                unscorable.append(uid)
+            elif score is None:
+                unscored.append(uid)
+            else:
+                scored.append((uid, score))
+        unscored.sort()
+        scored.sort(key=lambda t: t[1])
+        unscorable.sort()
+
+        cols = self._cols()
+        self._slot_of_uid = {}
+        slot = 0
+        for uid in unscored:
+            self._slot_of_uid[uid] = slot
+            self._known_slot[uid] = slot
+            self.set_dimmed(uid, False)
+            slot += 1
+        for uid, _score in scored:
+            self._slot_of_uid[uid] = slot
+            self._known_slot[uid] = slot
+            self.set_dimmed(uid, False)
+            slot += 1
+        if unscorable:
+            if slot % cols != 0:
+                slot += cols - (slot % cols)
+            slot += cols  # one full blank row as an explicit divider
+            for uid in unscorable:
+                self._slot_of_uid[uid] = slot
+                self._known_slot[uid] = slot
+                self.set_dimmed(uid, True)
+                slot += 1
+        self._next_slot = slot
+        self._occupied_slots = set(self._slot_of_uid.values())
+        self._relayout_all()
+        self._update_scene_rect()
+
+    def apply_id_order(self):
+        """One-shot re-layout by uid (original ID) ascending, undoing
+        whatever apply_score_order last did -- including un-dimming
+        everything, since dimming only ever means anything relative to a
+        distance-based order. Like apply_score_order, this is a single
+        snapshot, not an ongoing mode."""
+        ordered = sorted(self._items.keys())
+        self._slot_of_uid = {}
+        self._next_slot = 0
+        for uid in ordered:
+            self._slot_of_uid[uid] = self._next_slot
+            self._known_slot[uid] = self._next_slot
+            self.set_dimmed(uid, False)
+            self._next_slot += 1
+        self._occupied_slots = set(self._slot_of_uid.values())
+        self._relayout_all()
+        self._update_scene_rect()
+
+    def uids_from_slot(self, uid):
+        """uid and every other currently-displayed uid at an equal or
+        later slot, in slot order -- i.e. "this one and the rest of the
+        list" as it's actually laid out on screen right now, whatever
+        that currently is (stable insertion order, or a one-shot Sort by
+        Score/Original ID snapshot -- see apply_score_order/
+        apply_id_order). Used for Shift+Ctrl+click (see
+        TomoBoxer.img_selected), which has to follow what's visually on
+        screen, not some other order invisible to whoever's looking at
+        it -- particularly since a per-class grid's own slots only ever
+        contain that class's particles, so this also naturally keeps the
+        gesture from reaching into a different class entirely."""
+        start = self._slot_of_uid.get(uid)
+        if start is None:
+            return [uid]
+        return [u for u, s in sorted(self._slot_of_uid.items(), key=lambda kv: kv[1]) if s >= start]
 
     def reorganize(self):
         """Compact the grid: drop gaps left by deleted particles while
@@ -232,6 +359,7 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             self._slot_of_uid[uid] = self._next_slot
             self._known_slot[uid] = self._next_slot
             self._next_slot += 1
+        self._occupied_slots = set(self._slot_of_uid.values())
         for uid in ordered:
             self._position_item(uid)
         self._update_scene_rect()
@@ -241,13 +369,14 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         self._images[uid] = img
         if slot is None:
             known = self._known_slot.get(uid)
-            if known is not None and known not in self._slot_of_uid.values():
+            if known is not None and known not in self._occupied_slots:
                 slot = known
             else:
                 slot = self._next_slot
                 self._next_slot += 1
         self._known_slot[uid] = slot
         self._slot_of_uid[uid] = slot
+        self._occupied_slots.add(slot)
         item = QtWidgets.QGraphicsPixmapItem(self._render_pixmap(img))
         item.setTransformationMode(QtCore.Qt.SmoothTransformation)
         item.setData(UID_ROLE, uid)
@@ -261,7 +390,9 @@ class ParticleGrid(QtWidgets.QGraphicsView):
         if item is not None:
             self._scene.removeItem(item)
         self._images.pop(uid, None)
-        self._slot_of_uid.pop(uid, None)
+        slot = self._slot_of_uid.pop(uid, None)
+        if slot is not None:
+            self._occupied_slots.discard(slot)
         self._hide_selection(uid)
         self._hide_label(uid)
         self._border_colors.pop(uid, None)
@@ -382,6 +513,13 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             rect.setPen(pen)
         pos = item.pos()
         rect.setRect(pos.x() - 1, pos.y() - 1, self._thumb_size + 2, self._thumb_size + 2)
+
+    # -- dimming (used by apply_score_order for particles with no
+    # embedding at all, which can never be scored/reordered) --------------
+    def set_dimmed(self, uid, dimmed):
+        item = self._items.get(uid)
+        if item is not None:
+            item.setOpacity(0.35 if dimmed else 1.0)
 
     def _relayout_all(self):
         for uid in self._items:
@@ -702,6 +840,79 @@ class ParticleListPanel(QtWidgets.QWidget):
             self.view_toolbar.addAction(target.show_all_channels_action)
             layout.addWidget(self.view_toolbar)
 
+        # Deliberately the loudest thing in this window: computing/sorting
+        # by Mahalanobis distance used to live as a File menu item (then a
+        # popup dialog triggered from a button), which made it easy to miss
+        # or fiddly to reach. Now it's its own group, inline, right here --
+        # the reference set/embedding space/leave-one-out controls plus the
+        # big green "go" button all live together with nothing modal in
+        # between, so the whole feature reads and edits in place.
+        self.compute_distance_group = QtWidgets.QWidget()
+        group_layout = QtWidgets.QVBoxLayout(self.compute_distance_group)
+        group_layout.setContentsMargins(0, 0, 0, 0)
+        group_layout.setSpacing(3)
+
+        # Top row names the actual set that'll be ranked -- the current
+        # tab, kept live-updated by _update_compute_distance_state as you
+        # switch tabs -- rather than leaving that implicit the way a bare
+        # "vs. [combo]" row did.
+        target_row = QtWidgets.QHBoxLayout()
+        target_row.addWidget(QtWidgets.QLabel("Rank:"))
+        self.compute_distance_target_label = QtWidgets.QLabel()
+        self.compute_distance_target_label.setStyleSheet("font-weight: bold;")
+        target_row.addWidget(self.compute_distance_target_label)
+        target_row.addWidget(QtWidgets.QLabel("vs."))
+        self.compute_distance_reference_combo = QtWidgets.QComboBox()
+        self.compute_distance_reference_combo.setToolTip(
+            "The set whose embedding distribution the current tab's particles "
+            "are compared to (e.g. Confirmed) -- can be the current tab itself, "
+            "to spot outliers within it.")
+        self.compute_distance_reference_combo.currentIndexChanged.connect(
+            self._update_compute_distance_state)
+        target_row.addWidget(self.compute_distance_reference_combo)
+        target_row.addStretch(1)
+        group_layout.addLayout(target_row)
+
+        controls_row = QtWidgets.QHBoxLayout()
+        self.compute_distance_space_combo = QtWidgets.QComboBox()
+        self.compute_distance_space_combo.addItem("Full embedding (1024-d)", "full")
+        controls_row.addWidget(self.compute_distance_space_combo)
+        self.compute_distance_loo_check = QtWidgets.QCheckBox("Leave-one-out")
+        controls_row.addWidget(self.compute_distance_loo_check)
+        loo_help_button = QtWidgets.QToolButton()
+        loo_help_button.setText("?")
+        loo_help_button.setToolTip("What does leave-one-out mean, and how slow is it?")
+        loo_help_button.clicked.connect(self._show_leave_one_out_help)
+        controls_row.addWidget(loo_help_button)
+        controls_row.addStretch(1)
+        group_layout.addLayout(controls_row)
+
+        self.compute_distance_button = QtWidgets.QPushButton("▶  Use embeddings to rank particles")
+        self.compute_distance_button.setToolTip(
+            "Score the current tab's particles by their Mahalanobis distance to "
+            "the reference set's embedding distribution, then lay them out "
+            "closest-first.")
+        self.compute_distance_button.setCursor(QtCore.Qt.PointingHandCursor)
+        self.compute_distance_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2e7d32;
+                color: white;
+                font-weight: bold;
+                font-size: 13px;
+                padding: 8px 14px;
+                border: none;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #388e3c; }
+            QPushButton:pressed { background-color: #1b5e20; }
+            QPushButton:disabled { background-color: #9e9e9e; }
+        """)
+        self.compute_distance_button.clicked.connect(self._run_compute_distance)
+        group_layout.addWidget(self.compute_distance_button)
+
+        self.compute_distance_group.setEnabled(False)  # no embeddings loaded yet
+        layout.addWidget(self.compute_distance_group)
+
         self.tabs = QtWidgets.QTabWidget()
         # setTabBar must happen before any tabs are added (Qt requirement).
         # setMovable(True) plus _ConstrainedTabBar is what lets normal sets
@@ -731,6 +942,9 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._color_swatches = {}  # classid -> QToolButton (color swatch), embedded in that tab
         self._pinning_fixed_tabs = False  # reentrancy guard, see _pin_fixed_tabs
         self._selected_uids = set()  # the one authoritative selection -- see _commit_selection
+        self._uid_scores = {}  # uid -> (score, has_embedding), refreshed by every sync_particles
+                                # call -- read by the one-shot "Sort by Score" button
+                                # (apply_score_order) so it doesn't need fresh data from TomoBoxer
 
         self._plus_placeholder = QtWidgets.QWidget()
         self.tabs.addTab(self._plus_placeholder, "+")
@@ -749,6 +963,26 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.delete_set_button.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
         self.delete_set_button.setEnabled(False)
         btnrow.addWidget(self.delete_set_button)
+        # One-shot re-layout actions, not modes: each click snapshots the
+        # current order and stops there -- neither one keeps re-sorting as
+        # more particles are added or moved afterward (see apply_id_order/
+        # apply_score_order). "Original ID" restores plain uid order,
+        # undoing whatever "By Score" last did (including its dimming);
+        # "By Score" reads whatever was last computed via the "Compute
+        # Distance" button above the tabs, it doesn't compute anything
+        # itself.
+        self.sort_by_id_button = QtWidgets.QPushButton("Sort by Original ID")
+        self.sort_by_id_button.setToolTip(
+            "One-time re-layout of this set's particles by their original ID.")
+        self.sort_by_id_button.setEnabled(False)  # starts on "All", not a real set
+        btnrow.addWidget(self.sort_by_id_button)
+        self.sort_by_score_button = QtWidgets.QPushButton("Sort by Score")
+        self.sort_by_score_button.setToolTip(
+            "One-time re-layout of this set's particles by their last computed "
+            "Mahalanobis distance (unscored ones first, then ascending by score). "
+            "Doesn't compute anything itself -- see \"Use embeddings to rank particles\" above.")
+        self.sort_by_score_button.setEnabled(False)  # starts on "All", not a real set
+        btnrow.addWidget(self.sort_by_score_button)
         self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
         self.empty_recycle_button.setToolTip(
             "Permanently delete everything currently in the Recycle Bin "
@@ -761,6 +995,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.detach_button.clicked.connect(self._detach_current_tab)
         self.delete_set_button.clicked.connect(self._delete_current_set)
         self.empty_recycle_button.clicked.connect(self._empty_recycle_bin)
+        self.sort_by_id_button.clicked.connect(self._sort_current_by_id)
+        self.sort_by_score_button.clicked.connect(self._sort_current_by_score)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
 
@@ -797,6 +1033,9 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.delete_set_button.setEnabled(cid is not None and not is_fixed)
         self.detach_button.setEnabled(cid is not None)  # "All" can't be detached
         self.empty_recycle_button.setVisible(cid == categories.RECYCLE_BIN_ID)
+        self.sort_by_id_button.setEnabled(cid is not None)
+        self.sort_by_score_button.setEnabled(cid is not None)
+        self._update_compute_distance_state()
         if cid is not None and not is_fixed:
             self.class_activated.emit(cid)
         # Unlike class_activated (only normal/pickable classes), this
@@ -891,6 +1130,75 @@ class ParticleListPanel(QtWidgets.QWidget):
             target.delete_set(f"{cid}::{name}")
             self.rebuild_tabs(target.sets)
 
+    def _refresh_compute_distance_controls(self):
+        """Keeps the reference-set combo in sync with whatever sets exist
+        (called from rebuild_tabs, so on every set add/rename/delete),
+        preserving the current selection where possible, and refreshes the
+        UMAP item's presence/availability. Actual enabled-state (whether
+        embeddings are loaded, and whether leave-one-out applies) is
+        _update_compute_distance_state's job, called at the end of this."""
+        target = self._target_or_none()
+        if target is None:
+            return
+        combo = self.compute_distance_reference_combo
+        previous = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for cid in categories.category_order(target.sets):
+            combo.addItem(target.sets[cid], cid)
+        idx = combo.findData(previous) if previous is not None else -1
+        if idx < 0:
+            idx = combo.findData(categories.CONFIRMED_ID)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+        space_combo = self.compute_distance_space_combo
+        has_umap = target.embeddings_umap is not None
+        has_umap_item = space_combo.findData("umap") >= 0
+        if has_umap and not has_umap_item:
+            space_combo.addItem("UMAP (2-d)", "umap")
+        elif not has_umap and has_umap_item:
+            space_combo.removeItem(space_combo.findData("umap"))
+
+        self._update_compute_distance_state()
+
+    def _update_compute_distance_state(self):
+        target = self._target_or_none()
+        cid = self._active_classid()
+        self.compute_distance_target_label.setText(
+            target.sets[cid] if target is not None and cid is not None else "—")
+        has_embeddings = target is not None and (
+            target.embeddings_full is not None or target.embeddings_umap is not None)
+        enabled = has_embeddings and cid is not None
+        self.compute_distance_group.setEnabled(enabled)
+        self.compute_distance_group.setToolTip(
+            "" if has_embeddings else
+            "No embeddings are loaded -- import a particle list with an embeddings "
+            "bundle attached first (File > Import Particle List with Embeddings...).")
+
+        same = enabled and self.compute_distance_reference_combo.currentData() == cid
+        self.compute_distance_loo_check.setEnabled(same)
+        if not same:
+            self.compute_distance_loo_check.setChecked(False)
+        self.compute_distance_loo_check.setToolTip(
+            "" if same else "Only available when comparing the current tab to itself.")
+
+    def _show_leave_one_out_help(self):
+        QtWidgets.QMessageBox.information(self, "Leave-one-out", _LEAVE_ONE_OUT_HELP)
+
+    def _run_compute_distance(self):
+        target = self._target_or_none()
+        cid = self._active_classid()
+        if target is None or cid is None:
+            return
+        target.run_compute_distance(
+            target_classid=cid,
+            reference_classid=self.compute_distance_reference_combo.currentData(),
+            space=self.compute_distance_space_combo.currentData(),
+            leave_one_out=(self.compute_distance_loo_check.isEnabled()
+                            and self.compute_distance_loo_check.isChecked()))
+
     def _empty_recycle_bin(self):
         target = self._target_or_none()
         if target is None:
@@ -904,6 +1212,35 @@ class ParticleListPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
         if reply == QtWidgets.QMessageBox.Yes:
             target.empty_recycle_bin()
+
+    def _sort_current_by_id(self):
+        """One-shot: re-lay-out the active tab by original ID. See
+        ParticleGrid.apply_id_order -- this is a single snapshot, not an
+        ongoing mode, and never touches which particles exist."""
+        grid = self._class_grids.get(self._active_classid())
+        if grid is None:
+            return
+        grid.apply_id_order()
+
+    def _sort_current_by_score(self):
+        """One-shot: re-lay-out the active tab by last-computed
+        Mahalanobis score. See ParticleGrid.apply_score_order -- reads
+        whatever's cached in self._uid_scores (kept current by every
+        sync_particles call), doesn't compute anything itself."""
+        self.sort_active_tab_by_score()
+
+    def sort_active_tab_by_score(self):
+        """Same one-shot action as the "Sort by Score" button, callable
+        directly -- used by TomoBoxer right after a Mahalanobis
+        computation finishes, so the freshly-computed order is visible
+        immediately without an extra manual click. A no-op if the
+        computation's target set isn't the tab currently on screen (the
+        caller is expected to have already switched to it -- see
+        activate_class_tab)."""
+        grid = self._class_grids.get(self._active_classid())
+        if grid is None:
+            return
+        grid.apply_score_order(self._uid_scores)
 
     _LOCKED_VISIBILITY_TIP = 'Turn off "Show the active channel only" to change visibility.'
     _NORMAL_VISIBILITY_TIP = "Show/hide this set's particles in the tomogram views."
@@ -1073,6 +1410,23 @@ class ParticleListPanel(QtWidgets.QWidget):
         w = self.tabs.currentWidget()
         return w if isinstance(w, ParticleGrid) else self.grid
 
+    def force_refresh(self):
+        """Force a full relayout of whatever's currently on screen, not
+        just the reconciliation sync_particles normally does -- used by
+        TomoBoxer.refresh_all (Edit > Refresh, F5) as an escape hatch if
+        rendering ever visibly gets stuck. sync_particles (called right
+        before this, as part of refresh_all's own update_all) already
+        re-renders every pixmap; this additionally repositions every
+        item, in case layout itself is what's stuck."""
+        self._active_grid()._relayout_all()
+
+    def active_uids_from(self, uid):
+        """uid and everything visually after it in whichever grid is
+        currently on screen -- see ParticleGrid.uids_from_slot. A click
+        can only ever happen in the grid you're actually looking at, so
+        that's always the right one to ask."""
+        return self._active_grid().uids_from_slot(uid)
+
     def set_mouse_mode(self, mode):
         self.grid.set_mouse_mode(mode)
         for g in self._class_grids.values():
@@ -1166,6 +1520,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         # call, keeps them always correct rather than tracking each
         # possible trigger individually. Cheap: just a handful of classes.
         self._refresh_all_color_swatches()
+        self._refresh_compute_distance_controls()
 
     def _is_tab_locked(self, index):
         """"All", "+", and the fixed categories can't be dragged -- only
@@ -1361,9 +1716,14 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.tabs.setCurrentWidget(grid)
 
     # -- particle sync --------------------------------------------------------
-    def sync_particles(self, entries):
-        """entries: iterable of (uid, img, classid)."""
+    def sync_particles(self, entries, scores=None):
+        """entries: iterable of (uid, img, classid). scores: {uid:
+        (score, has_embedding)} as built by TomoBoxer.update_boximgs --
+        cached (self._uid_scores) for use by any tab currently showing
+        the "Sort by Score" order, and by the toggle itself when it's
+        switched on later without a fresh sync happening."""
         entries = list(entries)
+        self._uid_scores = scores if scores is not None else {}
         current_widget = self.tabs.currentWidget()
         if current_widget is self.grid:
             self.grid.sync_particles_grouped(entries, self._all_visible_class_order())

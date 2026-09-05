@@ -5,6 +5,7 @@ e2spt_boxer.py that runs outside the EMAN2 environment).
 Usage:
     python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
         [--working_dir DIR] [--particle_lists PATH [PATH ...]]
+        [--embedded_particle_list PATH --embeddings_h5 PATH [--embeddings_umap PATH]]
 """
 from __future__ import annotations
 
@@ -34,7 +35,27 @@ def main():
         help="One or more 'x y z' coordinate text files, each imported as its own new set "
              "(named after the file, auto-suffixed on a name collision) and copied into "
              "the working directory")
+    parser.add_argument(
+        "--embedded_particle_list", type=str, default=None, metavar="PATH",
+        help="A single 'x y z' coordinate text file to import with a matched embeddings "
+             "bundle attached (requires --embeddings_h5). Separate from --particle_lists "
+             "since only one particle list can have embeddings attached at a time.")
+    parser.add_argument(
+        "--embeddings_h5", type=str, default=None, metavar="PATH",
+        help="HDF5 file with one dataset holding the full-dimensionality embedding for "
+             "each particle in --embedded_particle_list, in the same order (either "
+             "(particle, feature) or (feature, particle) orientation is fine)")
+    parser.add_argument(
+        "--embeddings_umap", type=str, default=None, metavar="PATH",
+        help="Optional companion CSV with a 2D UMAP-reduced embedding per particle (needs "
+             "'x','y' and 'centroid-0/1/2' columns), used both as an alternate distance "
+             "space and to cross-check --embedded_particle_list's own coordinates")
     options = parser.parse_args()
+
+    if (options.embeddings_h5 or options.embeddings_umap) and not options.embedded_particle_list:
+        parser.error("--embeddings_h5/--embeddings_umap require --embedded_particle_list")
+    if options.embedded_particle_list and not options.embeddings_h5:
+        parser.error("--embedded_particle_list requires --embeddings_h5")
 
     options.mode = "2D" if options.box2d and not options.box3d else "3D"
 

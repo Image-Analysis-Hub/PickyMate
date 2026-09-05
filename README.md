@@ -214,6 +214,7 @@ The **File** menu offers:
 | Send to Confirmed | Space + click |
 | Multi-select toggle | Ctrl + click (gallery or tomogram view) |
 | Multi-select range | Alt + click (gallery) |
+| Send every selected particle to Recycle Bin | Delete |
 | Shape-select (rectangle/circle) | Click + drag, Select tool active |
 | Shape-select (freeform) | Click to place points, Select tool active |
 | Finish freeform selection | Double-click, Enter, or click near the start point |
