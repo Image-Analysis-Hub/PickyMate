@@ -82,6 +82,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mfile_read_boxloc = self.mfile.addAction("Import Particle List...")
         self.mfile_import_with_embeddings = self.mfile.addAction("Import Particle List with Embeddings...")
         self.mfile_save_boxloc = self.mfile.addAction("Export Particle Coordinates...")
+        self.mfile.addSeparator()
+        self.load_companion_action = QtGui.QAction("Load Companion Volume...", self)
+        self.load_companion_action.setToolTip(
+            "Load a second version of this same tomogram (e.g. denoised) to switch "
+            "display between -- picks, sets, and box sizes are shared; only the pixel "
+            "data shown changes. Must match the primary tomogram's dimensions exactly.")
+        self.load_companion_action.triggered.connect(self.load_companion_volume_dialog)
+        self.mfile.addAction(self.load_companion_action)
 
         # Each of these is populated further down, once the actions/objects
         # it needs exist -- created here (empty) so the menu bar's overall
@@ -447,9 +455,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.focus_selected_action = QtGui.QAction("Show Only Selected", self)
         self.focus_selected_action.setCheckable(True)
         self.focus_selected_action.setToolTip(
-            "While on, only the currently selected particle(s) are shown in the "
-            "tomogram views, regardless of any set's own visibility -- if nothing "
-            "is selected, nothing shows. Updates live as the selection changes.")
+            "While on, a particle only shows in the tomogram views if it's both "
+            "currently selected AND still in whatever set it was in when it "
+            "joined the selection -- moving it to another set (Space/Shift+click, "
+            "drag, ...) hides it right away without deselecting it, even though "
+            "its new set is itself visible. Updates live as the selection changes.")
         self.focus_selected_action.toggled.connect(self._toggle_focus_selected)
 
         self.medit.addSeparator()
@@ -524,10 +534,29 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.show_all_sets_action.setToolTip("Make every set visible in the tomogram views.")
         self.show_all_sets_action.triggered.connect(self.show_all_sets)
 
+        # Disabled until a companion volume is actually loaded (see
+        # load_companion_volume_dialog/_load_companion_volume below).
+        self.toggle_companion_action = QtGui.QAction("Show Companion Volume", self)
+        self.toggle_companion_action.setCheckable(True)
+        self.toggle_companion_action.setEnabled(False)
+        self.toggle_companion_action.setToolTip(
+            "Switch the tomogram views and gallery thumbnails between the primary "
+            "volume and its loaded companion (e.g. denoised). Contrast and Avg "
+            "Slices are kept separate per volume; picks/sets are shared.")
+        self.toggle_companion_action.toggled.connect(self._on_toggle_companion)
+
+        self.mview.addAction(self.toggle_companion_action)
+        self.mview.addSeparator()
         self.mview.addAction(self.toggle_colors_action)
         self.mview.addSeparator()
         self.mview.addAction(self.view_only_selected_action)
         self.mview.addAction(self.show_all_sets_action)
+
+        self.addToolBarBreak()
+        self.volume_toolbar = self.addToolBar("Volume")
+        self.volume_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.volume_toolbar.addAction(self.load_companion_action)
+        self.volume_toolbar.addAction(self.toggle_companion_action)
 
         self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
@@ -594,11 +623,31 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # -- load data ---------------------------------------------------------
         self.datafilename = datafile
 
-        data = Volume.from_file(datafile)
+        # Companion-volume support (e.g. denoised vs. non-denoised display of
+        # the exact same tomogram): _volume_slots holds the two possible
+        # Volume objects, _active_volume_key says which one self.data
+        # currently aliases, and _volume_ui_state remembers each volume's own
+        # Avg Slices / contrast settings across switches (see _switch_volume).
+        # The companion is loaded lazily -- only actually read from disk the
+        # first time it's switched to -- even when its path is already known
+        # from --companion_tomogram, so specifying one costs nothing for
+        # anyone who never uses the switch.
+        self._native_memmap = bool(getattr(options, "native_memmap", False))
+        self._volume_slots = {"primary": None, "companion": None}
+        self._volume_ui_state = {}
+        self._active_volume_key = "primary"
+        self.companion_path = getattr(options, "companion_tomogram", None)
+        if self.companion_path:
+            self.companion_path = os.path.abspath(self.companion_path)
+
+        data = Volume.from_file(datafile, native_memmap=self._native_memmap)
         if options.apix:
             data.apix = options.apix
+        self._volume_slots["primary"] = data
         self.data = None
         self.set_data(data)
+        if self.companion_path:
+            self.toggle_companion_action.setEnabled(True)
 
         # Per-class plain-text pick files live in "<basename>_picks/" next
         # to the tomogram by default, or wherever --working_dir points
@@ -882,6 +931,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._undo_stack = []
         self._redo_stack = []
         self._selected_uids = set()
+        self._focus_home_class = {}  # uid -> class at the moment it joined the Show-Only-Selected review; see _is_visible_particle
         self._refresh_undo_redo_actions()
         self.confirm_selected_action.setEnabled(False)
         self.recycle_selected_action.setEnabled(False)
@@ -900,9 +950,19 @@ class TomoBoxer(QtWidgets.QMainWindow):
         somewhere sensible instead of at (0, 1). A full-volume mean/std is
         too slow for a real tomogram (multiple seconds), so this samples
         every 4th voxel along each axis instead -- close enough for a
-        contrast range and orders of magnitude faster."""
+        contrast range and orders of magnitude faster.
+
+        mean/std are computed with dtype=np.float32 explicitly rather than
+        relying on the sample's own dtype: a float16-loaded volume (see
+        Volume.from_file) has millions of voxels in this sample, and
+        float16's accumulator overflows to inf on std() well before the
+        reduction finishes -- silently breaking AutoContrast. int8/int16
+        sources don't have this problem (numpy already upgrades integer
+        reductions to float64), but pinning float32 here costs nothing and
+        keeps this correct regardless of whatever dtype the volume ends up
+        being loaded as."""
         sample = data.data[::4, ::4, ::4]
-        mean, std = float(sample.mean()), float(sample.std())
+        mean, std = float(sample.mean(dtype=np.float32)), float(sample.std(dtype=np.float32))
         if std == 0:
             std = 1.0
         self._contrast_defaults = (mean - 3 * std, mean + 3 * std)
@@ -923,7 +983,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
             half_thickness = self.nlayers() - 1
             dz = 2 * half_thickness + 1
             cube = self.data.get_clip_centered(x, y, z, bs, bs, dz)
-            return cube.mean(axis=0, keepdims=True)
+            # dtype=np.float32: see Volume.slab_projection's docstring --
+            # an axis-reduced mean() over a float16-loaded volume doesn't
+            # auto-promote its accumulator the way a full reduction does.
+            return cube.mean(axis=0, keepdims=True, dtype=np.float32)
         return self.data.get_clip_centered(x, y, z, bs, bs, bs)
 
     def _thumbnail_crop(self, box):
@@ -1050,6 +1113,109 @@ class TomoBoxer(QtWidgets.QMainWindow):
         for v in (self.xyview, self.xzview, self.zyview):
             v.set_manual_levels(lo, hi)
         self.boxesviewer.set_levels(lo, hi)
+
+    # -- companion volume (e.g. denoised alternative display) ---------------
+    def load_companion_volume_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Load Companion Volume", os.path.dirname(self.datafilename) or ".",
+            "Tomogram files (*.mrc *.rec *.mrcs *.st);;All files (*)")
+        if not path:
+            return
+        if not self._load_companion_volume(path):
+            return
+        if self.toggle_companion_action.isChecked():
+            # Already showing the companion slot -- replacing its file with
+            # setChecked(True) below would be a silent no-op (already
+            # checked), so apply the swap explicitly instead.
+            self.data = self._volume_slots["companion"]
+            self._init_contrast_slider(self.data)
+            self._restore_volume_ui_state("companion")
+            if self.initialized:
+                self.refresh_all()
+        else:
+            # Jump straight to it -- loading one and not seeing it applied
+            # would look like nothing happened.
+            self.toggle_companion_action.setChecked(True)
+
+    def _load_companion_volume(self, path):
+        try:
+            vol = Volume.from_file(path, native_memmap=self._native_memmap)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load Companion Volume", str(e))
+            return False
+        primary = self._volume_slots["primary"]
+        if (vol.nx, vol.ny, vol.nz) != (primary.nx, primary.ny, primary.nz):
+            QtWidgets.QMessageBox.critical(
+                self, "Load Companion Volume",
+                f"This file is {vol.nx}x{vol.ny}x{vol.nz}, but the primary tomogram is "
+                f"{primary.nx}x{primary.ny}x{primary.nz}. A companion volume must match "
+                "exactly, since picks are shared between the two.")
+            return False
+        # Picks are defined in the primary volume's physical coordinate
+        # space; matching apix keeps distances/box sizes meaning the same
+        # thing regardless of which volume happens to be on screen.
+        vol.apix = primary.apix
+        self._volume_slots["companion"] = vol
+        self.companion_path = path
+        self.toggle_companion_action.setEnabled(True)
+        return True
+
+    def _on_toggle_companion(self, checked):
+        self._switch_volume("companion" if checked else "primary")
+
+    def _switch_volume(self, key):
+        """Switch which Volume self.data aliases -- purely a display change.
+        Picks/boxes/undo history are untouched (unlike set_data, which is
+        for loading a brand new dataset); only the pixel data shown in the
+        tomogram views and gallery thumbnails changes. Avg Slices and
+        contrast are deliberately per-volume (a denoised volume typically
+        wants neither the slab-averaging nor the intensity levels a noisy
+        raw volume does), remembered across switches via
+        _snapshot_volume_ui_state/_restore_volume_ui_state."""
+        if key == self._active_volume_key:
+            return
+        if self._volume_slots[key] is None:
+            if key != "companion" or not self.companion_path:
+                return
+            if not self._load_companion_volume(self.companion_path):
+                self.toggle_companion_action.setChecked(False)
+                return
+        self._snapshot_volume_ui_state()
+        self._active_volume_key = key
+        self.data = self._volume_slots[key]
+        self._init_contrast_slider(self.data)
+        self._restore_volume_ui_state(key)
+        if self.initialized:
+            self.refresh_all()
+
+    def _snapshot_volume_ui_state(self):
+        self._volume_ui_state[self._active_volume_key] = {
+            "nlayers": self.wnlayers.value(),
+            "autocontrast": self.wbautoc.isChecked(),
+            "manual_levels": self.wcontrast.values(),
+        }
+
+    def _restore_volume_ui_state(self, key):
+        # A never-before-visited volume (state is None) starts at the same
+        # defaults a freshly opened tomogram would: Avg Slices 1, AutoContrast
+        # on -- not whatever the other volume happened to be using.
+        state = self._volume_ui_state.get(key)
+        self.wnlayers.blockSignals(True)
+        self.wnlayers.setValue(state["nlayers"] if state else 1)
+        self.wnlayers.blockSignals(False)
+        autocontrast = state["autocontrast"] if state else True
+        self.wbautoc.blockSignals(True)
+        self.wbautoc.setChecked(autocontrast)
+        self.wbautoc.blockSignals(False)
+        if autocontrast:
+            for v in (self.xyview, self.xzview, self.zyview):
+                v.clear_manual_levels()
+            self.boxesviewer.clear_levels()
+            self.wcontrast.set_values(*self._contrast_defaults, emit=False)
+        else:
+            lo, hi = state["manual_levels"]
+            self.wcontrast.set_values(lo, hi, emit=False)
+            self._apply_manual_contrast(lo, hi)
 
     def get_boxsize(self, clsid=None):
         # clsid=None means "the current set". -1 used to double as that
@@ -1229,7 +1395,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return unique_name, count
 
     # -- Mahalanobis distance -------------------------------------------------
-    def compute_mahalanobis(self, reference_classid, target_classid, space="full", leave_one_out=False):
+    def compute_mahalanobis(self, reference_classid, target_classid, space="full",
+                             leave_one_out=False, negative_classid=None):
         """Score every embedded particle in target_classid by its
         Mahalanobis distance to reference_classid's embedding
         distribution (mean + covariance, built from whichever of the
@@ -1239,26 +1406,46 @@ class TomoBoxer(QtWidgets.QMainWindow):
         _reassign_boxes for why moving a particle to a different class
         resets it back to None.
 
+        negative_classid, when given, turns this into a "double distance"
+        (contrastive) score instead: distance-to-reference minus
+        distance-to-negative_classid, so particles simultaneously close to
+        the reference and far from the negative set sort first (e.g. close
+        to Confirmed, far from Recycle Bin). This is the plain difference
+        of two ordinary Mahalanobis distances, not a full log-likelihood
+        ratio: the missing term there (each distribution's own log-
+        determinant) is a per-particle constant, so it could never change
+        the resulting *order* anyway, and it's undefined here besides --
+        these embeddings' covariance is severely rank-deficient (see
+        _mahalanobis_distribution), so a real determinant is zero. Both
+        terms use the same space and leave_one_out setting.
+
         space: "full" (the 1024-d embedding) or "umap" (the 2D UMAP
         reduction) -- both are attached per particle at import time (see
         import_particle_list_with_embeddings); this only picks which one
         to read here.
 
-        leave_one_out: only meaningful when reference_classid ==
-        target_classid (silently ignored otherwise, since a particle
-        that isn't a member of the reference set was never part of the
+        leave_one_out: applied independently to whichever term(s) --
+        reference, negative, or both -- actually equal target_classid
+        (silently ignored for a term that doesn't, since a particle that
+        isn't a member of that reference was never part of the
         distribution it's being compared to anyway). Excludes each
-        particle's own contribution from the reference distribution
-        before scoring it -- the exact way, a fresh covariance per
-        particle, which is genuinely expensive for anything but a small
-        set (see the compute dialog's own help text for real numbers).
+        particle's own contribution from that reference before scoring it
+        -- the exact way, a fresh covariance per particle, which is
+        genuinely expensive for anything but a small set (see the
+        leave-one-out help text for real numbers).
 
         Particles with no embedding at all are left untouched -- no
-        score, never sortable (the three-tier display). Returns a dict
-        with "scored", "skipped_no_embedding", and "reference_size" for
-        the caller to report. Raises ValueError if the reference set has
-        fewer than 2 embedded particles to build a distribution from, or
-        for an unrecognized `space`."""
+        score, never sortable (the three-tier display); so is a particle
+        leave-one-out could only score on one of the two terms (its own
+        reference would have shrunk below 2 without it) -- there's
+        nothing meaningful to combine it with. Returns a dict with
+        "scored", "skipped_no_embedding", and "reference_size" (of the
+        positive/"close to" reference) for the caller to report. Raises
+        ValueError if either reference has fewer than 2 embedded
+        particles, for an unrecognized `space`, or if negative_classid ==
+        reference_classid (the score would be zero for every particle)."""
+        if negative_classid is not None and negative_classid == reference_classid:
+            raise ValueError("The \"far from\" set can't be the same as the \"close to\" set.")
         if space == "full":
             array = self.embeddings_full
         elif space == "umap":
@@ -1271,41 +1458,62 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 "embeddings bundle attached first (File > Import Particle List with "
                 "Embeddings...).")
 
-        def rows_of(classid):
-            return [(i, b[7]) for i, b in enumerate(self.boxes) if b[5] == classid and b[7] is not None]
-
-        ref_rows = rows_of(reference_classid)
-        if len(ref_rows) < 2:
-            raise ValueError(
-                f"The reference set has only {len(ref_rows)} particle(s) with an "
-                f"embedding -- need at least 2 to build a distribution.")
-
-        target_rows = rows_of(target_classid)
+        target_rows = self._mahalanobis_rows_of(target_classid)
         target_total = sum(1 for b in self.boxes if b[5] == target_classid)
         skipped = target_total - len(target_rows)
 
+        positive, ref_size = self._mahalanobis_distances(
+            reference_classid, target_classid, target_rows, array, leave_one_out)
+
+        if negative_classid is not None:
+            negative, _ = self._mahalanobis_distances(
+                negative_classid, target_classid, target_rows, array, leave_one_out)
+            combined = {i: positive[i] - negative[i] for i in positive if i in negative}
+            skipped += len(positive) - len(combined)
+        else:
+            combined = positive
+
+        for i, d in combined.items():
+            self.boxes[i][4] = float(d)
+
+        self.save_json(only={target_classid})
+        self.update_all(reslice=False, only_indices=[])
+        return {"scored": len(combined), "skipped_no_embedding": skipped, "reference_size": ref_size}
+
+    def _mahalanobis_rows_of(self, classid):
+        return [(i, b[7]) for i, b in enumerate(self.boxes) if b[5] == classid and b[7] is not None]
+
+    def _mahalanobis_distances(self, reference_classid, target_classid, target_rows, array, leave_one_out):
+        """{box_index: squared Mahalanobis distance} for every (index,
+        embedding_row) pair in target_rows, relative to reference_classid's
+        own embedding distribution in `array`. target_rows is computed
+        once by the caller (shared across both terms of a double-distance
+        call) so "does this particle have an embedding at all" is only
+        ever decided from the target set itself, not re-derived per
+        reference. Raises ValueError if the reference set has fewer than
+        2 embedded particles. Returns (distances, reference_size)."""
+        ref_rows = self._mahalanobis_rows_of(reference_classid)
+        if len(ref_rows) < 2:
+            name = self.sets.get(reference_classid, reference_classid)
+            raise ValueError(
+                f"\"{name}\" has only {len(ref_rows)} particle(s) with an embedding -- "
+                f"need at least 2 to build a distribution.")
+        distances = {}
         if leave_one_out and reference_classid == target_classid:
-            scored = 0
             for i, row in target_rows:
                 others = [r for idx2, r in ref_rows if idx2 != i]
                 if len(others) < 2:
                     continue
                 mu, covinv = self._mahalanobis_distribution(array[others])
-                d2 = self._mahalanobis_scores(mu, covinv, array[[row]])[0]
-                self.boxes[i][4] = float(d2)
-                scored += 1
+                distances[i] = float(self._mahalanobis_scores(mu, covinv, array[[row]])[0])
         else:
             mu, covinv = self._mahalanobis_distribution(array[[row for _, row in ref_rows]])
             idx_list = [i for i, _ in target_rows]
             rows_list = [row for _, row in target_rows]
             d2 = self._mahalanobis_scores(mu, covinv, array[rows_list])
             for i, d in zip(idx_list, d2):
-                self.boxes[i][4] = float(d)
-            scored = len(idx_list)
-
-        self.save_json(only={target_classid})
-        self.update_all(reslice=False, only_indices=[])
-        return {"scored": scored, "skipped_no_embedding": skipped, "reference_size": len(ref_rows)}
+                distances[i] = float(d)
+        return distances, len(ref_rows)
 
     @staticmethod
     def _mahalanobis_distribution(vectors):
@@ -1372,16 +1580,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self, "Import Particle List with Embeddings",
             f"Imported {count} particle(s) into new set \"{unique_name}\", with embeddings attached.")
 
-    def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out):
+    def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out, negative_classid=None):
         """Triggered by the particle list's own inline "Rank by Embedding Distance"
         controls (see ParticleListPanel) -- there's no dialog or menu
         entry point, this is the feature's only one, deliberately
         prominent and edited in place rather than tucked into File or
         behind a popup. The controls there are already responsible for
-        disabling themselves when no embeddings are loaded, so unlike the
+        disabling themselves when no embeddings are loaded (or when
+        negative_classid conflicts with reference_classid), so unlike the
         old dialog-based version this doesn't re-check that itself."""
         try:
-            result = self.compute_mahalanobis(reference_classid, target_classid, space, leave_one_out)
+            result = self.compute_mahalanobis(
+                reference_classid, target_classid, space, leave_one_out, negative_classid)
         except ValueError as e:
             self._show_gallery_notice(QtWidgets.QMessageBox.Critical, "Rank Particles", str(e))
             return
@@ -1391,10 +1601,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # ParticleGrid.apply_score_order).
         self.boxesviewer.activate_class_tab(target_classid)
         self.boxesviewer.sort_active_tab_by_score()
-        msg = (f"Scored {result['scored']} particle(s) in \"{self.sets[target_classid]}\" against "
-               f"{result['reference_size']} reference particle(s) in \"{self.sets[reference_classid]}\".")
+        msg = (f"Scored {result['scored']} particle(s) in \"{self.sets[target_classid]}\" -- close to "
+               f"{result['reference_size']} particle(s) in \"{self.sets[reference_classid]}\"")
+        if negative_classid is not None:
+            msg += f", far from \"{self.sets[negative_classid]}\""
+        msg += "."
         if result["skipped_no_embedding"]:
-            msg += f"\n{result['skipped_no_embedding']} particle(s) skipped (no embedding attached)."
+            msg += f"\n{result['skipped_no_embedding']} particle(s) not scored (no embedding, or excluded by leave-one-out)."
         self._show_gallery_notice(QtWidgets.QMessageBox.Information, "Rank Particles", msg)
 
     def _show_gallery_notice(self, icon, title, text):
@@ -1528,10 +1741,20 @@ class TomoBoxer(QtWidgets.QMainWindow):
         else:
             items = [(i, boxes[i]) for i in only_indices if 0 <= i < len(boxes)]
 
-        # Focus Selected: an extra, independent visibility gate on top of
-        # set visibility -- while on, only particles in the current
-        # multi-selection show at all, regardless of which set(s) are
-        # checked visible. Computed once here rather than per-box.
+        # Focus Selected: while on, this *replaces* set-visibility with a
+        # narrower rule -- a particle shows only if it's selected AND still
+        # in whatever set it belonged to when it joined the current review
+        # (self._focus_home_class[uid], snapshotted the moment it was
+        # selected -- see _toggle_focus_selected/set_selected_uids), not
+        # merely "some set that's checked visible." That's deliberate:
+        # sending a selected particle to a different set (Space/Shift+click,
+        # drag, Move Selected To, ...) should make it disappear from view
+        # the moment it leaves its own home set -- without touching the
+        # selection itself -- even though its new set (Confirmed, say) is
+        # itself perfectly visible. A particle whose home set was never
+        # recorded (shouldn't normally happen) is treated as still home, so
+        # a bookkeeping gap fails open rather than hiding things wrongly.
+        # Computed once here rather than per-box.
         focus_active = self.focus_selected_action.isChecked()
 
         for ax in axis:
@@ -1548,8 +1771,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 shp = view.get_shapes().get(i)
                 if shp is None:
                     continue
-                focused = not focus_active or b[6] in self._selected_uids
-                if inplane and (b[5] in self.sets_visible) and focused:
+                if focus_active:
+                    class_visible = (b[6] in self._selected_uids
+                                      and self._focus_home_class.get(b[6], b[5]) == b[5])
+                else:
+                    class_visible = b[5] in self.sets_visible
+                if inplane and class_visible:
                     shp.linewidth = 3 if self.curbox == i else 2
                     if self.options.mode == "3D":
                         shp.geom[2] = rad
@@ -1634,13 +1861,21 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _is_visible_particle(self, box):
         """Shared "is this particle currently shown in the tomogram views"
-        test: its own set must be visible, and -- while "Show only
-        selected" is on -- it must also be part of the current selection.
+        test. Normally: its own set must be checked visible. While "Show
+        only selected" is on, that's replaced (not just supplemented) by a
+        narrower rule -- selected AND still in its own home set, i.e.
+        whatever set it belonged to the moment it joined the current
+        review (self._focus_home_class; see _toggle_focus_selected/
+        set_selected_uids) -- so reassigning a selected particle to a
+        different set (Space/Shift+click, drag, ...) hides it immediately
+        without deselecting it, even though its new set is itself visible.
         Used by every action that scopes itself to what's on screen
         (plain-click hit-testing, the Eraser, and the Select tool's shape
         hit-test), so they can't disagree about what "on screen" means."""
-        return (box[5] in self.sets_visible
-                and (not self.focus_selected_action.isChecked() or box[6] in self._selected_uids))
+        if self.focus_selected_action.isChecked():
+            return (box[6] in self._selected_uids
+                    and self._focus_home_class.get(box[6], box[5]) == box[5])
+        return box[5] in self.sets_visible
 
     def inside_box(self, n, x=-1, y=-1, z=-1):
         box = self.boxes[n]
@@ -1978,8 +2213,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
         same particles in the tomogram views. Only the particles whose
         selection state actually changed need their shape rebuilt."""
         new_selected = set(uids or [])
+        added_uids = new_selected - self._selected_uids
         changed_uids = self._selected_uids ^ new_selected
         self._selected_uids = new_selected
+        # Show Only Selected's home-class bookkeeping (see
+        # _is_visible_particle): a particle newly joining the selection
+        # while it's already on records its *current* class as home right
+        # now, same as if Focus had just been turned on with it already
+        # selected -- so it shows immediately rather than needing a
+        # reassignment-free round trip first.
+        if self.focus_selected_action.isChecked() and added_uids:
+            self._focus_home_class.update(
+                (b[6], b[5]) for b in self.boxes if b[6] in added_uids)
         has_selection = bool(self._selected_uids)
         self.confirm_selected_action.setEnabled(has_selection)
         self.recycle_selected_action.setEnabled(has_selection)
@@ -1998,14 +2243,22 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _toggle_focus_selected(self, checked):
         """Turning Focus Selected on/off doesn't change sets_visible at
-        all (unlike Show Active Set Only) -- it's a second,
-        independent gate checked directly in update_sliceview/inside_box,
-        so there's nothing to snapshot or restore here. Every particle's
-        visibility outcome can change the moment this flips, so this
-        needs the full (only_indices=None) recompute; ongoing selection
-        changes while it's already on are handled by set_selected_uids's
-        own scoped update instead, since only the particles whose
-        selection actually changed can have a different outcome."""
+        all (unlike Show Active Set Only) -- while on, it replaces the
+        set-visibility check entirely (see _is_visible_particle/
+        update_sliceview) with a per-particle "still in its home set" test,
+        so turning it on snapshots every currently selected particle's
+        current class as its home (discarding any stale snapshot from a
+        previous time it was on -- re-selecting after turning it off starts
+        fresh). Particles selected *while* it's already on get their home
+        class recorded by set_selected_uids instead, the moment they join.
+        Every particle's visibility outcome can change the moment this
+        flips, so this needs the full (only_indices=None) recompute;
+        ongoing selection changes while it's already on are handled by
+        set_selected_uids's own scoped update instead, since only the
+        particles whose selection actually changed can have a different
+        outcome."""
+        if checked:
+            self._focus_home_class = {b[6]: b[5] for b in self.boxes if b[6] in self._selected_uids}
         self.update_all(reslice=False, only_indices=None)
 
     def _update_focus_pulse(self, checked):

@@ -955,15 +955,17 @@ class ParticleListPanel(QtWidgets.QWidget):
 
         # One row for everything: which set gets ranked (the current tab,
         # kept live-updated by _update_compute_distance_state as you switch
-        # tabs, rather than leaving it implicit), what it's ranked against,
-        # which embedding space, and leave-one-out -- all one coherent
-        # sentence-like control instead of splitting it across two rows.
+        # tabs, rather than leaving it implicit), what it's ranked close to,
+        # optionally what it's ranked far from (the "double distance"/
+        # contrastive score -- see TomoBoxer.compute_mahalanobis), which
+        # embedding space, and leave-one-out -- all one coherent
+        # sentence-like control instead of splitting it across rows.
         controls_row = QtWidgets.QHBoxLayout()
         controls_row.addWidget(QtWidgets.QLabel("Rank:"))
         self.compute_distance_target_label = QtWidgets.QLabel()
         self.compute_distance_target_label.setStyleSheet("font-weight: bold;")
         controls_row.addWidget(self.compute_distance_target_label)
-        controls_row.addWidget(QtWidgets.QLabel("vs."))
+        controls_row.addWidget(QtWidgets.QLabel("close to"))
         self.compute_distance_reference_combo = QtWidgets.QComboBox()
         self.compute_distance_reference_combo.setToolTip(
             "The set whose embedding distribution the current tab's particles "
@@ -972,6 +974,18 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.compute_distance_reference_combo.currentIndexChanged.connect(
             self._update_compute_distance_state)
         controls_row.addWidget(self.compute_distance_reference_combo)
+        controls_row.addWidget(QtWidgets.QLabel("far from"))
+        self.compute_distance_negative_combo = QtWidgets.QComboBox()
+        self.compute_distance_negative_combo.addItem("(none)", None)
+        self.compute_distance_negative_combo.setToolTip(
+            "Optional: also rank away from this set's own embedding distribution "
+            "(e.g. Recycle Bin) -- the rank becomes distance-to-\"close to\" minus "
+            "distance-to-\"far from\", so particles near the first and away from "
+            "the second sort first. Leave at \"(none)\" for a plain single-distance "
+            "rank, same as before.")
+        self.compute_distance_negative_combo.currentIndexChanged.connect(
+            self._update_compute_distance_state)
+        controls_row.addWidget(self.compute_distance_negative_combo)
         self.compute_distance_space_combo = QtWidgets.QComboBox()
         self.compute_distance_space_combo.addItem("Full embedding (1024-d)", "full")
         controls_row.addWidget(self.compute_distance_space_combo)
@@ -986,11 +1000,17 @@ class ParticleListPanel(QtWidgets.QWidget):
         group_layout.addLayout(controls_row)
 
         self.compute_distance_button = QtWidgets.QPushButton("▶  Rank by Embedding Distance")
-        self.compute_distance_button.setToolTip(
+        # Saved so _update_compute_distance_state can restore it after
+        # temporarily swapping in a "why is this disabled" tooltip (for a
+        # same-set conflict) -- see there.
+        self._compute_distance_button_tip = (
             "Ranks the current tab's particles by their Mahalanobis distance to "
-            "the reference set's embedding distribution, then lays them out "
-            "closest-first. \"Sort by Rank\" (below) re-displays this same "
-            "result later without recomputing it.")
+            "the \"close to\" set's embedding distribution, then lays them out "
+            "closest-first. Set a \"far from\" set too for a contrastive rank: "
+            "distance-to-\"close to\" minus distance-to-\"far from\", favoring "
+            "particles near the first and away from the second. \"Sort by Rank\" "
+            "(below) re-displays this same result later without recomputing it.")
+        self.compute_distance_button.setToolTip(self._compute_distance_button_tip)
         self.compute_distance_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.compute_distance_button.setStyleSheet("""
             QPushButton {
@@ -1298,7 +1318,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             self.rebuild_tabs(target.sets)
 
     def _refresh_compute_distance_controls(self):
-        """Keeps the reference-set combo in sync with whatever sets exist
+        """Keeps the reference-set combos in sync with whatever sets exist
         (called from rebuild_tabs, so on every set add/rename/delete),
         preserving the current selection where possible, and refreshes the
         UMAP item's presence/availability. Actual enabled-state (whether
@@ -1320,6 +1340,20 @@ class ParticleListPanel(QtWidgets.QWidget):
             combo.setCurrentIndex(idx)
         combo.blockSignals(False)
 
+        # Same set list as the reference combo, plus a leading "(none)"
+        # (data=None) that keeps the plain, single-distance rank -- the
+        # default, and the only option before this control existed.
+        negative_combo = self.compute_distance_negative_combo
+        previous_negative = negative_combo.currentData()
+        negative_combo.blockSignals(True)
+        negative_combo.clear()
+        negative_combo.addItem("(none)", None)
+        for cid in categories.category_order(target.sets):
+            negative_combo.addItem(target.sets[cid], cid)
+        idx = negative_combo.findData(previous_negative) if previous_negative is not None else 0
+        negative_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        negative_combo.blockSignals(False)
+
         space_combo = self.compute_distance_space_combo
         has_umap = target.embeddings_umap is not None
         has_umap_item = space_combo.findData("umap") >= 0
@@ -1337,20 +1371,42 @@ class ParticleListPanel(QtWidgets.QWidget):
             target.sets[cid] if target is not None and cid is not None else "—")
         has_embeddings = target is not None and (
             target.embeddings_full is not None or target.embeddings_umap is not None)
-        enabled = has_embeddings and cid is not None
-        self.compute_distance_group.setEnabled(enabled)
-        self.rank_action.setEnabled(enabled)
+        reference_cid = self.compute_distance_reference_combo.currentData()
+        negative_cid = self.compute_distance_negative_combo.currentData()
+        conflict = negative_cid is not None and negative_cid == reference_cid
+
+        # No embeddings at all isn't fixable from anything in this group
+        # (you'd need to import some elsewhere first), so graying out the
+        # whole thing -- combos included -- is fine there. A same-set
+        # conflict is different: it's fixable right here, by changing
+        # either combo, so disabling the *group* (which contains those
+        # very combos) would trap the user with no way to undo their own
+        # choice. Only the actual "go" button (and its menu equivalent)
+        # get disabled for a conflict, with a tooltip explaining why;
+        # every combo stays live regardless.
+        group_enabled = has_embeddings and cid is not None
+        self.compute_distance_group.setEnabled(group_enabled)
         self.compute_distance_group.setToolTip(
             "" if has_embeddings else
             "No embeddings are loaded -- import a particle list with an embeddings "
             "bundle attached first (File > Import Particle List with Embeddings...).")
 
-        same = enabled and self.compute_distance_reference_combo.currentData() == cid
+        can_run = group_enabled and not conflict
+        self.compute_distance_button.setEnabled(can_run)
+        self.rank_action.setEnabled(can_run)
+        self.compute_distance_button.setToolTip(
+            "\"close to\" and \"far from\" can't be the same set." if conflict
+            else self._compute_distance_button_tip)
+
+        # Leave-one-out is relevant (and only ever applied) to whichever
+        # term -- "close to", "far from", or both -- actually equals the
+        # current tab; see TomoBoxer.compute_mahalanobis.
+        same = group_enabled and (reference_cid == cid or negative_cid == cid)
         self.compute_distance_loo_check.setEnabled(same)
         if not same:
             self.compute_distance_loo_check.setChecked(False)
         self.compute_distance_loo_check.setToolTip(
-            "" if same else "Only available when comparing the current tab to itself.")
+            "" if same else "Only available when \"close to\" and/or \"far from\" is the current tab itself.")
 
     def _show_leave_one_out_help(self):
         QtWidgets.QMessageBox.information(self, "Leave-One-Out", _LEAVE_ONE_OUT_HELP)
@@ -1365,7 +1421,8 @@ class ParticleListPanel(QtWidgets.QWidget):
             reference_classid=self.compute_distance_reference_combo.currentData(),
             space=self.compute_distance_space_combo.currentData(),
             leave_one_out=(self.compute_distance_loo_check.isEnabled()
-                            and self.compute_distance_loo_check.isChecked()))
+                            and self.compute_distance_loo_check.isChecked()),
+            negative_classid=self.compute_distance_negative_combo.currentData())
 
     def _empty_recycle_bin(self):
         target = self._target_or_none()

@@ -91,11 +91,13 @@ _NOTES = [
     "Set Only\" off restores exactly the visibility you had "
     "before; Show All Sets makes every set visible in one click and "
     "turns it off if it was on.",
-    "\"Show Only Selected\" (Selection toolbar) shows only the currently "
-    "selected particle(s) in the tomogram views, regardless of any set's "
-    "own visibility -- if nothing is selected, nothing shows. Updates "
-    "live as the selection changes; unlike \"Show Active "
-    "Set Only\", there's nothing to restore when you turn it back off.",
+    "\"Show Only Selected\" (Selection toolbar) shows a particle in the "
+    "tomogram views only if it's both currently selected AND still in "
+    "whatever set it was in when it joined the selection -- moving it to "
+    "another set (Space/Shift+click, drag, ...) hides it right away "
+    "without deselecting it, even though its new set is itself visible. "
+    "Updates live as the selection changes; unlike \"Show Active Set "
+    "Only\", there's nothing to restore when you turn it back off.",
     "\"Refresh\" (Edit menu, toolbar, or F5) forces everything to fully "
     "re-derive and redraw -- regenerating every gallery thumbnail from "
     "the volume and fully re-slicing the tomogram views -- in case "

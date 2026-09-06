@@ -14,9 +14,14 @@
   doesn't keep files selected once you've moved them.
 - **Escape** clears the current selection from anywhere in the app, not
   just while a tomogram view has keyboard focus.
-- **Show Only Selected** (also in the Selection toolbar) shows only the
-  currently selected particle(s) in the tomogram views, regardless of any
-  set's own visibility — if nothing is selected, nothing shows. Updates
+- **Show Only Selected** (also in the Selection toolbar) shows a particle
+  in the tomogram views only if it's both currently selected *and* still
+  in whatever set it was in when it joined the selection — moving it to
+  another set (Space/Shift+click, drag, Move Selected To) hides it right
+  away without deselecting it, even though its new set is itself visible.
+  Selecting particles from several different sets at once is fine — each
+  one's own set at the moment it's selected is what it's compared against,
+  not a single shared one. If nothing is selected, nothing shows. Updates
   live as the selection changes.
 - **Delete** sends every currently selected particle to the Recycle Bin,
   the same as clicking Recycle Selected; **Insert** sends them to

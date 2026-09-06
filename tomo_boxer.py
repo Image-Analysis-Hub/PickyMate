@@ -5,6 +5,7 @@ Usage:
     python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
         [--working_dir DIR] [--particle_lists PATH [PATH ...]]
         [--embedded_particle_list PATH --embeddings_h5 PATH [--embeddings_umap PATH]]
+        [--companion_tomogram PATH] [--native_memmap]
 """
 from __future__ import annotations
 
@@ -49,6 +50,18 @@ def main():
         help="Optional companion CSV with a 2D UMAP-reduced embedding per particle (needs "
              "'x','y' and 'centroid-0/1/2' columns), used both as an alternate distance "
              "space and to cross-check --embedded_particle_list's own coordinates")
+    parser.add_argument(
+        "--companion_tomogram", type=str, default=None, metavar="PATH",
+        help="A second version of the same tomogram (e.g. denoised), of identical "
+             "dimensions, to switch display between via View > Show Companion Volume. "
+             "Picks/sets are shared -- only the pixel data shown changes. Not actually "
+             "read from disk until first switched to.")
+    parser.add_argument(
+        "--native_memmap", action="store_true",
+        help="Load tomogram(s) at their exact on-disk dtype via a memory-mapped file "
+             "instead of the RAM-saving default (native integer dtype kept as-is, "
+             "float32/float64 downcast to float16). Trades some access latency for "
+             "full original precision and a much lower RAM ceiling.")
     options = parser.parse_args()
 
     if (options.embeddings_h5 or options.embeddings_umap) and not options.embedded_particle_list:

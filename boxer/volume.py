@@ -18,6 +18,7 @@ class Volume:
             raise ValueError("Volume data must be a 3D array (nz, ny, nx)")
         self.data = data
         self.apix = float(apix) if apix else 1.0
+        self._mmap_owner = None  # keeps the backing mrcfile alive for native_memmap loads
 
     @property
     def nx(self) -> int:
@@ -32,9 +33,36 @@ class Volume:
         return self.data.shape[0]
 
     @classmethod
-    def from_file(cls, path: str) -> "Volume":
+    def from_file(cls, path: str, native_memmap: bool = False) -> "Volume":
+        """Load a tomogram. By default this picks whichever in-memory dtype
+        wastes the least RAM without throwing away information the file
+        didn't already have: an integer volume (int8/int16/... -- the common
+        case for cryo-ET tomograms) is kept at its native on-disk dtype
+        instead of upcast to float32, and a floating-point volume (float32/
+        float64) is downcast to float16. Display/contrast code already works
+        in plain Python floats applied via numpy broadcasting, so it's
+        dtype-agnostic and needs no changes for either case.
+
+        native_memmap=True instead memory-maps the file at its exact
+        on-disk dtype via mrcfile.mmap(), for anyone who wants the original
+        full-precision data and is willing to trade a bit of access latency
+        (the OS pages in slices/crops from disk as they're actually touched)
+        for a RAM footprint far below even a single fully-materialized copy.
+        """
+        if native_memmap:
+            mrc = mrcfile.mmap(path, mode="r", permissive=True)
+            data = mrc.data
+            apix = float(mrc.voxel_size.x) if mrc.voxel_size.x else 1.0
+            if data.ndim == 2:
+                data = data[np.newaxis, :, :]
+            vol = cls(data, apix)
+            vol._mmap_owner = mrc
+            return vol
+
         with mrcfile.open(path, permissive=True) as mrc:
-            data = np.asarray(mrc.data, dtype=np.float32)
+            raw = mrc.data
+            dtype = np.float16 if np.issubdtype(raw.dtype, np.floating) else raw.dtype
+            data = np.array(raw, dtype=dtype)
             apix = float(mrc.voxel_size.x) if mrc.voxel_size.x else 1.0
         if data.ndim == 2:
             data = data[np.newaxis, :, :]
@@ -68,6 +96,16 @@ class Volume:
           axis='z' -> XY image,  row=y, col=x
           axis='y' -> XZ image,  row=z, col=x
           axis='x' -> ZY image,  row=y, col=z
+
+        dtype=np.float32 on every mean() below is deliberate, not
+        cosmetic: unlike a full unaxed reduction, numpy's axis-reduced
+        mean() does *not* auto-promote a float16 input's accumulator, so a
+        float16-loaded volume (see from_file) would silently produce a
+        float16 slice here -- and a float16 image, once averaged over
+        anywhere near 1000 slices/pixels, overflows to inf the moment any
+        downstream .std() (autocontrast) touches it. Forcing float32 here
+        keeps every consumer downstream exactly as dtype-safe as it was
+        when volumes were always loaded as float32.
         """
         lo = int(round(center)) - int(half_thickness)
         hi = int(round(center)) + int(half_thickness) + 1
@@ -76,17 +114,17 @@ class Volume:
             lo_c, hi_c = max(lo, 0), min(hi, self.nz)
             if hi_c <= lo_c:
                 return np.zeros((self.ny, self.nx), dtype=np.float32)
-            return self.data[lo_c:hi_c].mean(axis=0)
+            return self.data[lo_c:hi_c].mean(axis=0, dtype=np.float32)
         elif axis == "y":
             lo_c, hi_c = max(lo, 0), min(hi, self.ny)
             if hi_c <= lo_c:
                 return np.zeros((self.nz, self.nx), dtype=np.float32)
-            return self.data[:, lo_c:hi_c, :].mean(axis=1)
+            return self.data[:, lo_c:hi_c, :].mean(axis=1, dtype=np.float32)
         elif axis == "x":
             lo_c, hi_c = max(lo, 0), min(hi, self.nx)
             if hi_c <= lo_c:
                 return np.zeros((self.ny, self.nz), dtype=np.float32)
-            return self.data[:, :, lo_c:hi_c].mean(axis=2).T
+            return self.data[:, :, lo_c:hi_c].mean(axis=2, dtype=np.float32).T
         else:
             raise ValueError(f"unknown axis {axis!r}")
 
