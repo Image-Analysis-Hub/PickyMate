@@ -1744,8 +1744,21 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.update_all(reslice=False, only_indices=[i for i, _ in changed])
 
     def empty_recycle_bin(self):
-        """Permanently purge every particle currently in the Recycle Bin."""
+        """Clear the Recycle Bin -- but "empty" only means "out of the
+        list," not "gone with no trace": every particle in it is first
+        archived to a hidden, timestamped backup file in the working
+        directory (see metadata.archive_recycle_bin), which discover_classes
+        never loads back as a set. Still undo-able with Ctrl+Z right
+        after, same as any other delete, independent of that backup."""
         delids = [i for i, b in enumerate(self.boxes) if b[5] == categories.RECYCLE_BIN_ID]
+        if not delids:
+            return
+        records = [
+            {"x": self.boxes[i][0], "y": self.boxes[i][1], "z": self.boxes[i][2],
+             "uid": self.boxes[i][6], "embedding_row": self.boxes[i][7], "score": self.boxes[i][4]}
+            for i in delids
+        ]
+        metadata.archive_recycle_bin(self.picksdir, records)
         self.del_box(delids)
 
     # -- particle uids / undo -----------------------------------------------

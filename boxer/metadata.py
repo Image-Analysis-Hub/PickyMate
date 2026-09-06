@@ -53,6 +53,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+import time
 
 import numpy as np
 
@@ -183,6 +184,14 @@ def load_class_records(pdir: str, classname: str) -> list:
     return _parse_particle_file(class_file(pdir, classname))
 
 
+def _write_records_csv(path: str, records) -> None:
+    with open(path, "w") as out:
+        out.write("x,y,z,uid,embedding_row,score\n")
+        for r in records:
+            fields = [r["x"], r["y"], r["z"]] + [r.get(name) for name in _RECORD_FIELDS]
+            out.write(",".join("" if v is None else str(v) for v in fields) + "\n")
+
+
 def save_class_records(pdir: str, classname: str, records) -> None:
     """records: iterable of dicts with 'x','y','z' and optionally 'uid',
     'embedding_row','score' (missing or None written as an empty cell,
@@ -190,12 +199,29 @@ def save_class_records(pdir: str, classname: str, records) -> None:
     header'd format -- this is what upgrades an old plain "x y z" file
     the first time it's saved through here."""
     os.makedirs(pdir, exist_ok=True)
-    path = class_file(pdir, classname)
-    with open(path, "w") as out:
-        out.write("x,y,z,uid,embedding_row,score\n")
-        for r in records:
-            fields = [r["x"], r["y"], r["z"]] + [r.get(name) for name in _RECORD_FIELDS]
-            out.write(",".join("" if v is None else str(v) for v in fields) + "\n")
+    _write_records_csv(class_file(pdir, classname), records)
+
+
+def archive_recycle_bin(pdir: str, records) -> str:
+    """Write a timestamped, hidden backup of the given records -- used
+    when "emptying" the Recycle Bin, so that only ever means "out of the
+    way," never "gone with no trace." Deliberately named ".recyclebin_
+    <timestamp>", not "<name>.txt": discover_classes only ever looks for
+    "*.txt" files, so this is never picked back up as a set on the next
+    launch, with no separate exclusion list to maintain. Returns the
+    path written to."""
+    os.makedirs(pdir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(pdir, f".recyclebin_{timestamp}")
+    n = 1
+    while os.path.isfile(path):
+        # Two empties within the same second (rare, but possible via undo
+        # + immediately emptying again) -- disambiguate rather than
+        # silently overwriting the previous archive.
+        n += 1
+        path = os.path.join(pdir, f".recyclebin_{timestamp}_{n}")
+    _write_records_csv(path, records)
+    return path
 
 
 def delete_class_file(pdir: str, classname: str) -> None:

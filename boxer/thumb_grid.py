@@ -1140,8 +1140,9 @@ class ParticleListPanel(QtWidgets.QWidget):
 
         self.empty_recycle_action = QtGui.QAction("Empty Recycle Bin", self)
         self.empty_recycle_action.setToolTip(
-            "Permanently delete everything currently in the Recycle Bin "
-            "(undoable with Ctrl+Z right after).")
+            "Clear everything currently in the Recycle Bin -- archived to a "
+            "hidden backup file first (not loaded again), and still undoable "
+            "with Ctrl+Z right after.")
         self.empty_recycle_action.setVisible(False)  # only shown while viewing the Recycle Bin tab
         self.empty_recycle_action.triggered.connect(self._empty_recycle_bin)
         self.gallery_toolbar.addAction(self.empty_recycle_action)
@@ -1375,7 +1376,9 @@ class ParticleListPanel(QtWidgets.QWidget):
             return
         reply = QtWidgets.QMessageBox.question(
             self, "Empty Recycle Bin",
-            f"Permanently delete {count} particle(s) in the Recycle Bin? (Undo-able with Ctrl+Z right after.)",
+            f"Clear {count} particle(s) from the Recycle Bin? They'll be archived to a "
+            "hidden backup file in the working directory first (not loaded again), and "
+            "this is still undoable with Ctrl+Z right after.",
             QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
         if reply == QtWidgets.QMessageBox.Yes:
             target.empty_recycle_bin()

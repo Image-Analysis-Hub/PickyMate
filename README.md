@@ -118,6 +118,10 @@ Sets window:
   recolored too). A manually-set color is remembered across restarts and
   is never touched by Toggle Colors.
 - **Empty Recycle Bin** only appears while the Recycle Bin tab is active.
+  Clearing it archives every particle it holds to a hidden, timestamped
+  backup file (`.recyclebin_<date>_<time>`) in the working directory first
+  — not loaded back as a set on the next launch, but recoverable by hand
+  if you ever need to — and is still undoable with Ctrl+Z right after.
 - Switching to a set's tab also makes it the active picking class — the
   same as clicking a Sets-panel row used to.
 - **Reordering tabs** — drag a normal set's tab to put your own sets in
