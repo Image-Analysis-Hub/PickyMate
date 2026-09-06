@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone tomogram particle boxer (functional port of EMAN2's
-e2spt_boxer.py that runs outside the EMAN2 environment).
+"""PickyMate: a standalone tomogram particle-picking tool.
 
 Usage:
     python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]

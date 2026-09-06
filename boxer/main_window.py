@@ -1,7 +1,6 @@
-"""Standalone tomogram particle boxer main window.
+"""PickyMate's main window: the tomogram slice-view/picking widget.
 
-This is a functional port of EMAN2's e2spt_boxer.py (EMTomoBoxer) that runs
-outside the EMAN2 environment, built on plain PySide6 + numpy + mrcfile.
+Built on plain PySide6 + numpy + mrcfile.
 
 Feature-complete for v1: orthogonal XY/XZ/ZY slice viewing, 2D or 3D particle
 picking with mouse (move/drag/shift-delete), an eraser tool, multiple
@@ -66,7 +65,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._closing = False
         self.options = options
         self.boxshape = "circle" if options.mode == "3D" else "rect"
-        self.setWindowTitle("Tomogram Boxer (standalone)")
+        self.setWindowTitle(f"PickyMate — {metadata.base_name(datafile)}")
 
         # Install the space-bar tracker now rather than waiting for the
         # first space+click gesture to trigger it lazily -- see
@@ -78,14 +77,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mfile = self.menuBar().addMenu("File")
         self.mfile_save_all = self.mfile.addAction("Save")
         self.mfile.addSeparator()
-        self.mfile_read_boxloc = self.mfile.addAction("Read Box Coord")
+        self.mfile_read_boxloc = self.mfile.addAction("Import Particle List...")
         self.mfile_import_with_embeddings = self.mfile.addAction("Import Particle List with Embeddings...")
-        self.mfile_save_boxloc = self.mfile.addAction("Save Box Coord")
+        self.mfile_save_boxloc = self.mfile.addAction("Export Particle Coordinates...")
 
-        # Populated further down, once undo()/redo() and the undo/redo
-        # stacks exist -- created here so File/Edit/Help land in that order
-        # on the menu bar regardless.
+        # Each of these is populated further down, once the actions/objects
+        # it needs exist -- created here (empty) so the menu bar's overall
+        # order (File, Edit, Tools, View, Set, Help) is fixed regardless of
+        # where in __init__ each menu's own actions happen to be built.
         self.medit = self.menuBar().addMenu("Edit")
+        self.mtools = self.menuBar().addMenu("Tools")
+        self.mview = self.menuBar().addMenu("View")
+        self.mset = self.menuBar().addMenu("Set")
 
         self._shortcuts_dialog = None
         self.mhelp = self.menuBar().addMenu("Help")
@@ -318,6 +321,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.tool_3d_checkbox.setEnabled(False)
         self.tool_3d_checkbox.toggled.connect(self._select_cancel_drawing)
 
+        self.mtools.addAction(self.tool_pick_action)
+        self.mtools.addAction(self.tool_eraser_action)
+        self.mtools.addAction(self.tool_select_action)
+
         self.tools_toolbar = self.addToolBar("Tools")
         self.tools_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.tools_toolbar.addAction(self.tool_pick_action)
@@ -399,19 +406,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # A placeholder rather than leaving it blank -- an empty editable
         # combo box otherwise gives no visual hint that there's an input
         # here at all, as opposed to just dead space next to the button.
-        self.move_to_combo.lineEdit().setPlaceholderText("..........")
+        self.move_to_combo.lineEdit().setPlaceholderText("Type a set name…")
 
-        self.move_selected_action = QtGui.QAction("Move Selected to", self)
+        self.move_selected_action = QtGui.QAction("Move Selected To", self)
         self.move_selected_action.setToolTip("Move every currently selected particle to the set named at right.")
         self.move_selected_action.triggered.connect(self._move_selected_via_toolbar)
 
-        self.focus_selected_action = QtGui.QAction("Show only selected", self)
+        self.focus_selected_action = QtGui.QAction("Show Only Selected", self)
         self.focus_selected_action.setCheckable(True)
         self.focus_selected_action.setToolTip(
             "While on, only the currently selected particle(s) are shown in the "
             "tomogram views, regardless of any set's own visibility -- if nothing "
             "is selected, nothing shows. Updates live as the selection changes.")
         self.focus_selected_action.toggled.connect(self._toggle_focus_selected)
+
+        self.medit.addSeparator()
+        self.medit.addAction(self.confirm_selected_action)
+        self.medit.addAction(self.recycle_selected_action)
+        self.medit.addAction(self.move_selected_action)
+        self.medit.addAction(self.focus_selected_action)
 
         # Toggle Colors' QAction is created here (TomoBoxer owns the
         # behavior), but the button for it lives in the particle list's own
@@ -450,11 +463,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.selection_toolbar.addSeparator()
         self.selection_toolbar.addAction(self.focus_selected_action)
 
-        # Show the active channel only / Show All Channels' QActions are created here
+        # Show Active Set Only / Show All Sets' QActions are created here
         # (TomoBoxer owns sets_visible and the solo logic), but -- like
         # Toggle Colors above -- the buttons for them live in the particle
         # list's own toolbar, not here; see ParticleListPanel.__init__.
-        self.view_only_selected_action = QtGui.QAction("Show the active channel only", self)
+        self.view_only_selected_action = QtGui.QAction("Show Active Set Only", self)
         self.view_only_selected_action.setCheckable(True)
         self.view_only_selected_action.setToolTip(
             "While on, only the active tab's set is shown in the tomogram "
@@ -464,9 +477,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.view_only_selected_action.toggled.connect(self.toggle_view_only_selected)
         self._solo_saved_visible = None  # sets_visible snapshot from before solo turned on
 
-        self.show_all_channels_action = QtGui.QAction("Show All Channels", self)
-        self.show_all_channels_action.setToolTip("Make every set visible in the tomogram views.")
-        self.show_all_channels_action.triggered.connect(self.show_all_channels)
+        self.show_all_sets_action = QtGui.QAction("Show All Sets", self)
+        self.show_all_sets_action.setToolTip("Make every set visible in the tomogram views.")
+        self.show_all_sets_action.triggered.connect(self.show_all_sets)
+
+        self.mview.addAction(self.toggle_colors_action)
+        self.mview.addSeparator()
+        self.mview.addAction(self.view_only_selected_action)
+        self.mview.addAction(self.show_all_sets_action)
 
         self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
@@ -548,7 +566,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 print(f"warning: could not reload the previously-attached embeddings: {e}")
 
         self.boxesviewer = ParticleListPanel(self)
-        self.boxesviewer.setWindowTitle("Particle List")
+        self.boxesviewer.setWindowTitle(f"PickyMate — Particle List — {metadata.base_name(datafile)}")
         self.boxesviewer.set_mouse_mode("App")
         self.boxesviewer.show()
 
@@ -565,6 +583,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # Only Selected still needs to follow the gallery to *those* tabs
         # too -- active_tab_changed fires for every real tab, fixed or not.
         self.boxesviewer.active_tab_changed.connect(self._on_gallery_tab_changed)
+
+        # Every gallery action that only had a button/gesture until now
+        # (double-click a tab to rename it, the "+" tab to create one, the
+        # bottom toolbar's own actions) also gets a menu entry here, so
+        # everything reachable in the app is reachable from the menu bar,
+        # not just from toolbars/buttons you have to already know about.
+        self.mset.addAction(self.boxesviewer.new_set_action)
+        self.mset.addAction(self.boxesviewer.rename_set_action)
+        self.mset.addAction(self.boxesviewer.delete_set_action)
+        self.mset.addSeparator()
+        self.mset.addAction(self.boxesviewer.organize_action)
+        self.mset.addAction(self.boxesviewer.detach_action)
+        self.mset.addSeparator()
+        self.mset.addAction(self.boxesviewer.sort_by_id_action)
+        self.mset.addAction(self.boxesviewer.sort_by_rank_action)
+        self.mset.addSeparator()
+        self.mset.addAction(self.boxesviewer.rank_action)
+        self.mset.addSeparator()
+        self.mset.addAction(self.boxesviewer.empty_recycle_action)
 
         self._arrange_windows()
 
@@ -706,6 +743,17 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.update_all()
         self.initialized = True
+
+        # Land on the first real set's own tab, not "All" -- grouping
+        # every particle across every class (ParticleGrid.
+        # sync_particles_grouped) is the single most expensive gallery
+        # view to build, and isn't what you want staring back at you the
+        # moment a large tomogram finishes opening anyway. Whatever's
+        # first in the gallery's own tab order (after Recycle Bin/
+        # Confirmed), matching what the tab bar actually shows.
+        first_normal = self.boxesviewer.normal_class_order()
+        if first_normal:
+            self.boxesviewer.activate_class_tab(first_normal[0])
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -962,7 +1010,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         set from a previous run) -- rather than dumping the imported
         particles into whichever set happens to be selected, which left
         no way to tell them apart from picks made by hand. Shared by the
-        File > Read Box Coord menu action (live=True) and --particle_lists
+        File > Import Particle List menu action (live=True) and --particle_lists
         at startup (live=False).
 
         `live` covers what only makes sense once the app is already
@@ -1216,13 +1264,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         name = metadata.base_name(fsp)
         result = self.import_particle_list(fsp, live=True)
         if result is None:
-            QtWidgets.QMessageBox.information(self, "Read Box Coord", "No coordinates found in that file.")
+            QtWidgets.QMessageBox.information(self, "Import Particle List", "No coordinates found in that file.")
             return
         unique_name, count = result
         msg = f"Imported {count} particle(s) into new set \"{unique_name}\"."
         if unique_name != name:
             msg += f' (renamed from "{name}", which was already in use.)'
-        QtWidgets.QMessageBox.information(self, "Read Box Coord", msg)
+        QtWidgets.QMessageBox.information(self, "Import Particle List", msg)
 
     def menu_file_import_with_embeddings(self):
         dlg = EmbeddingsImportDialog(self)
@@ -1245,7 +1293,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             f"Imported {count} particle(s) into new set \"{unique_name}\", with embeddings attached.")
 
     def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out):
-        """Triggered by the particle list's own inline "Use embeddings to rank particles"
+        """Triggered by the particle list's own inline "Rank by Embedding Distance"
         controls (see ParticleListPanel) -- there's no dialog or menu
         entry point, this is the feature's only one, deliberately
         prominent and edited in place rather than tucked into File or
@@ -1255,10 +1303,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         try:
             result = self.compute_mahalanobis(reference_classid, target_classid, space, leave_one_out)
         except ValueError as e:
-            QtWidgets.QMessageBox.critical(self, "Rank Particles", str(e))
+            self._show_gallery_notice(QtWidgets.QMessageBox.Critical, "Rank Particles", str(e))
             return
         # A one-shot re-layout of the target tab by the score just
-        # computed, exactly like clicking "Sort by Score" by hand --
+        # computed, exactly like clicking "Sort by Rank" by hand --
         # not an ongoing mode, so it doesn't fight later edits (see
         # ParticleGrid.apply_score_order).
         self.boxesviewer.activate_class_tab(target_classid)
@@ -1267,7 +1315,23 @@ class TomoBoxer(QtWidgets.QMainWindow):
                f"{result['reference_size']} reference particle(s) in \"{self.sets[reference_classid]}\".")
         if result["skipped_no_embedding"]:
             msg += f"\n{result['skipped_no_embedding']} particle(s) skipped (no embedding attached)."
-        QtWidgets.QMessageBox.information(self, "Rank Particles", msg)
+        self._show_gallery_notice(QtWidgets.QMessageBox.Information, "Rank Particles", msg)
+
+    def _show_gallery_notice(self, icon, title, text):
+        """A result notice for something triggered from the particle list
+        (not this window) -- centered over the particle list, and
+        non-modal, so it doesn't block you from immediately clicking a
+        particle there while it's still up (a modal QMessageBox.
+        information()/.critical() parented to *this* window did both:
+        appeared over the wrong window and forced you to dismiss it with
+        Ok before you could touch anything else)."""
+        box = QtWidgets.QMessageBox(icon, title, text, QtWidgets.QMessageBox.Ok, self.boxesviewer)
+        box.setModal(False)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.show()
+        geo = box.frameGeometry()
+        geo.moveCenter(self.boxesviewer.geometry().center())
+        box.move(geo.topLeft())
 
     def menu_file_save_boxloc(self):
         """Picks are already autosaved continuously (see save_picks) -- this
@@ -1276,7 +1340,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         rather than re-deriving and writing them again from scratch."""
         order = categories.category_order(self.sets)
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Save Box Coord")
+        dlg.setWindowTitle("Export Particle Coordinates")
         layout = QtWidgets.QVBoxLayout(dlg)
         layout.addWidget(QtWidgets.QLabel(
             "Picks are saved automatically already. Save a copy of:"))
@@ -1308,9 +1372,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         if copied:
             QtWidgets.QMessageBox.information(
-                self, "Save Box Coord", f"Saved a copy of {len(copied)} set(s) to {destdir}.")
+                self, "Export Particle Coordinates", f"Saved a copy of {len(copied)} set(s) to {destdir}.")
         else:
-            QtWidgets.QMessageBox.information(self, "Save Box Coord", "Nothing to save yet.")
+            QtWidgets.QMessageBox.information(self, "Export Particle Coordinates", "Nothing to save yet.")
 
     def save_picks(self, only=None):
         """Write every class's particles to its own "<name>.txt" file in
@@ -1561,7 +1625,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             # different class makes the old score stale, so it resets
             # rather than silently carrying over a number that no longer
             # means what it looks like it means. It shows up first (not
-            # last) in "Sort by Score" until recomputed -- see
+            # last) in "Sort by Rank" until recomputed -- see
             # ParticleGrid.apply_score_order.
             self.boxes[i][4] = None
             self.update_box_shape(i, self.boxes[i])
@@ -1821,7 +1885,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _toggle_focus_selected(self, checked):
         """Turning Focus Selected on/off doesn't change sets_visible at
-        all (unlike Show the active channel only) -- it's a second,
+        all (unlike Show Active Set Only) -- it's a second,
         independent gate checked directly in update_sliceview/inside_box,
         so there's nothing to snapshot or restore here. Every particle's
         visibility outcome can change the moment this flips, so this
@@ -1924,7 +1988,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 # "The rest of the list" means the rest of what's actually
                 # on screen right now -- self.boxes' own storage order
                 # (effectively original ID) is wrong the moment a set has
-                # been Sort by Score'd, and would also reach across class
+                # been Sort by Rank'd, and would also reach across class
                 # boundaries the gallery itself never shows mixed
                 # together. active_uids_from asks the grid actually being
                 # looked at for its own current visual order instead.
@@ -2373,7 +2437,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return self.view_only_selected_action.isChecked()
 
     def _sync_solo_visibility(self):
-        """While Show the active channel only is active, force sets_visible back to
+        """While Show Active Set Only is active, force sets_visible back to
         exactly {currentset}. Called from everywhere currentset can change
         (or sets_visible can otherwise drift away from it) -- not just
         set_current_set's own callers -- since a couple of paths bypass
@@ -2411,7 +2475,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxesviewer.refresh_visibility_checkboxes()
         self.update_all()
 
-    def show_all_channels(self):
+    def show_all_sets(self):
         if self.view_only_selected_action.isChecked():
             # Turns solo off (restoring its pre-solo snapshot first) --
             # then immediately overridden below to "everything visible",
@@ -2653,7 +2717,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.set_current_set(f"{cid}::")
 
     def _on_gallery_tab_changed(self, cid):
-        """Show the active channel only has to follow the gallery to *every* tab,
+        """Show Active Set Only has to follow the gallery to *every* tab,
         not just the ones that can become the active picking class --
         unlike class_activated (which only ever fires for normal sets),
         active_tab_changed also fires for Recycle Bin, Confirmed, and

@@ -1,5 +1,4 @@
-"""A thumbnail grid for the boxed-particle list, replacing the subset of
-EMAN2's OpenGL EMImageMXWidget used by e2spt_boxer.py.
+"""A thumbnail grid for the boxed-particle list.
 
 Unlike a plain auto-flowing QListWidget, this grid keeps each particle's
 thumbnail pinned to a stable "slot" that is assigned once (in bottom-left-
@@ -10,8 +9,7 @@ gaps while preserving relative order.
 
 Particles are tracked by a caller-supplied unique id (uid), not by list
 position, so slot assignment survives additions/removals anywhere else in
-the particle list. A uid that reappears after being removed -- via undo,
-or because its set's visibility checkbox was toggled off and back on, or
+the particle list. A uid that reappears after being removed -- via undo, or
 detach/reattach -- returns to its old slot rather than being appended at
 the end. It is deliberately *not* auto-selected just for reappearing here
 (a uid reappearing isn't always an undo -- see the point above); undoing a
@@ -39,7 +37,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import categories
-from .widgets import TOOLBAR_BUTTON_STYLE, space_key_state
+from .widgets import TOOLBAR_BUTTON_STYLE, mark_destructive, space_key_state
 
 _LEAVE_ONE_OUT_HELP = (
     "Leave-one-out excludes each particle's own contribution from the reference "
@@ -64,6 +62,18 @@ MIN_THUMB = 24
 MAX_THUMB = 256
 SPACING = 4
 UID_ROLE = 0
+
+
+class _PlainClickEvent:
+    """Stand-in for a real mouse event, for gestures (arrow-key grid
+    navigation) that should behave exactly like a plain click -- single-
+    select and jump to it -- without actually involving a mouse.
+    TomoBoxer.img_selected only ever calls .modifiers() on what it's
+    given."""
+
+    @staticmethod
+    def modifiers():
+        return QtCore.Qt.NoModifier
 
 _label_style = None  # lazily-built (bg_brush, no_pen, text_brush, font) shared by every
                       # particle's number-id label -- see _get_label_style()
@@ -126,6 +136,11 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                                   # gesture; see ParticleListPanel._commit_selection
         self._selection_rects = {}  # uid -> QGraphicsRectItem
         self._last_clicked_uid = None
+        self._last_known_slot = None  # last slot navigated/clicked to, kept even
+                                  # once that uid is gone (recycled/confirmed/deleted)
+                                  # so arrow-key navigation resumes from the same
+                                  # spot instead of jumping back to the start --
+                                  # see _navigate/_jump_to
         self._labels = {}        # uid -> (bg QGraphicsRectItem, text QGraphicsSimpleTextItem)
         self._border_rects = {}  # uid -> QGraphicsRectItem (class-color border, grouped views only)
         self._border_colors = {}  # uid -> QColor
@@ -620,6 +635,11 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                 # TomoBoxer.img_selected. Bypass multi-select entirely and
                 # forward the click as-is.
                 if mods & QtCore.Qt.ShiftModifier or space_key_state().held:
+                    # This particle is about to leave this grid entirely
+                    # (recycled/confirmed) -- remember where it sat so a
+                    # subsequent arrow-key press resumes from here instead
+                    # of jumping back to the start (see _navigate).
+                    self._last_known_slot = self._slot_of_uid.get(uid)
                     self.mx_image_selected.emit(event, [uid])
                     event.accept()
                     return
@@ -635,9 +655,11 @@ class ParticleGrid(QtWidgets.QGraphicsView):
                     else:
                         sel.add(uid)
                     self._last_clicked_uid = uid
+                    self._last_known_slot = self._slot_of_uid.get(uid)
                     self.selection_changed.emit(list(sel))
                 else:
                     self._last_clicked_uid = uid
+                    self._last_known_slot = self._slot_of_uid.get(uid)
                     self.selection_changed.emit([uid])
                     self.mx_image_selected.emit(event, [uid])
                 event.accept()
@@ -663,14 +685,71 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             return
         super().mouseReleaseEvent(event)
 
+    _ARROW_KEYS = (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right, QtCore.Qt.Key_Up, QtCore.Qt.Key_Down)
+
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key_Escape:
             self.clear_selection()
             event.accept()
             return
+        if event.key() in self._ARROW_KEYS:
+            self._navigate(event.key())
+            event.accept()
+            return
         super().keyPressEvent(event)
 
+    def _navigate(self, key):
+        """Arrow keys move to the neighboring particle in that direction
+        and jump to it exactly like clicking it would (same as a plain
+        click: single-select it and center the tomogram views on it).
+
+        Left/Right move to the previous/next occupied slot in slot order
+        (not strictly "same row"): since slots are assigned bottom-row-
+        first, left-to-right (see the module docstring), this is exactly
+        reading order, so Right off the end of a row continues onto the
+        next row up rather than stopping dead at the row boundary. Up/
+        Down move a full row within the same column instead -- row 0 is
+        the bottom row (see _position_item), so Up means a numerically
+        *higher* row and Down a lower one.
+
+        The anchor is _last_known_slot, a plain slot number that outlives
+        whatever uid was last there -- so once that particle leaves this
+        grid entirely (recycled/confirmed/deleted), the next arrow press
+        still resumes from the same spot instead of falling back to the
+        very first particle. If nothing has ever been selected/navigated
+        to here, the first (lowest-slot) particle is picked instead."""
+        if not self._slot_of_uid:
+            return
+        if self._last_known_slot is None:
+            self._jump_to(min(self._slot_of_uid, key=self._slot_of_uid.get))
+            return
+        anchor_slot = self._last_known_slot
+        slot_to_uid = {s: u for u, s in self._slot_of_uid.items()}
+        if key == QtCore.Qt.Key_Right:
+            candidates = sorted(s for s in slot_to_uid if s > anchor_slot)
+        elif key == QtCore.Qt.Key_Left:
+            candidates = sorted((s for s in slot_to_uid if s < anchor_slot), reverse=True)
+        else:
+            cols = self._cols()
+            row, col = divmod(anchor_slot, cols)
+            if key == QtCore.Qt.Key_Up:
+                candidates = [(row + 1) * cols + col]
+            else:  # Key_Down
+                candidates = [(row - 1) * cols + col] if row > 0 else []
+        for slot in candidates:
+            uid = slot_to_uid.get(slot)
+            if uid is not None:
+                self._jump_to(uid)
+                return
+
+    def _jump_to(self, uid):
+        self._last_clicked_uid = uid
+        self._last_known_slot = self._slot_of_uid.get(uid)
+        self.selection_changed.emit([uid])
+        self.mx_image_selected.emit(_PlainClickEvent(), [uid])
+
     def _range_select(self, from_uid, to_uid):
+        self._last_known_slot = self._slot_of_uid.get(to_uid)
         if from_uid not in self._slot_of_uid or to_uid not in self._slot_of_uid:
             self.selection_changed.emit([to_uid])
             return
@@ -825,7 +904,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         # cascade from that one.
         self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
-        # Toggle Colors / Show the active channel only / Show All Channels: the
+        # Toggle Colors / Show Active Set Only / Show All Sets: the
         # QActions themselves live on TomoBoxer (it owns sets_visible and
         # the color rotation), but the buttons for them live here instead
         # of the tomogram window -- a QAction isn't tied to whichever
@@ -837,7 +916,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             self.view_toolbar.addAction(target.toggle_colors_action)
             self.view_toolbar.addSeparator()
             self.view_toolbar.addAction(target.view_only_selected_action)
-            self.view_toolbar.addAction(target.show_all_channels_action)
+            self.view_toolbar.addAction(target.show_all_sets_action)
             layout.addWidget(self.view_toolbar)
 
         # Deliberately the loudest thing in this window: computing/sorting
@@ -852,16 +931,17 @@ class ParticleListPanel(QtWidgets.QWidget):
         group_layout.setContentsMargins(0, 0, 0, 0)
         group_layout.setSpacing(3)
 
-        # Top row names the actual set that'll be ranked -- the current
-        # tab, kept live-updated by _update_compute_distance_state as you
-        # switch tabs -- rather than leaving that implicit the way a bare
-        # "vs. [combo]" row did.
-        target_row = QtWidgets.QHBoxLayout()
-        target_row.addWidget(QtWidgets.QLabel("Rank:"))
+        # One row for everything: which set gets ranked (the current tab,
+        # kept live-updated by _update_compute_distance_state as you switch
+        # tabs, rather than leaving it implicit), what it's ranked against,
+        # which embedding space, and leave-one-out -- all one coherent
+        # sentence-like control instead of splitting it across two rows.
+        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.addWidget(QtWidgets.QLabel("Rank:"))
         self.compute_distance_target_label = QtWidgets.QLabel()
         self.compute_distance_target_label.setStyleSheet("font-weight: bold;")
-        target_row.addWidget(self.compute_distance_target_label)
-        target_row.addWidget(QtWidgets.QLabel("vs."))
+        controls_row.addWidget(self.compute_distance_target_label)
+        controls_row.addWidget(QtWidgets.QLabel("vs."))
         self.compute_distance_reference_combo = QtWidgets.QComboBox()
         self.compute_distance_reference_combo.setToolTip(
             "The set whose embedding distribution the current tab's particles "
@@ -869,15 +949,11 @@ class ParticleListPanel(QtWidgets.QWidget):
             "to spot outliers within it.")
         self.compute_distance_reference_combo.currentIndexChanged.connect(
             self._update_compute_distance_state)
-        target_row.addWidget(self.compute_distance_reference_combo)
-        target_row.addStretch(1)
-        group_layout.addLayout(target_row)
-
-        controls_row = QtWidgets.QHBoxLayout()
+        controls_row.addWidget(self.compute_distance_reference_combo)
         self.compute_distance_space_combo = QtWidgets.QComboBox()
         self.compute_distance_space_combo.addItem("Full embedding (1024-d)", "full")
         controls_row.addWidget(self.compute_distance_space_combo)
-        self.compute_distance_loo_check = QtWidgets.QCheckBox("Leave-one-out")
+        self.compute_distance_loo_check = QtWidgets.QCheckBox("Leave-One-Out")
         controls_row.addWidget(self.compute_distance_loo_check)
         loo_help_button = QtWidgets.QToolButton()
         loo_help_button.setText("?")
@@ -887,11 +963,12 @@ class ParticleListPanel(QtWidgets.QWidget):
         controls_row.addStretch(1)
         group_layout.addLayout(controls_row)
 
-        self.compute_distance_button = QtWidgets.QPushButton("▶  Use embeddings to rank particles")
+        self.compute_distance_button = QtWidgets.QPushButton("▶  Rank by Embedding Distance")
         self.compute_distance_button.setToolTip(
-            "Score the current tab's particles by their Mahalanobis distance to "
-            "the reference set's embedding distribution, then lay them out "
-            "closest-first.")
+            "Ranks the current tab's particles by their Mahalanobis distance to "
+            "the reference set's embedding distribution, then lays them out "
+            "closest-first. \"Sort by Rank\" (below) re-displays this same "
+            "result later without recomputing it.")
         self.compute_distance_button.setCursor(QtCore.Qt.PointingHandCursor)
         self.compute_distance_button.setStyleSheet("""
             QPushButton {
@@ -910,8 +987,21 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.compute_distance_button.clicked.connect(self._run_compute_distance)
         group_layout.addWidget(self.compute_distance_button)
 
+        # Menu-only equivalent of the button above (TomoBoxer's Set menu),
+        # kept in sync with compute_distance_group's own enabled state by
+        # _update_compute_distance_state -- there is deliberately no
+        # separate toolbar button for it, since the big green one already
+        # serves that role.
+        self.rank_action = QtGui.QAction("Rank by Embedding Distance", self)
+        self.rank_action.setToolTip(self.compute_distance_button.toolTip())
+        self.rank_action.triggered.connect(self._run_compute_distance)
+
         self.compute_distance_group.setEnabled(False)  # no embeddings loaded yet
-        layout.addWidget(self.compute_distance_group)
+        # Added to the layout further down, right below the tab grid --
+        # see the trailing layout.addWidget(self.compute_distance_group)
+        # call -- so it sits next to Sort by Original ID/Sort by Rank
+        # rather than above the tabs entirely: all three act on "whatever
+        # tab you're currently looking at," so they read as one group.
 
         self.tabs = QtWidgets.QTabWidget()
         # setTabBar must happen before any tabs are added (Qt requirement).
@@ -943,7 +1033,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         self._pinning_fixed_tabs = False  # reentrancy guard, see _pin_fixed_tabs
         self._selected_uids = set()  # the one authoritative selection -- see _commit_selection
         self._uid_scores = {}  # uid -> (score, has_embedding), refreshed by every sync_particles
-                                # call -- read by the one-shot "Sort by Score" button
+                                # call -- read by the one-shot "Sort by Rank" button
                                 # (apply_score_order) so it doesn't need fresh data from TomoBoxer
 
         self._plus_placeholder = QtWidgets.QWidget()
@@ -951,52 +1041,103 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.tabs.setTabToolTip(self.tabs.indexOf(self._plus_placeholder), "Create a new set")
         self._last_tab_index = 0
 
-        btnrow = QtWidgets.QHBoxLayout()
-        self.organize_button = QtWidgets.QPushButton("Organize Grid")
-        self.organize_button.setToolTip("Compact the grid, removing gaps left by deleted particles.")
-        btnrow.addWidget(self.organize_button)
-        self.detach_button = QtWidgets.QPushButton("Detach Tab")
-        self.detach_button.setToolTip("Pop the current tab's grid into its own floating window.")
-        self.detach_button.setEnabled(False)  # starts on "All", which can't be detached
-        btnrow.addWidget(self.detach_button)
-        self.delete_set_button = QtWidgets.QPushButton("Delete Set")
-        self.delete_set_button.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
-        self.delete_set_button.setEnabled(False)
-        btnrow.addWidget(self.delete_set_button)
+        # Menu-only equivalents of the "+" tab and double-clicking a tab
+        # (TomoBoxer's Set menu) -- both gestures already exist and work
+        # fine, these just make them reachable without knowing that.
+        self.new_set_action = QtGui.QAction("New Set...", self)
+        self.new_set_action.setToolTip("Create a new set.")
+        self.new_set_action.triggered.connect(self._prompt_new_set)
+
+        self.rename_set_action = QtGui.QAction("Rename Set...", self)
+        self.rename_set_action.setToolTip("Rename the current tab's set.")
+        self.rename_set_action.triggered.connect(self._prompt_rename_current_set)
+
+        # The Rank panel operates on "whatever tab is currently on screen,"
+        # same as every action in the toolbar just below it -- keeping them
+        # adjacent (rather than the Rank panel sitting above the tabs
+        # entirely, as it used to) makes that relationship visible instead
+        # of implied.
+        layout.addWidget(self.compute_distance_group)
+
+        # A real QToolBar (not a bare row of QPushButtons) so these pick up
+        # the exact same flat "chip" look as every other toolbar in the
+        # app, rather than looking like a different, unstyled widget glued
+        # on underneath. Grouped with separators by what they actually do:
+        # grid/window layout, then re-ordering, then the two genuinely
+        # destructive actions (marked in red -- see widgets.mark_destructive
+        # -- so they read as different in kind from the harmless ones next
+        # to them, not just alphabetically nearby).
+        self.gallery_toolbar = QtWidgets.QToolBar()
+        self.gallery_toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
+
+        self.organize_action = QtGui.QAction("Organize Grid", self)
+        self.organize_action.setToolTip("Compact the grid, removing gaps left by deleted particles.")
+        self.organize_action.triggered.connect(lambda: self._active_grid().reorganize())
+        self.gallery_toolbar.addAction(self.organize_action)
+
+        self.detach_action = QtGui.QAction("Detach Tab", self)
+        self.detach_action.setToolTip("Pop the current tab's grid into its own floating window.")
+        self.detach_action.setEnabled(False)  # starts on "All", which can't be detached
+        self.detach_action.triggered.connect(self._detach_current_tab)
+        self.gallery_toolbar.addAction(self.detach_action)
+
+        self.gallery_toolbar.addSeparator()
+
         # One-shot re-layout actions, not modes: each click snapshots the
         # current order and stops there -- neither one keeps re-sorting as
         # more particles are added or moved afterward (see apply_id_order/
         # apply_score_order). "Original ID" restores plain uid order,
-        # undoing whatever "By Score" last did (including its dimming);
-        # "By Score" reads whatever was last computed via the "Compute
-        # Distance" button above the tabs, it doesn't compute anything
-        # itself.
-        self.sort_by_id_button = QtWidgets.QPushButton("Sort by Original ID")
-        self.sort_by_id_button.setToolTip(
+        # undoing whatever "By Rank" last did (including its dimming); "By
+        # Rank" reads whatever was last computed via the "Rank by Embedding
+        # Distance" button above, it doesn't compute anything itself.
+        self.sort_by_id_action = QtGui.QAction("Sort by Original ID", self)
+        self.sort_by_id_action.setToolTip(
             "One-time re-layout of this set's particles by their original ID.")
-        self.sort_by_id_button.setEnabled(False)  # starts on "All", not a real set
-        btnrow.addWidget(self.sort_by_id_button)
-        self.sort_by_score_button = QtWidgets.QPushButton("Sort by Score")
-        self.sort_by_score_button.setToolTip(
-            "One-time re-layout of this set's particles by their last computed "
-            "Mahalanobis distance (unscored ones first, then ascending by score). "
-            "Doesn't compute anything itself -- see \"Use embeddings to rank particles\" above.")
-        self.sort_by_score_button.setEnabled(False)  # starts on "All", not a real set
-        btnrow.addWidget(self.sort_by_score_button)
-        self.empty_recycle_button = QtWidgets.QPushButton("Empty Recycle Bin")
-        self.empty_recycle_button.setToolTip(
+        self.sort_by_id_action.setEnabled(False)  # starts on "All", not a real set
+        self.sort_by_id_action.triggered.connect(self._sort_current_by_id)
+        self.gallery_toolbar.addAction(self.sort_by_id_action)
+
+        self.sort_by_rank_action = QtGui.QAction("Sort by Rank", self)
+        self.sort_by_rank_action.setToolTip(
+            "One-time re-layout of this set's particles by their rank -- the "
+            "distance last computed by \"Rank by Embedding Distance\" above "
+            "(closest first; particles never ranked come first of all). "
+            "Doesn't compute anything itself, only re-displays the last result.")
+        self.sort_by_rank_action.setEnabled(False)  # starts on "All", not a real set
+        self.sort_by_rank_action.triggered.connect(self._sort_current_by_score)
+        self.gallery_toolbar.addAction(self.sort_by_rank_action)
+
+        self.gallery_toolbar.addSeparator()
+
+        self.delete_set_action = QtGui.QAction("Delete Set", self)
+        self.delete_set_action.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
+        self.delete_set_action.setEnabled(False)
+        self.delete_set_action.triggered.connect(self._delete_current_set)
+        self.gallery_toolbar.addAction(self.delete_set_action)
+        mark_destructive(self.gallery_toolbar.widgetForAction(self.delete_set_action))
+
+        self.empty_recycle_action = QtGui.QAction("Empty Recycle Bin", self)
+        self.empty_recycle_action.setToolTip(
             "Permanently delete everything currently in the Recycle Bin "
             "(undoable with Ctrl+Z right after).")
-        self.empty_recycle_button.setVisible(False)  # only shown while viewing the Recycle Bin tab
-        btnrow.addWidget(self.empty_recycle_button)
-        layout.addLayout(btnrow)
+        self.empty_recycle_action.setVisible(False)  # only shown while viewing the Recycle Bin tab
+        self.empty_recycle_action.triggered.connect(self._empty_recycle_bin)
+        self.gallery_toolbar.addAction(self.empty_recycle_action)
+        mark_destructive(self.gallery_toolbar.widgetForAction(self.empty_recycle_action))
 
-        self.organize_button.clicked.connect(lambda: self._active_grid().reorganize())
-        self.detach_button.clicked.connect(self._detach_current_tab)
-        self.delete_set_button.clicked.connect(self._delete_current_set)
-        self.empty_recycle_button.clicked.connect(self._empty_recycle_bin)
-        self.sort_by_id_button.clicked.connect(self._sort_current_by_id)
-        self.sort_by_score_button.clicked.connect(self._sort_current_by_score)
+        layout.addWidget(self.gallery_toolbar)
+
+        # Old attribute names kept as aliases to the actions' own toolbar
+        # widgets (still real, clickable QToolButtons) rather than removed
+        # outright -- nothing outside this method should need them (the
+        # actions above are the real thing now), but this keeps anything
+        # that still reaches in by the old button names working unchanged.
+        self.organize_button = self.gallery_toolbar.widgetForAction(self.organize_action)
+        self.detach_button = self.gallery_toolbar.widgetForAction(self.detach_action)
+        self.delete_set_button = self.gallery_toolbar.widgetForAction(self.delete_set_action)
+        self.sort_by_id_button = self.gallery_toolbar.widgetForAction(self.sort_by_id_action)
+        self.sort_by_score_button = self.gallery_toolbar.widgetForAction(self.sort_by_rank_action)
+        self.empty_recycle_button = self.gallery_toolbar.widgetForAction(self.empty_recycle_action)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
 
@@ -1017,7 +1158,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         tracks the active *picking* class and never changes for "All" or
         the fixed categories) or class_activated (which only fires for
         normal classes), this always reflects literally what's on screen;
-        used by Show the active channel only / Show All Channels to key off the tab
+        used by Show Active Set Only / Show All Sets to key off the tab
         you're actually looking at rather than the picking class."""
         return self._active_classid()
 
@@ -1030,17 +1171,17 @@ class ParticleListPanel(QtWidgets.QWidget):
 
         cid = self._active_classid()
         is_fixed = cid in categories.FIXED_CLASS_IDS if cid is not None else False
-        self.delete_set_button.setEnabled(cid is not None and not is_fixed)
-        self.detach_button.setEnabled(cid is not None)  # "All" can't be detached
-        self.empty_recycle_button.setVisible(cid == categories.RECYCLE_BIN_ID)
-        self.sort_by_id_button.setEnabled(cid is not None)
-        self.sort_by_score_button.setEnabled(cid is not None)
+        self.delete_set_action.setEnabled(cid is not None and not is_fixed)
+        self.detach_action.setEnabled(cid is not None)  # "All" can't be detached
+        self.empty_recycle_action.setVisible(cid == categories.RECYCLE_BIN_ID)
+        self.sort_by_id_action.setEnabled(cid is not None)
+        self.sort_by_rank_action.setEnabled(cid is not None)
         self._update_compute_distance_state()
         if cid is not None and not is_fixed:
             self.class_activated.emit(cid)
         # Unlike class_activated (only normal/pickable classes), this
         # fires for *every* real tab -- Recycle Bin, Confirmed, and "All"
-        # (cid None) included -- since Show the active channel only needs to follow
+        # (cid None) included -- since Show Active Set Only needs to follow
         # whatever the gallery is showing regardless of whether that tab
         # could ever become the active picking class.
         self.active_tab_changed.emit(cid)
@@ -1080,6 +1221,9 @@ class ParticleListPanel(QtWidgets.QWidget):
         grid = self._class_grids.get(cid)
         if grid is not None:
             self.tabs.setCurrentWidget(grid)
+
+    def _prompt_rename_current_set(self):
+        self._on_tab_double_clicked(self.tabs.currentIndex())
 
     def _on_tab_double_clicked(self, index):
         widget = self.tabs.widget(index)
@@ -1172,6 +1316,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             target.embeddings_full is not None or target.embeddings_umap is not None)
         enabled = has_embeddings and cid is not None
         self.compute_distance_group.setEnabled(enabled)
+        self.rank_action.setEnabled(enabled)
         self.compute_distance_group.setToolTip(
             "" if has_embeddings else
             "No embeddings are loaded -- import a particle list with an embeddings "
@@ -1185,7 +1330,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             "" if same else "Only available when comparing the current tab to itself.")
 
     def _show_leave_one_out_help(self):
-        QtWidgets.QMessageBox.information(self, "Leave-one-out", _LEAVE_ONE_OUT_HELP)
+        QtWidgets.QMessageBox.information(self, "Leave-One-Out", _LEAVE_ONE_OUT_HELP)
 
     def _run_compute_distance(self):
         target = self._target_or_none()
@@ -1230,7 +1375,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.sort_active_tab_by_score()
 
     def sort_active_tab_by_score(self):
-        """Same one-shot action as the "Sort by Score" button, callable
+        """Same one-shot action as the "Sort by Rank" button, callable
         directly -- used by TomoBoxer right after a Mahalanobis
         computation finishes, so the freshly-computed order is visible
         immediately without an extra manual click. A no-op if the
@@ -1242,7 +1387,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             return
         grid.apply_score_order(self._uid_scores)
 
-    _LOCKED_VISIBILITY_TIP = 'Turn off "Show the active channel only" to change visibility.'
+    _LOCKED_VISIBILITY_TIP = 'Turn off "Show Active Set Only" to change visibility.'
     _NORMAL_VISIBILITY_TIP = "Show/hide this set's particles in the tomogram views."
 
     def _make_visibility_checkbox(self, classid):
@@ -1267,7 +1412,7 @@ class ParticleListPanel(QtWidgets.QWidget):
     def refresh_visibility_checkboxes(self):
         """Resync every checkbox's checked state from the model -- needed
         whenever sets_visible changes by some means other than a checkbox
-        click itself (Show the active channel only turning on/off, Show All
+        click itself (Show Active Set Only turning on/off, Show All
         Channels)."""
         target = self._target_or_none()
         if target is None:
@@ -1283,7 +1428,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             cb.blockSignals(False)
 
     def set_visibility_controls_locked(self, locked):
-        """Gray out every visibility checkbox while Show the active channel only is
+        """Gray out every visibility checkbox while Show Active Set Only is
         active -- clicking one wouldn't do anything useful right now since
         it'd just be overridden on the next tab switch, and the tooltip
         explains why on hover (Qt shows tooltips on disabled widgets)."""
@@ -1469,6 +1614,18 @@ class ParticleListPanel(QtWidgets.QWidget):
                 self._color_swatches.pop(classid, None)
                 idx = self.tabs.indexOf(grid)
                 if idx >= 0:
+                    # Switch away *before* removing it if it's the tab
+                    # currently on screen -- otherwise Qt shifts the
+                    # current tab onto whatever ends up in its place
+                    # (possibly "+", which immediately fires an unwanted
+                    # "create a new set" prompt as a side effect of
+                    # deleting one). _delete_current_set already does this
+                    # itself before calling delete_set, but doing it here
+                    # too means anything that removes a class -- now or
+                    # later -- can't reintroduce this by skipping that
+                    # dance.
+                    if self.tabs.currentWidget() is grid:
+                        self.tabs.setCurrentWidget(self.grid)
                     self.tabs.removeTab(idx)
 
         for classid in list(self._detached.keys()):
@@ -1720,7 +1877,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         """entries: iterable of (uid, img, classid). scores: {uid:
         (score, has_embedding)} as built by TomoBoxer.update_boximgs --
         cached (self._uid_scores) for use by any tab currently showing
-        the "Sort by Score" order, and by the toggle itself when it's
+        the "Sort by Rank" order, and by the toggle itself when it's
         switched on later without a fresh sync happening."""
         entries = list(entries)
         self._uid_scores = scores if scores is not None else {}

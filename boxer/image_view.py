@@ -1,22 +1,16 @@
 """A QGraphicsView-based 2D image view: pan/zoom, auto-contrast,
 shape-overlay annotation, and mouse/keyboard signal plumbing.
 
-This replaces the subset of EMAN2's OpenGL-based EMImage2DWidget that
-e2spt_boxer.py actually relies on (set_data/add_shape/get_shapes/del_shape,
-scr_to_img, scroll_to, get_origin/set_origin, set_scale, and the
-mousedown/mousedrag/mouseup/mousewheel/mousemove/keypress signals).
-
 Particle shapes are persistent QGraphicsItems (one per key) rather than
 being redrawn from scratch on every repaint: Qt's own scene graph tracks
 which items actually changed and only repaints those regions, instead of
 every visible shape being walked and redrawn on every single change to any
 one particle. This mirrors the approach thumb_grid.ParticleGrid already
 uses for the particle gallery. The pan/zoom coordinate system is kept as
-plain (_origin, _scale) bookkeeping identical to before -- rather than
-Qt's native scrollbar-based view scrolling -- specifically so scr_to_img/
-img_to_scr keep their exact original formulas and precision (including
-sub-pixel origins), applied here as the view's transform instead of a
-per-paint QPainter transform.
+plain (_origin, _scale) bookkeeping rather than Qt's native scrollbar-based
+view scrolling, specifically so scr_to_img/img_to_scr keep exact, simple
+formulas and full precision (including sub-pixel origins), applied here as
+the view's transform instead of a per-paint QPainter transform.
 """
 from __future__ import annotations
 
@@ -159,7 +153,7 @@ class ImageView2D(QtWidgets.QGraphicsView):
         self._scale = 1.0
         self._origin = (0.0, 0.0)  # image coord shown at widget top-left
         self._center = None        # image coord to keep centered across resizes/zooms
-        self.mag = 1.1              # zoom-in factor per wheel notch (matches EMAN2)
+        self.mag = 1.1              # zoom-in factor per wheel notch
         self.invmag = 1.0 / self.mag
         self._pan_last = None       # last screen pos while middle-button panning
 

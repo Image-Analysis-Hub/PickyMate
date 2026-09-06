@@ -1,6 +1,5 @@
-"""Minimal replacement for EMAN2's EMShape: a small mutable geometric shape
-used to annotate the 2D slice views (particle box markers, crosshair lines,
-eraser cursor preview).
+"""A small mutable geometric shape used to annotate the 2D slice views
+(particle box markers, crosshair lines, eraser cursor preview).
 """
 from __future__ import annotations
 

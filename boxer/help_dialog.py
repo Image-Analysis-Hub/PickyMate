@@ -29,14 +29,15 @@ _SHORTCUTS = [
     ("Multi-select toggle", "Ctrl + click (gallery or tomogram view)"),
     ("Multi-select range", "Alt + click (gallery)"),
     ("Send every selected particle to Recycle Bin", "Delete"),
+    ("Navigate to the neighboring particle", "Arrow keys (gallery)"),
     ("Shape-select (rectangle/circle)", "Click + drag, Select tool active"),
     ("Shape-select (freeform)", "Click to place points, Select tool active"),
     ("Finish freeform selection", "Double-click, Enter, or click near the start point"),
     ("Undo last freeform point", "Backspace (while placing points)"),
     ("Cancel freeform selection", "Escape"),
     ("Clear the current selection (anywhere in the app)", "Escape"),
-    ("New set", "Click the gallery's \"+\" tab"),
-    ("Rename set", "Double-click its tab"),
+    ("New set", "Click the gallery's \"+\" tab, or Set > New Set..."),
+    ("Rename set", "Double-click its tab, or Set > Rename Set..."),
     ("Undo", "Ctrl+Z"),
     ("Redo", "Ctrl+Y, Ctrl+Shift+Z, or your platform's native Redo key"),
     ("Force everything to re-derive and redraw", "F5 (Edit > Refresh)"),
@@ -81,19 +82,19 @@ _NOTES = [
     "whatever's on screen. \"All\", Recycle Bin, Confirmed, and \"+\" stay "
     "fixed in place and can't be dragged; a detached set has no tab "
     "position and is skipped from numbering until reattached.",
-    "\"Show the active channel only\" and \"Show All Channels\" (particle "
+    "\"Show Active Set Only\" and \"Show All Sets\" (particle "
     "list toolbar, alongside Toggle Colors) show only the active tab's "
     "set and follow you as you switch tabs (including by number key), "
     "Recycle Bin/Confirmed included; following \"All\" shows every set "
-    "instead, matching what All itself displays. Turning \"Show the "
-    "active channel only\" off restores exactly the visibility you had "
-    "before; Show All Channels makes every set visible in one click and "
+    "instead, matching what All itself displays. Turning \"Show Active "
+    "Set Only\" off restores exactly the visibility you had "
+    "before; Show All Sets makes every set visible in one click and "
     "turns it off if it was on.",
-    "\"Show only selected\" (Selection toolbar) shows only the currently "
+    "\"Show Only Selected\" (Selection toolbar) shows only the currently "
     "selected particle(s) in the tomogram views, regardless of any set's "
     "own visibility -- if nothing is selected, nothing shows. Updates "
-    "live as the selection changes; unlike \"Show the active channel "
-    "only\", there's nothing to restore when you turn it back off.",
+    "live as the selection changes; unlike \"Show Active "
+    "Set Only\", there's nothing to restore when you turn it back off.",
     "\"Refresh\" (Edit menu, toolbar, or F5) forces everything to fully "
     "re-derive and redraw -- regenerating every gallery thumbnail from "
     "the volume and fully re-slicing the tomogram views -- in case "

@@ -1,9 +1,10 @@
 # PickyMate
 
-A standalone tomogram particle boxer (a PySide6 + numpy + mrcfile port of
-EMAN2's `e2spt_boxer.py` that runs without EMAN2). Pick particles from an
-MRC/REC tomogram in three orthogonal views, organize them into sets, clean
-up with a Recycle-Bin / Confirmed workflow, and export coordinates.
+A standalone tomogram particle-picking tool, built on plain PySide6 + numpy +
+mrcfile (design loosely inspired by EMAN2's `e2spt_boxer.py`, though the two
+have since diverged considerably). Pick particles from an MRC/REC tomogram in
+three orthogonal views, organize them into sets, clean up with a Recycle-Bin
+/ Confirmed workflow, and export coordinates.
 
 ## Running it
 
@@ -22,7 +23,7 @@ python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [
 - `--particle_lists PATH [PATH ...]` — one or more plain-text `x y z`
   coordinate files, space-separated; each becomes its own brand new set
   (named after the file) copied into the working directory immediately,
-  exactly like File > Read Box Coord. A name already in use (including
+  exactly like File > Import Particle List. A name already in use (including
   from a previous run against the same working directory) gets a numeric
   suffix rather than being skipped or overwritten, since the same name can
   legitimately carry different picks run to run.
@@ -132,17 +133,17 @@ The particle list also has its own toolbar, above the tabs:
   of that rotation, though either can still be recolored manually via its
   own tab's color swatch. Any manually-set color, on any set, is left
   alone by Toggle Colors too.
-- **Show the active channel only** shows only the active tab's set, hiding every
+- **Show Active Set Only** shows only the active tab's set, hiding every
   other one, and keeps following whichever tab you switch to (including
   by number key, and Recycle Bin/Confirmed, without making either the
-  active picking class) — handy for flipping through channels one at a
+  active picking class) — handy for flipping through sets one at a
   time. Following the **All** tab shows every set instead, matching what
   All itself displays. Turning it off restores exactly the visibility you
   had before turning it on. While it's on, the gallery's per-tab
   visibility checkboxes are grayed out (hover one for a reminder to turn
   it off first).
-- **Show All Channels** is a one-shot button that makes every set visible
-  and turns Show the active channel only off if it was on.
+- **Show All Sets** is a one-shot button that makes every set visible
+  and turns Show Active Set Only off if it was on.
 
 Beyond sets management:
 
@@ -169,19 +170,28 @@ Beyond sets management:
 - A small label at the bottom-right of the tomogram window shows "N
   particle(s) selected", the way a file manager shows a selection count.
 - The **Selection** toolbar acts on that selection directly: **Confirm
-  Selected**, **Recycle Selected**, and **Move Selected** (type a set name
-  — existing or new — into the box beside it, then Move Selected). Each
-  one clears the selection afterward, the same way a file manager doesn't
-  keep files selected once you've moved them.
+  Selected**, **Recycle Selected**, and **Move Selected To** (type a set
+  name — existing or new — into the box beside it, then Move Selected To).
+  Each one clears the selection afterward, the same way a file manager
+  doesn't keep files selected once you've moved them.
 - **Escape** clears the current selection from anywhere in the app, not
   just while a tomogram view has keyboard focus.
+- **Show Only Selected** (also in the Selection toolbar) shows only the
+  currently selected particle(s) in the tomogram views, regardless of any
+  set's own visibility — if nothing is selected, nothing shows. Updates
+  live as the selection changes.
+- **Delete** sends every currently selected particle to the Recycle Bin,
+  the same as clicking Recycle Selected.
 
 ## Undo / redo
 
 Every add, delete, and reassignment (recycle/confirm/move) is undoable and
 redoable, including permanent deletes from the Recycle Bin. The **Edit**
 menu and toolbar mirror Undo/Redo with visible buttons alongside the
-keyboard shortcuts.
+keyboard shortcuts. **Refresh** (Edit menu, toolbar, or F5) forces
+everything to fully re-derive and redraw — regenerating every gallery
+thumbnail from the volume and fully re-slicing the tomogram views — in
+case rendering ever visibly gets stuck; not needed for normal use.
 
 ## Saving
 
@@ -192,11 +202,12 @@ file for any non-default box sizes — no separate save step needed.
 The **File** menu offers:
 - **Save** — forces an immediate write of every set's picks and box sizes
   (happens automatically anyway) and confirms with the folder it wrote to.
-- **Read Box Coord** — import an `x y z` coordinate text file as a brand
-  new set, named after the file (auto-renamed with a numeric suffix if
+- **Import Particle List...** — import an `x y z` coordinate text file as a
+  brand new set, named after the file (auto-renamed with a numeric suffix if
   that name's already taken).
-- **Save Box Coord** — copies the already-saved coordinate file(s) — all
-  sets, or one you pick — to a folder of your choice, for your own records.
+- **Export Particle Coordinates...** — copies the already-saved coordinate
+  file(s) — all sets, or one you pick — to a folder of your choice, for your
+  own records.
 
 ## Shortcut reference
 
@@ -215,6 +226,7 @@ The **File** menu offers:
 | Multi-select toggle | Ctrl + click (gallery or tomogram view) |
 | Multi-select range | Alt + click (gallery) |
 | Send every selected particle to Recycle Bin | Delete |
+| Navigate to the neighboring particle | Arrow keys (gallery) |
 | Shape-select (rectangle/circle) | Click + drag, Select tool active |
 | Shape-select (freeform) | Click to place points, Select tool active |
 | Finish freeform selection | Double-click, Enter, or click near the start point |

@@ -1,12 +1,10 @@
-"""Lightweight, dependency-free replacement for EMAN2's EMData for tomogram
-volumes, providing only the subset of functionality that the tomogram boxer
-needs: MRC I/O, centered sub-volume extraction (with zero-padding), thin-slab
-axis-aligned projections, and normalization.
+"""Lightweight tomogram-volume wrapper: MRC I/O, centered sub-volume
+extraction (with zero-padding), and thin-slab axis-aligned projections.
 
 Internally the volume is stored as a numpy array shaped (nz, ny, nx), matching
 the on-disk convention used by mrcfile. ``nx``/``ny``/``nz`` properties are
-provided for readability when porting code that used EMAN2's EMData["nx"]
-style header access.
+provided for readability wherever header-style axis access reads better than
+indexing the array shape directly.
 """
 from __future__ import annotations
 

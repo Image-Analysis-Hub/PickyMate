@@ -1,6 +1,5 @@
-"""Small labeled-value widgets, replacing EMAN2's ValBox/ValSlider for the
-handful of numeric controls e2spt_boxer.py uses (box size, eraser radius,
-layer thickness)."""
+"""Small labeled-value widgets for the app's handful of numeric controls
+(box size, eraser radius, layer thickness)."""
 from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -47,7 +46,33 @@ TOOLBAR_BUTTON_STYLE = """
         border-color: palette(midlight);
         color: palette(mid);
     }
+    QToolBar QToolButton#destructiveAction {
+        color: #c62828;
+        border-color: #c62828;
+    }
+    QToolBar QToolButton#destructiveAction:hover {
+        background-color: #ffebee;
+        border-color: #b71c1c;
+    }
+    QToolBar QToolButton#destructiveAction:pressed {
+        background-color: #ffcdd2;
+    }
+    QToolBar QToolButton#destructiveAction:disabled {
+        color: palette(mid);
+        border-color: palette(midlight);
+    }
 """
+
+
+def mark_destructive(widget):
+    """Tag a toolbar button as a destructive/irreversible-feeling action
+    (Delete Set, Empty Recycle Bin, ...) so it picks up the red accent
+    above instead of the default neutral chip look -- the one other color
+    used anywhere in the app besides the green "primary action" button, so
+    a user learns two consistent meanings (green = do this, red = this
+    removes something) instead of every button looking equally weighted."""
+    if widget is not None:
+        widget.setObjectName("destructiveAction")
 
 
 class RangeSlider(QtWidgets.QWidget):
@@ -211,8 +236,8 @@ def space_key_state() -> _SpaceKeyState:
 
 
 class LabeledSpinBox(QtWidgets.QWidget):
-    """Label + integer spin box. Drop-in equivalent of ValBox for the
-    integer-valued controls used here (box size, eraser radius).
+    """Label + integer spin box, used for the app's integer-valued controls
+    (box size, eraser radius).
 
     Keyboard tracking is off: typing a new value (e.g. box size, which can
     trigger rewriting every particle's shape/thumbnail) doesn't apply on
