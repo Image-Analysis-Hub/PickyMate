@@ -61,6 +61,11 @@ TOOLBAR_BUTTON_STYLE = """
         color: palette(mid);
         border-color: palette(midlight);
     }
+    QToolBar QToolButton#pulsingAttention {
+        background-color: #ff9800;
+        color: white;
+        border-color: #e65100;
+    }
 """
 
 

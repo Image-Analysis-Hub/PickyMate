@@ -592,10 +592,32 @@ class ParticleGrid(QtWidgets.QGraphicsView):
             super().wheelEvent(event)
             return
         delta = event.angleDelta().y()
+        if delta == 0:
+            event.accept()
+            return
+        # Zooming re-lays out every item (their slot positions scale with
+        # thumb size), which would otherwise leave the view centered on
+        # whatever raw scene point it happened to be at before -- rarely
+        # where you actually want to keep looking. If something's
+        # selected, keep it in view instead (its own position after the
+        # relayout, not before); otherwise keep the point under the
+        # cursor centered.
+        anchor_uid = self._last_clicked_uid if self._last_clicked_uid in self._selected else None
+        if anchor_uid is None and self._selected:
+            anchor_uid = next(iter(self._selected))
+        cursor_scene_pos = None
+        if anchor_uid is None:
+            cursor_scene_pos = self.mapToScene(event.position().toPoint())
         if delta > 0:
             self.zoom_in()
-        elif delta < 0:
+        else:
             self.zoom_out()
+        if anchor_uid is not None:
+            item = self._items.get(anchor_uid)
+            if item is not None:
+                self.centerOn(item.sceneBoundingRect().center())
+        elif cursor_scene_pos is not None:
+            self.centerOn(cursor_scene_pos)
         event.accept()
 
     def resizeEvent(self, event):

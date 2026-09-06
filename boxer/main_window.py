@@ -26,10 +26,12 @@ from PySide6.QtCore import Qt
 from .embeddings_wizard import EmbeddingsImportDialog
 from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
+from .settings_dialog import KeyboardShortcutsDialog
 from .thumb_grid import ParticleListPanel
 from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
 from . import categories
 from . import metadata
+from . import shortcuts
 from .shapes import Shape
 from .volume import Volume
 
@@ -83,12 +85,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         # Each of these is populated further down, once the actions/objects
         # it needs exist -- created here (empty) so the menu bar's overall
-        # order (File, Edit, Tools, View, Set, Help) is fixed regardless of
-        # where in __init__ each menu's own actions happen to be built.
+        # order (File, Edit, Tools, View, Set, Settings, Help) is fixed
+        # regardless of where in __init__ each menu's own actions happen
+        # to be built.
         self.medit = self.menuBar().addMenu("Edit")
         self.mtools = self.menuBar().addMenu("Tools")
         self.mview = self.menuBar().addMenu("View")
         self.mset = self.menuBar().addMenu("Set")
+        self.msettings = self.menuBar().addMenu("Settings")
 
         self._shortcuts_dialog = None
         self.mhelp = self.menuBar().addMenu("Help")
@@ -101,7 +105,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.setCentralWidget(QtWidgets.QWidget())
         self.gbl = QtWidgets.QGridLayout(self.centralWidget())
         gblh = QtWidgets.QHBoxLayout()
-        self.gbl.addLayout(gblh, 0, 0, 2, 2)
+        self.gbl.addLayout(gblh, 0, 1, 2, 2)
 
         self.splitter_top = QtWidgets.QSplitter(Qt.Horizontal)
         self.splitter_bottom = QtWidgets.QSplitter(Qt.Horizontal)
@@ -111,8 +115,28 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xzview = ImageView2D(sizehint=(1024, 256))
         self.zyview = ImageView2D(sizehint=(256, 1024))
 
+        # Three slice sliders, one per view's own depth axis -- each
+        # spatially next to the view it drives, rather than all three
+        # clustered arbitrarily: wdepth_x sits at the far left, parallel
+        # to the top row (zyview is the leftmost view there); wdepth
+        # (Z, XY view) stays at the far right, where it always was;
+        # wdepth_y runs along the bottom, right below the row xzview
+        # itself sits in, spanning exactly as wide as the view grid above
+        # it (gblh) -- ending at the XZ view's own right edge rather than
+        # the full window width. All three also respond to Shift+wheel
+        # over their own view, and stay in sync however the position
+        # actually changes (see update_coords/_sync_depth_sliders).
+        self.wdepth_x = QtWidgets.QSlider()
+        self.wdepth_x.setToolTip("X depth (ZY view) -- Shift+wheel over that view also steps it.")
+        self.gbl.addWidget(self.wdepth_x, 0, 0)
+
         self.wdepth = QtWidgets.QSlider()
-        self.gbl.addWidget(self.wdepth, 0, 2)
+        self.wdepth.setToolTip("Z depth (XY view) -- Shift+wheel over that view also steps it.")
+        self.gbl.addWidget(self.wdepth, 0, 3)
+
+        self.wdepth_y = QtWidgets.QSlider(Qt.Horizontal)
+        self.wdepth_y.setToolTip("Y depth (XZ view) -- Shift+wheel over that view also steps it.")
+        self.gbl.addWidget(self.wdepth_y, 2, 1, 1, 2)
 
         self.splitter_top.addWidget(self.zyview)
         self.splitter_top.addWidget(self.xyview)
@@ -200,6 +224,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mfile_save_boxloc.triggered.connect(self.menu_file_save_boxloc)
 
         self.wdepth.valueChanged[int].connect(self.event_depth)
+        self.wdepth_y.valueChanged[int].connect(self.event_depth_y)
+        self.wdepth_x.valueChanged[int].connect(self.event_depth_x)
         self.wnlayers.valueChanged[int].connect(self.event_nlayers)
         self.wboxsize.valueChanged.connect(self.event_boxsize)
         self.wboxsize_allsets.toggled.connect(self.event_boxsize_allsets_toggled)
@@ -380,7 +406,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.medit.addAction(self.refresh_action)
 
         self.confirm_selected_action = QtGui.QAction("Confirm Selected", self)
-        self.confirm_selected_action.setToolTip("Send every currently selected particle to Confirmed.")
+        self.confirm_selected_action.setToolTip(
+            "Send every currently selected particle to Confirmed. (Insert key)")
+        # Same idea as Recycle Selected's Delete key below: application-wide,
+        # and naturally inert (via Qt's own disabled-action-shortcut
+        # behavior) whenever nothing is selected.
+        self.confirm_selected_action.setShortcut(QtGui.QKeySequence(Qt.Key_Insert))
+        self.confirm_selected_action.setShortcutContext(Qt.ApplicationShortcut)
         self.confirm_selected_action.triggered.connect(lambda: self.confirm_particles_by_uid(self._selected_uids))
 
         self.recycle_selected_action = QtGui.QAction("Recycle Selected", self)
@@ -463,6 +495,17 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.selection_toolbar.addSeparator()
         self.selection_toolbar.addAction(self.focus_selected_action)
 
+        # Show Only Selected quietly hides every other particle, which can
+        # be confusing to stumble back into later (particles look "gone"
+        # for no visible reason) if you forget it's still on -- pulsing
+        # its own toolbar button for as long as it's checked keeps it from
+        # being a silent, easy-to-forget mode.
+        self._focus_pulse_timer = QtCore.QTimer(self)
+        self._focus_pulse_timer.setInterval(500)  # ms; on+off = a 1-second cycle
+        self._focus_pulse_timer.timeout.connect(self._pulse_focus_button)
+        self._focus_pulse_on = False
+        self.focus_selected_action.toggled.connect(self._update_focus_pulse)
+
         # Show Active Set Only / Show All Sets' QActions are created here
         # (TomoBoxer owns sets_visible and the solo logic), but -- like
         # Toggle Colors above -- the buttons for them live in the particle
@@ -526,6 +569,27 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._escape_shortcut = QtGui.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self)
         self._escape_shortcut.setContext(Qt.ApplicationShortcut)
         self._escape_shortcut.activated.connect(self._global_escape)
+
+        # -- customizable keyboard shortcuts (Settings > Customize Keyboard
+        # Shortcuts...) -- registered here, now that every action/shortcut
+        # below has its own built-in default already set, so that default
+        # can just be read back rather than duplicated a second time.
+        self._shortcut_registry = []
+        self._register_shortcut("undo", "Undo", self.undo_action)
+        self._register_shortcut("redo", "Redo", self.redo_action, multi=True)
+        self._register_shortcut("refresh", "Refresh", self.refresh_action)
+        self._register_shortcut("recycle_selected", "Recycle Selected (send to Recycle Bin)", self.recycle_selected_action)
+        self._register_shortcut("confirm_selected", "Confirm Selected (send to Confirmed)", self.confirm_selected_action)
+        self._register_shortcut("show_only_selected", "Show Only Selected", self.focus_selected_action)
+        self._register_shortcut("tool_pick", "Tool: Pick", self.tool_pick_action)
+        self._register_shortcut("tool_eraser", "Tool: Eraser", self.tool_eraser_action)
+        self._register_shortcut("tool_select", "Tool: Select", self.tool_select_action)
+        self._register_shortcut("shortcuts_reference", "Keyboard Shortcuts Reference (Help menu)", self.mhelp_shortcuts_action)
+        self._register_shortcut("clear_selection", "Clear Selection", self._escape_shortcut)
+        self._apply_shortcut_overrides(shortcuts.load_overrides())
+
+        self.msettings_shortcuts_action = self.msettings.addAction("Customize Keyboard Shortcuts...")
+        self.msettings_shortcuts_action.triggered.connect(self.open_shortcuts_settings)
 
         # -- load data ---------------------------------------------------------
         self.datafilename = datafile
@@ -807,6 +871,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.wdepth.setRange(0, data.nz - 1)
         self.wdepth.setValue(data.nz // 2)
+        self.wdepth_y.setRange(0, data.ny - 1)
+        self.wdepth_y.setValue(data.ny // 2)
+        self.wdepth_x.setRange(0, data.nx - 1)
+        self.wdepth_x.setValue(data.nx // 2)
         self.boxes = []
         self._indices_by_class = {}
         self.curbox = -1
@@ -932,6 +1000,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def event_depth(self):
         if self.z_loc != self.wdepth.value():
             self.z_loc = self.wdepth.value()
+        if self.initialized:
+            self.update_sliceview()
+
+    def event_depth_y(self):
+        if self.y_loc != self.wdepth_y.value():
+            self.y_loc = self.wdepth_y.value()
+        if self.initialized:
+            self.update_sliceview()
+
+    def event_depth_x(self):
+        if self.x_loc != self.wdepth_x.value():
+            self.x_loc = self.wdepth_x.value()
         if self.initialized:
             self.update_sliceview()
 
@@ -1494,6 +1574,26 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def update_coords(self):
         self.wcoords.setText(f"X: {int(self.x_loc)}\tY: {int(self.y_loc)}\tZ: {int(self.z_loc)}")
+        self._sync_depth_sliders()
+
+    def _sync_depth_sliders(self):
+        """Keep all three slice sliders reflecting the actual current
+        position regardless of how it changed -- a slider drag, Shift+
+        wheel over any view, clicking a particle, arrow-key navigation in
+        the gallery, ... all eventually funnel through update_sliceview,
+        which calls update_coords (and so this) at the end. Signals are
+        blocked while syncing since each slider's own valueChanged
+        handler (event_depth/event_depth_y/event_depth_x) is what calls
+        update_sliceview in the first place -- without this, updating a
+        slider here would immediately recurse back into it."""
+        for slider, loc in (
+            (self.wdepth, self.z_loc), (self.wdepth_y, self.y_loc), (self.wdepth_x, self.x_loc),
+        ):
+            value = int(loc)
+            if slider.value() != value:
+                slider.blockSignals(True)
+                slider.setValue(value)
+                slider.blockSignals(False)
 
     # -- per-class index bookkeeping (mouse_down's click hit-test) ----------
     # self._indices_by_class lets that hit-test skip every particle in a
@@ -1894,6 +1994,27 @@ class TomoBoxer(QtWidgets.QMainWindow):
         own scoped update instead, since only the particles whose
         selection actually changed can have a different outcome."""
         self.update_all(reslice=False, only_indices=None)
+
+    def _update_focus_pulse(self, checked):
+        if checked:
+            self._focus_pulse_on = True
+            self._set_focus_button_pulsing(True)
+            self._focus_pulse_timer.start()
+        else:
+            self._focus_pulse_timer.stop()
+            self._set_focus_button_pulsing(False)
+
+    def _pulse_focus_button(self):
+        self._focus_pulse_on = not self._focus_pulse_on
+        self._set_focus_button_pulsing(self._focus_pulse_on)
+
+    def _set_focus_button_pulsing(self, on):
+        widget = self.selection_toolbar.widgetForAction(self.focus_selected_action)
+        if widget is None:
+            return
+        widget.setObjectName("pulsingAttention" if on else "")
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
 
     def _refresh_move_to_combo(self):
         current = self.move_to_combo.currentText()
@@ -2654,6 +2775,49 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._shortcuts_dialog.show()
         self._shortcuts_dialog.raise_()
         self._shortcuts_dialog.activateWindow()
+
+    # -- customizable keyboard shortcuts ---------------------------------
+    def _register_shortcut(self, id_, label, target, multi=False):
+        """target: a QAction (its own default already set via setShortcut/
+        setShortcuts) or a QShortcut (setKey). multi=True is for actions
+        like Redo that can carry more than one QKeySequence at once (see
+        the platform-native-Redo-key handling above) -- customizing it
+        here always narrows it down to the single sequence the user
+        picks, replacing whatever list it started with."""
+        if isinstance(target, QtGui.QShortcut):
+            get, set_ = target.key, target.setKey
+        elif multi:
+            def get(t=target):
+                seqs = t.shortcuts()
+                return seqs[0] if seqs else QtGui.QKeySequence()
+
+            def set_(seq, t=target):
+                t.setShortcuts([] if seq.isEmpty() else [seq])
+        else:
+            get, set_ = target.shortcut, target.setShortcut
+        self._shortcut_registry.append({
+            "id": id_, "label": label, "get": get, "set": set_,
+            "default": QtGui.QKeySequence(get()),
+        })
+
+    def _apply_shortcut_overrides(self, overrides):
+        for entry in self._shortcut_registry:
+            text = overrides.get(entry["id"])
+            if text:
+                entry["set"](QtGui.QKeySequence(text))
+
+    def open_shortcuts_settings(self):
+        dlg = KeyboardShortcutsDialog(self._shortcut_registry, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        new_values = dlg.values()
+        overrides = {}
+        for entry in self._shortcut_registry:
+            seq = new_values[entry["id"]]
+            entry["set"](seq)
+            if seq.toString() != entry["default"].toString():
+                overrides[entry["id"]] = seq.toString()
+        shortcuts.save_overrides(overrides)
 
     # -- keyboard -----------------------------------------------------------
     def key_press(self, event):

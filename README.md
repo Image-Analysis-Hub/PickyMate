@@ -226,6 +226,7 @@ The **File** menu offers:
 | Multi-select toggle | Ctrl + click (gallery or tomogram view) |
 | Multi-select range | Alt + click (gallery) |
 | Send every selected particle to Recycle Bin | Delete |
+| Send every selected particle to Confirmed | Insert |
 | Navigate to the neighboring particle | Arrow keys (gallery) |
 | Shape-select (rectangle/circle) | Click + drag, Select tool active |
 | Shape-select (freeform) | Click to place points, Select tool active |
@@ -238,3 +239,15 @@ The **File** menu offers:
 | Undo | Ctrl+Z |
 | Redo | Ctrl+Y, Ctrl+Shift+Z, or your platform's native Redo key |
 | Open this reference | F1 |
+
+## Settings
+
+**Settings > Customize Keyboard Shortcuts...** lets you rebind most of the
+shortcuts above: click a shortcut field and press the new key combination,
+"Reset" restores one row's default, "Restore All Defaults" resets
+everything. Two shortcuts assigned to the same key are flagged (only one of
+them would actually respond), but you can still save anyway. This is
+entirely optional -- nothing is written to disk until you actually change a
+shortcut, and it lives in `~/.config/pickymate/shortcuts.json` (or
+`$XDG_CONFIG_HOME/pickymate/shortcuts.json`), separate from any tomogram's
+own picks.

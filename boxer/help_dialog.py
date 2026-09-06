@@ -29,6 +29,7 @@ _SHORTCUTS = [
     ("Multi-select toggle", "Ctrl + click (gallery or tomogram view)"),
     ("Multi-select range", "Alt + click (gallery)"),
     ("Send every selected particle to Recycle Bin", "Delete"),
+    ("Send every selected particle to Confirmed", "Insert"),
     ("Navigate to the neighboring particle", "Arrow keys (gallery)"),
     ("Shape-select (rectangle/circle)", "Click + drag, Select tool active"),
     ("Shape-select (freeform)", "Click to place points, Select tool active"),
@@ -99,6 +100,10 @@ _NOTES = [
     "re-derive and redraw -- regenerating every gallery thumbnail from "
     "the volume and fully re-slicing the tomogram views -- in case "
     "rendering ever visibly gets stuck. Not needed for normal use.",
+    "Most of the shortcuts above can be rebound from Settings > Customize "
+    "Keyboard Shortcuts... -- optional, and stored in "
+    "~/.config/pickymate/shortcuts.json (only ever created once you "
+    "actually change one).",
 ]
 
 
