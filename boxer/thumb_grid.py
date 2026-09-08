@@ -986,8 +986,14 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.compute_distance_negative_combo.currentIndexChanged.connect(
             self._update_compute_distance_state)
         controls_row.addWidget(self.compute_distance_negative_combo)
+        # Populated from whatever embedding spaces are actually attached
+        # (see _refresh_compute_distance_controls) rather than hardcoded --
+        # several methods can be attached at once and each contributes its
+        # full embedding and its UMAP as separately rankable spaces.
         self.compute_distance_space_combo = QtWidgets.QComboBox()
-        self.compute_distance_space_combo.addItem("Full embedding (1024-d)", "full")
+        self.compute_distance_space_combo.setToolTip(
+            "Which embedding to measure distances in. Every attached method "
+            "contributes its full embedding and, when one was given, its UMAP.")
         controls_row.addWidget(self.compute_distance_space_combo)
         self.compute_distance_loo_check = QtWidgets.QCheckBox("Leave-One-Out")
         controls_row.addWidget(self.compute_distance_loo_check)
@@ -1354,13 +1360,20 @@ class ParticleListPanel(QtWidgets.QWidget):
         negative_combo.setCurrentIndex(idx if idx >= 0 else 0)
         negative_combo.blockSignals(False)
 
+        # One entry per attached space, so several methods can be compared
+        # from the same dropdown ("CryoSIAM - full (1024-d)", "TomoTwin -
+        # UMAP (2-d)", ...). Rebuilt wholesale rather than patched item by
+        # item, since attaching a method adds two at once; the current
+        # choice is preserved when it's still available.
         space_combo = self.compute_distance_space_combo
-        has_umap = target.embeddings_umap is not None
-        has_umap_item = space_combo.findData("umap") >= 0
-        if has_umap and not has_umap_item:
-            space_combo.addItem("UMAP (2-d)", "umap")
-        elif not has_umap and has_umap_item:
-            space_combo.removeItem(space_combo.findData("umap"))
+        previous_space = space_combo.currentData()
+        space_combo.blockSignals(True)
+        space_combo.clear()
+        for name, entry in target.embedding_spaces.items():
+            space_combo.addItem(entry["label"], name)
+        idx = space_combo.findData(previous_space) if previous_space else -1
+        space_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        space_combo.blockSignals(False)
 
         self._update_compute_distance_state()
 
@@ -1369,8 +1382,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         cid = self._active_classid()
         self.compute_distance_target_label.setText(
             target.sets[cid] if target is not None and cid is not None else "—")
-        has_embeddings = target is not None and (
-            target.embeddings_full is not None or target.embeddings_umap is not None)
+        has_embeddings = target is not None and bool(target.embedding_spaces)
         reference_cid = self.compute_distance_reference_combo.currentData()
         negative_cid = self.compute_distance_negative_combo.currentData()
         conflict = negative_cid is not None and negative_cid == reference_cid

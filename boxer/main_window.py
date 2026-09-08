@@ -23,6 +23,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
+from . import embeddings_io
 from .embeddings_wizard import EmbeddingsImportDialog
 from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
@@ -81,6 +82,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mfile.addSeparator()
         self.mfile_read_boxloc = self.mfile.addAction("Import Particle List...")
         self.mfile_import_with_embeddings = self.mfile.addAction("Import Particle List with Embeddings...")
+        self.mfile_attach_embeddings = self.mfile.addAction("Attach Embeddings to Current Particles...")
+        self.mfile_attach_embeddings.setToolTip(
+            "Add another method's embeddings to the particles already imported, so the "
+            "same picks can be ranked by each method and compared.")
         self.mfile_save_boxloc = self.mfile.addAction("Export Particle Coordinates...")
         self.mfile.addSeparator()
         self.load_companion_action = QtGui.QAction("Load Companion Volume...", self)
@@ -229,6 +234,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mfile_save_all.triggered.connect(self.menu_file_save_all)
         self.mfile_read_boxloc.triggered.connect(self.menu_file_read_boxloc)
         self.mfile_import_with_embeddings.triggered.connect(self.menu_file_import_with_embeddings)
+        self.mfile_attach_embeddings.triggered.connect(self.menu_file_attach_embeddings)
         self.mfile_save_boxloc.triggered.connect(self.menu_file_save_boxloc)
 
         self.wdepth.valueChanged[int].connect(self.event_depth)
@@ -663,20 +669,27 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # some already-imported particles still carry an embedding_row --
         # a fresh --embedded_particle_list import below (if given) simply
         # replaces this.
-        self.embeddings_full = None
-        self.embeddings_umap = None
-        saved_embeddings = metadata.load_embeddings_settings(self.picksdir)
-        if saved_embeddings is not None:
+        # name -> {"array", "method", "kind", "n", "path", "label"}. Several
+        # methods can be attached at once (CryoSIAM and TomoTwin over the
+        # same picks, say) and each contributes its full embedding and, if
+        # given, its UMAP as separate rankable spaces -- so the ranking
+        # dropdown can offer "CryoSIAM - full (1024-d)" alongside
+        # "TomoTwin - UMAP (2-d)" and they can be compared directly.
+        # Insertion order is the order they were attached, which is the
+        # order the dropdown shows.
+        self.embedding_spaces = {}
+        self.last_import_notes = []
+        for saved in metadata.load_embeddings_settings(self.picksdir):
             try:
-                full = metadata.load_embeddings_h5(saved_embeddings["h5"])
-                n = saved_embeddings["n"]
-                if full.shape[0] != n and full.shape[1] == n:
-                    full = full.T
-                self.embeddings_full = full
-                if saved_embeddings["umap"]:
-                    self.embeddings_umap = metadata.load_embeddings_umap(saved_embeddings["umap"])["xy"]
+                if saved["kind"] == "umap":
+                    array = embeddings_io.load_umap(saved["method"], saved["path"])["umap_xy"]
+                else:
+                    array = embeddings_io.load_embeddings(
+                        saved["method"], saved["path"], n_expected=saved["n"])["embeddings"]
+                self._register_embedding_space(
+                    saved["method"], saved["kind"], array, saved["path"])
             except (OSError, ValueError) as e:
-                print(f"warning: could not reload the previously-attached embeddings: {e}")
+                print(f"warning: could not reload the {saved['name']!r} embeddings: {e}")
 
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle(f"PickyMate — Particle List — {metadata.base_name(datafile)}")
@@ -814,20 +827,32 @@ class TomoBoxer(QtWidgets.QMainWindow):
             unique_name, count = result
             print(f"Imported {count} particle(s) from {lp!r} into new set \"{unique_name}\"")
 
-        # --embedded_particle_list (+ --embeddings_h5, --embeddings_umap):
-        # the one list that has a matched embeddings bundle -- see
+        # --cryosiam_embeddings / --tomotwin_embeddings (+ their own umap
+        # flags, and --embedded_particle_list): the one list that has a
+        # matched embeddings bundle -- see
         # import_particle_list_with_embeddings for the validation. Any
         # failure here is a warning, not a fatal error: the launch still
         # proceeds, just without that bundle attached.
+        # More than one method can be given at once: the first creates the
+        # set, and each one after it attaches to those same particles, so
+        # the ranking dropdown ends up offering every method's spaces side
+        # by side over one set of picks.
         embedded_list = getattr(options, "embedded_particle_list", None)
-        if embedded_list:
+        for i, (method, emb_path, umap_path) in enumerate(self._embedding_flags(options)):
             try:
-                unique_name, count = self.import_particle_list_with_embeddings(
-                    embedded_list, options.embeddings_h5, getattr(options, "embeddings_umap", None), live=False)
-                print(f"Imported {count} particle(s) from {embedded_list!r} into new set "
-                      f"\"{unique_name}\", with embeddings attached")
+                if i == 0:
+                    unique_name, count = self.import_particle_list_with_embeddings(
+                        embedded_list, emb_path, umap_path, live=False, method=method)
+                    print(f"Imported {count} particle(s) into new set \"{unique_name}\", "
+                          f"with {method} embeddings attached")
+                else:
+                    added = self.attach_embeddings(method, emb_path, umap_path)
+                    print(f"Attached {method} embeddings to the same particles "
+                          f"({', '.join(added)})")
+                for note in self.last_import_notes:
+                    print(f"note: {note}")
             except (ValueError, OSError) as e:
-                print(f"warning: could not import {embedded_list!r} with embeddings: {e}")
+                print(f"warning: could not load {method} embeddings from {emb_path!r}: {e}")
 
         if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
             self.new_set("particles_00")
@@ -1327,75 +1352,228 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         return unique_name, len(coords)
 
-    def import_particle_list_with_embeddings(self, coord_path, h5_path, umap_path=None, live=True):
+    @staticmethod
+    def _embedding_flags(options):
+        """[(method, embeddings_path, umap_path), ...] for every method
+        named on the command line, in the order embeddings_io lists them.
+        Several can be given at once -- attaching CryoSIAM and TomoTwin
+        over the same picks is exactly how you compare them.
+
+        Each method has its own pair of flags rather than one generic
+        --embeddings, because the file formats are genuinely different
+        and naming the method is clearer than having the app guess from
+        an extension (see embeddings_io)."""
+        found = []
+        for method in embeddings_io.METHODS:
+            path = getattr(options, f"{method}_embeddings", None)
+            if path:
+                found.append((method, path, getattr(options, f"{method}_umap", None)))
+        return found
+
+    def _register_embedding_space(self, method, kind, array, path):
+        """Add one rankable space to self.embedding_spaces, keyed and
+        labelled by method and kind so several methods coexist."""
+        name = embeddings_io.space_key(method, kind)
+        self.embedding_spaces[name] = {
+            "array": array,
+            "method": method,
+            "kind": kind,
+            "n": len(array),
+            "path": path,
+            "label": embeddings_io.space_label(method, kind, array.shape[1]),
+        }
+        return name
+
+    def _save_embedding_spaces(self):
+        metadata.save_embeddings_settings(self.picksdir, [
+            {"name": name, "method": s["method"], "kind": s["kind"],
+             "n": s["n"], "path": s["path"]}
+            for name, s in self.embedding_spaces.items()
+        ])
+
+    def _embedded_row_coordinates(self):
+        """(n, (n,3) coordinates by embedding_row) for the particles that
+        already carry an embedding row, or (0, None) if none do. This is
+        what a newly attached method has to agree with: rows are shared
+        across every attached space, so a second method's file has to
+        describe the same particles, in the same row order, as the first
+        one did."""
+        embedded = [(b[7], b) for b in self.boxes if b[7] is not None]
+        if not embedded:
+            return 0, None
+        n = max(row for row, _ in embedded) + 1
+        coords = np.full((n, 3), np.nan, dtype=np.float64)
+        for row, box in embedded:
+            coords[row] = (box[0], box[1], box[2])
+        return n, coords
+
+    def attach_embeddings(self, method, embeddings_path, umap_path=None):
+        """Attach another method's embeddings to particles that are
+        already imported, rather than importing a new set -- this is what
+        makes "rank the same picks by CryoSIAM and by TomoTwin, and
+        compare" possible.
+
+        The new files must describe the same particles, in the same row
+        order, as whatever is already attached: same count, and matching
+        coordinates wherever the file records its own. A mismatch raises
+        rather than silently pairing each particle with some other
+        particle's embedding.
+
+        Adds up to two spaces (the full embedding, and the UMAP if given)
+        and returns their names. Notes land in self.last_import_notes."""
+        self.last_import_notes = []
+        n, row_coords = self._embedded_row_coordinates()
+        if not n:
+            raise ValueError(
+                "No particles here carry an embedding row yet, so there's nothing to "
+                "attach to -- import a particle list with embeddings first.")
+
+        bundle = embeddings_io.load_embeddings(method, embeddings_path, n_expected=n)
+        if len(bundle["embeddings"]) != n:
+            raise ValueError(
+                f"{embeddings_path!r} holds {len(bundle['embeddings'])} particle(s), but "
+                f"{n} particle(s) here already carry an embedding row.")
+        self._check_against_rows(bundle.get("coords_xyz"), row_coords, embeddings_path)
+        self._note_volume_shape(bundle.get("volume_shape_zyx"))
+
+        added = [self._register_embedding_space(
+            method, "embeddings", bundle["embeddings"], embeddings_path)]
+
+        if umap_path:
+            umap_data = embeddings_io.load_umap(method, umap_path)
+            if len(umap_data["umap_xy"]) != n:
+                raise ValueError(
+                    f"{umap_path!r} has {len(umap_data['umap_xy'])} row(s), but "
+                    f"{n} particle(s) here carry an embedding row.")
+            self._check_against_rows(umap_data.get("coords_xyz"), row_coords, umap_path)
+            added.append(self._register_embedding_space(
+                method, "umap", umap_data["umap_xy"], umap_path))
+
+        self._save_embedding_spaces()
+        return added
+
+    @staticmethod
+    def _check_against_rows(own_coords, row_coords, path):
+        """Raise if a file's own recorded coordinates disagree with the
+        particles already sitting at those embedding rows. Rows with no
+        particle (nan) are skipped -- a particle can be deleted after
+        import without invalidating everyone else's row."""
+        if own_coords is None or row_coords is None:
+            return
+        known = ~np.isnan(row_coords[:, 0])
+        if not known.any():
+            return
+        if not np.allclose(own_coords[known], row_coords[known], atol=1.0):
+            raise ValueError(
+                f"{path!r}'s own recorded coordinates don't match the particles "
+                f"already here, row for row -- it doesn't appear to describe the "
+                f"same picks in the same order.")
+
+    def _note_volume_shape(self, shape):
+        """TomoTwin records the shape of the tomogram it was computed on.
+        A mismatch against the volume actually open is the signature of
+        embeddings computed at a different binning, which would make
+        every ranking meaningless -- but it's the user's call, not a
+        reason to refuse, so it's reported rather than raised."""
+        if not shape or self.data is None:
+            return
+        actual = (self.data.nz, self.data.ny, self.data.nx)
+        if tuple(shape) != actual:
+            self.last_import_notes.append(
+                f"These embeddings were computed on a {shape[2]}x{shape[1]}x{shape[0]} "
+                f"tomogram, but the one open is {actual[2]}x{actual[1]}x{actual[0]}. "
+                f"If that's a different binning, the rankings won't mean anything.")
+
+    def import_particle_list_with_embeddings(self, coord_path, embeddings_path, umap_path=None,
+                                              live=True, method="cryosiam"):
         """Like import_particle_list, but also attaches a matched
         embeddings bundle: assigns embedding_row = 0..N-1 positionally
-        (matching the coordinate file's own line order, which must be the
-        same order the embeddings file's rows/columns are in) and keeps
-        the embeddings arrays in memory (self.embeddings_full /
-        self.embeddings_umap) for the Mahalanobis-distance feature.
-        Attaching a new bundle here replaces whatever was attached before
-        -- there's only ever one active at a time (see
-        metadata.save_embeddings_settings).
+        (matching the row order shared by the coordinate file and the
+        embeddings file) and keeps the arrays in memory
+        (self.embeddings_full / self.embeddings_umap) for the
+        Mahalanobis-distance feature. Attaching a new bundle replaces
+        whatever was attached before -- there's only ever one active at a
+        time (see metadata.save_embeddings_settings).
 
-        Validated before anything is committed: the embeddings file's
-        particle count must exactly match the coordinate file's, and --
-        when a UMAP CSV is also given, which carries the original x,y,z
-        each embedding was computed at -- those coordinates must match
-        the coordinate file's own, particle for particle (accounting for
-        the UMAP file's own centroid-0/1/2 being z,y,x, not x,y,z). A
-        mismatch on either check raises rather than silently importing
-        with a wrong association -- there'd be no way to detect that
-        after the fact, and it would quietly corrupt every distance
+        `method` selects the reader (see embeddings_io). It also decides
+        whether coord_path is required: CryoSIAM's .h5 carries no
+        coordinates so a particle list is mandatory, while TomoTwin's
+        .temb carries its own X/Y/Z and can be imported alone. Passing a
+        particle list anyway is still worthwhile for TomoTwin -- the two
+        are then cross-checked against each other.
+
+        This creates the set. To add a *second* method's embeddings to
+        the particles it created -- which is how one set gets ranked by
+        CryoSIAM and by TomoTwin and the two compared -- use
+        attach_embeddings instead.
+
+        Everything is validated before anything is committed: particle
+        counts must match exactly across every file given, and wherever a
+        file records its own coordinates those must agree with the
+        particle list's, particle for particle. A mismatch raises rather
+        than importing a wrong association -- there'd be no way to detect
+        that afterwards, and it would quietly corrupt every distance
         computed against these particles.
 
-        Returns (unique_name, count) on success. Raises ValueError (with
-        a message meant to be shown to the user directly, not just
-        logged) on validation failure -- nothing is imported or attached
-        when this raises. Callers decide how to surface that: a
-        QMessageBox for the GUI wizard, a printed warning for the CLI
-        flags."""
-        coords = metadata.load_particle_list(coord_path)
-        if not coords:
-            raise ValueError(f"No coordinates found in {coord_path!r}.")
-        n = len(coords)
+        Returns (unique_name, count). Non-fatal observations (e.g. the
+        embeddings were computed on a differently-shaped tomogram than
+        the one open) land in self.last_import_notes for the caller to
+        show. Raises ValueError -- message meant to be shown to the user
+        directly -- on any validation failure."""
+        self.last_import_notes = []
 
-        full = metadata.load_embeddings_h5(h5_path)
-        if full.shape[0] == n:
-            pass
-        elif full.shape[1] == n:
-            full = full.T
+        coords = None
+        if coord_path:
+            coords = metadata.load_particle_list(coord_path)
+            if not coords:
+                raise ValueError(f"No coordinates found in {coord_path!r}.")
+
+        bundle = embeddings_io.load_embeddings(
+            method, embeddings_path, n_expected=len(coords) if coords else None)
+        full = bundle["embeddings"]
+        n = len(full)
+
+        own_coords = bundle["coords_xyz"]
+        if coords is None:
+            if own_coords is None:
+                raise ValueError(
+                    f"{embeddings_path!r} carries no coordinates, so a particle list "
+                    f"is needed to import it.")
+            coords = [tuple(row) for row in own_coords]
+            name_source = embeddings_path
         else:
+            name_source = coord_path
+
+        if len(coords) != n:
             raise ValueError(
-                f"Embeddings in {h5_path!r} have shape {full.shape}, which doesn't "
-                f"match the {n} particle(s) in {coord_path!r} on either axis.")
+                f"{embeddings_path!r} holds {n} particle(s) but "
+                f"{coord_path!r} has {len(coords)}.")
+
+        listed = np.asarray(coords, dtype=np.float64)
+        self._check_against_rows(own_coords if coord_path else None, listed, embeddings_path)
+        self._note_volume_shape(bundle.get("volume_shape_zyx"))
 
         umap_xy = None
         if umap_path:
-            umap_data = metadata.load_embeddings_umap(umap_path)
-            if len(umap_data["xy"]) != n:
+            umap_data = embeddings_io.load_umap(method, umap_path)
+            if len(umap_data["umap_xy"]) != n:
                 raise ValueError(
-                    f"{umap_path!r} has {len(umap_data['xy'])} row(s), but "
-                    f"{coord_path!r} has {n} particle(s).")
-            own = np.array(coords, dtype=np.float64)
-            if not np.allclose(umap_data["centroid_xyz"], own, atol=1.0):
-                raise ValueError(
-                    f"{umap_path!r}'s own recorded coordinates (its centroid-0/1/2 "
-                    f"columns, read as z,y,x) don't match {coord_path!r}'s x,y,z -- "
-                    f"these files don't appear to describe the same particles in the "
-                    f"same order.")
-            umap_xy = umap_data["xy"]
+                    f"{umap_path!r} has {len(umap_data['umap_xy'])} row(s), but "
+                    f"{embeddings_path!r} has {n} particle(s).")
+            self._check_against_rows(umap_data.get("coords_xyz"), listed, umap_path)
+            umap_xy = umap_data["umap_xy"]
 
         unique_name, count = self._commit_new_set_import(
-            metadata.base_name(coord_path), coords, list(range(n)), live)
+            metadata.base_name(name_source), coords, list(range(n)), live)
 
-        self.embeddings_full = full
-        self.embeddings_umap = umap_xy
-        metadata.save_embeddings_settings(self.picksdir, h5_path, n, umap_path)
+        self._register_embedding_space(method, "embeddings", full, embeddings_path)
+        if umap_xy is not None:
+            self._register_embedding_space(method, "umap", umap_xy, umap_path)
+        self._save_embedding_spaces()
         return unique_name, count
 
     # -- Mahalanobis distance -------------------------------------------------
-    def compute_mahalanobis(self, reference_classid, target_classid, space="full",
+    def compute_mahalanobis(self, reference_classid, target_classid, space=None,
                              leave_one_out=False, negative_classid=None):
         """Score every embedded particle in target_classid by its
         Mahalanobis distance to reference_classid's embedding
@@ -1419,10 +1597,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         _mahalanobis_distribution), so a real determinant is zero. Both
         terms use the same space and leave_one_out setting.
 
-        space: "full" (the 1024-d embedding) or "umap" (the 2D UMAP
-        reduction) -- both are attached per particle at import time (see
-        import_particle_list_with_embeddings); this only picks which one
-        to read here.
+        space: the name of one attached embedding space (see
+        self.embedding_spaces / embeddings_io.space_key) -- e.g.
+        "cryosiam", "cryosiam_umap", "tomotwin", "tomotwin_umap". Several
+        methods can be attached at once, so this is what picks which one
+        to measure in; None means the first attached.
 
         leave_one_out: applied independently to whichever term(s) --
         reference, negative, or both -- actually equal target_classid
@@ -1446,17 +1625,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         reference_classid (the score would be zero for every particle)."""
         if negative_classid is not None and negative_classid == reference_classid:
             raise ValueError("The \"far from\" set can't be the same as the \"close to\" set.")
-        if space == "full":
-            array = self.embeddings_full
-        elif space == "umap":
-            array = self.embeddings_umap
-        else:
-            raise ValueError(f"unrecognized embedding space {space!r}")
-        if array is None:
-            raise ValueError(
-                "No embeddings loaded for this space -- import a particle list with an "
-                "embeddings bundle attached first (File > Import Particle List with "
-                "Embeddings...).")
+        if space is None and self.embedding_spaces:
+            space = next(iter(self.embedding_spaces))
+        entry = self.embedding_spaces.get(space)
+        if entry is None:
+            known = ", ".join(self.embedding_spaces) or "none attached"
+            raise ValueError(f"unrecognized embedding space {space!r} (have: {known})")
+        array = entry["array"]
 
         target_rows = self._mahalanobis_rows_of(target_classid)
         target_total = sum(1 for b in self.boxes if b[5] == target_classid)
@@ -1564,21 +1739,54 @@ class TomoBoxer(QtWidgets.QMainWindow):
         dlg = EmbeddingsImportDialog(self)
         if dlg.exec() != QtWidgets.QDialog.Accepted:
             return
-        coord_path, h5_path, umap_path = dlg.values()
-        if not coord_path or not h5_path:
+        method, coord_path, emb_path, umap_path = dlg.values()
+        if not emb_path:
             QtWidgets.QMessageBox.information(
                 self, "Import Particle List with Embeddings",
-                "A particle list and an embeddings (.h5) file are both required.")
+                "An embeddings file is required.")
+            return
+        if dlg.list_required() and not coord_path:
+            QtWidgets.QMessageBox.information(
+                self, "Import Particle List with Embeddings",
+                "CryoSIAM embeddings carry no coordinates, so a particle list is required too.")
             return
         try:
             unique_name, count = self.import_particle_list_with_embeddings(
-                coord_path, h5_path, umap_path, live=True)
+                coord_path, emb_path, umap_path, live=True, method=method)
         except (ValueError, OSError) as e:
             QtWidgets.QMessageBox.critical(self, "Import Particle List with Embeddings", str(e))
             return
-        QtWidgets.QMessageBox.information(
-            self, "Import Particle List with Embeddings",
-            f"Imported {count} particle(s) into new set \"{unique_name}\", with embeddings attached.")
+        self.boxesviewer.rebuild_tabs(self.sets)
+        msg = (f"Imported {count} particle(s) into new set \"{unique_name}\", "
+               f"with {method} embeddings attached.")
+        for note in self.last_import_notes:
+            msg += f"\n\n{note}"
+        QtWidgets.QMessageBox.information(self, "Import Particle List with Embeddings", msg)
+
+    def menu_file_attach_embeddings(self):
+        """Add another method's embeddings to the particles already
+        imported -- the GUI counterpart of giving two methods' flags on
+        one command line. Creates no set: the rows are already fixed by
+        whatever import first attached embeddings here."""
+        title = "Attach Embeddings to Current Particles"
+        dlg = EmbeddingsImportDialog(self, attach=True)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        method, _coord_path, emb_path, umap_path = dlg.values()
+        if not emb_path:
+            QtWidgets.QMessageBox.information(self, title, "An embeddings file is required.")
+            return
+        try:
+            added = self.attach_embeddings(method, emb_path, umap_path)
+        except (ValueError, OSError) as e:
+            QtWidgets.QMessageBox.critical(self, title, str(e))
+            return
+        self.boxesviewer.rebuild_tabs(self.sets)
+        msg = ("Attached " + ", ".join(self.embedding_spaces[a]["label"] for a in added)
+               + ".\n\nPick which one to rank in from the dropdown next to \"Rank\".")
+        for note in self.last_import_notes:
+            msg += f"\n\n{note}"
+        QtWidgets.QMessageBox.information(self, title, msg)
 
     def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out, negative_classid=None):
         """Triggered by the particle list's own inline "Rank by Embedding Distance"

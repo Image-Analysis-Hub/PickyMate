@@ -347,47 +347,73 @@ def embeddings_settings_path(pdir: str) -> str:
     return os.path.join(pdir, EMBEDDINGS_SETTINGS_FILENAME)
 
 
-def save_embeddings_settings(pdir: str, h5_path: str, n: int, umap_path: str = None) -> None:
-    """Record which embeddings bundle is attached to this working
-    directory (absolute paths, so they still resolve regardless of the
-    current directory at reload time) -- one bundle per directory,
-    matching the "only one embedding [source]" design -- so a later
-    launch can auto-reload it without repeating the CLI flags or
-    re-running the import wizard. n is the particle count the bundle was
-    attached with, needed on reload to normalize the .h5 array's
-    (particle, feature) vs. (feature, particle) orientation the same way
-    the original import did -- there's no coordinate file being imported
-    at reload time to re-derive it from."""
+def save_embeddings_settings(pdir: str, spaces) -> None:
+    """Record every embedding space attached to this working directory so
+    a later launch reloads them all without repeating the CLI flags or
+    re-running the import wizard.
+
+    spaces: iterable of dicts with "name" (what the ranking dropdown
+    calls it), "method" (which reader in embeddings_io), "kind"
+    ("embeddings" or "umap"), "n" (the particle count it was attached
+    with) and "path". Written one "space" line each, path last so a path
+    containing spaces still round-trips.
+
+    n is stored because a CryoSIAM .h5 gives no way to tell its
+    (particle, feature) orientation from the file alone -- at reload
+    there's no coordinate file being imported to re-derive it from.
+    method is stored rather than guessed from the extension so a renamed
+    file still reloads correctly."""
     os.makedirs(pdir, exist_ok=True)
     with open(embeddings_settings_path(pdir), "w") as out:
-        out.write(f"h5 {os.path.abspath(h5_path)}\n")
-        out.write(f"n {n}\n")
-        if umap_path:
-            out.write(f"umap {os.path.abspath(umap_path)}\n")
+        for s in spaces:
+            out.write(f"space {s['name']} {s['method']} {s['kind']} "
+                      f"{int(s['n'])} {os.path.abspath(s['path'])}\n")
 
 
 def load_embeddings_settings(pdir: str):
-    """{"h5": path, "umap": path or None, "n": int}, or None if nothing's
-    attached -- including when the recorded file(s) have since been moved
-    or deleted, or the record predates this field being tracked, which
-    the caller should treat as "nothing to auto-load" rather than an
-    error at startup."""
+    """[{"name", "method", "kind", "n", "path"}, ...] for every attached
+    space whose file still exists, or [] if nothing's attached. A space
+    whose file has since been moved or deleted is dropped silently --
+    the caller should treat that as "nothing to auto-load" rather than
+    an error at startup.
+
+    Files written before more than one bundle could be attached used
+    separate "method"/"embeddings"/"n"/"umap" keys (and, earlier still,
+    "h5" with no method at all, which meant CryoSIAM since that was the
+    only reader). Both older shapes are converted to spaces here."""
     path = embeddings_settings_path(pdir)
     if not os.path.isfile(path):
-        return None
-    result = {"h5": None, "umap": None, "n": None}
+        return []
+
+    spaces = []
+    legacy = {"embeddings": None, "umap": None, "n": None, "method": None}
     with open(path) as f:
         for line in f:
-            parts = line.split(None, 1)
-            if len(parts) == 2 and parts[0] in result:
-                result[parts[0]] = parts[1].strip()
-    if result["n"] is not None:
+            parts = line.split(None, 5)
+            if len(parts) == 6 and parts[0] == "space":
+                _, name, method, kind, n, file_path = parts
+                try:
+                    spaces.append({"name": name, "method": method, "kind": kind,
+                                   "n": int(n), "path": file_path.strip()})
+                except ValueError:
+                    continue
+            elif len(parts) >= 2:
+                key, value = parts[0], " ".join(parts[1:]).strip()
+                if key == "h5":  # oldest format, pre-method
+                    legacy["embeddings"] = value
+                elif key in legacy:
+                    legacy[key] = value
+
+    if not spaces and legacy["embeddings"]:
+        method = legacy["method"] or "cryosiam"
         try:
-            result["n"] = int(result["n"])
-        except ValueError:
-            result["n"] = None
-    if not result["h5"] or not os.path.isfile(result["h5"]) or result["n"] is None:
-        return None
-    if result["umap"] and not os.path.isfile(result["umap"]):
-        result["umap"] = None
-    return result
+            n = int(legacy["n"])
+        except (TypeError, ValueError):
+            return []
+        spaces.append({"name": method, "method": method, "kind": "embeddings",
+                       "n": n, "path": legacy["embeddings"]})
+        if legacy["umap"]:
+            spaces.append({"name": f"{method}_umap", "method": method, "kind": "umap",
+                           "n": n, "path": legacy["umap"]})
+
+    return [s for s in spaces if os.path.isfile(s["path"])]
