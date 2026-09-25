@@ -76,6 +76,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.session = self.session_controller.session if self.session_controller else None
         self.session_name = metadata.base_name(datafile)
         self._switching = False
+        # uids of the particles last selected on the UMAP map (umap_view),
+        # saved to "UMAP Selection.csv" in the working directory; shown as
+        # the particle list's "UMAP Selection" tab while non-empty
+        self.umap_selection = set()
+        self._umap_saved = None      # the uids last written to the selection file
+        self.umap_window = None
+        self._last_tab_was_umap = False
         self.boxshape = "circle" if options.mode == "3D" else "rect"
         self.setWindowTitle(f"PickyMate — {metadata.base_name(datafile)}")
 
@@ -561,6 +568,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.toggle_companion_action.toggled.connect(self._on_toggle_companion)
 
         self.mview.addAction(self.toggle_companion_action)
+        self.umap_action = QtGui.QAction("UMAP Map...", self)
+        self.umap_action.setToolTip(
+            "Open the UMAP map of this tomogram's particles, coloured by set, and "
+            "lasso-select particles on it into the \"UMAP Selection\" tab.")
+        self.umap_action.triggered.connect(self.open_umap_window)
+        self.mview.addAction(self.umap_action)
         self.mview.addSeparator()
         self.mview.addAction(self.toggle_colors_action)
         self.mview.addSeparator()
@@ -912,6 +925,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if options.clean:
             self.tool_eraser_action.setChecked(True)
             self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
+
+        self._load_umap_selection()
 
         for i in range(len(self.boxes)):
             self.update_box(i)
@@ -1984,6 +1999,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 for b in self.boxes if b[5] == clsid
             ]
             metadata.save_class_records(self.picksdir, name, records)
+        # A deleted particle must drop out of the selection file (its uid
+        # stays in umap_selection, so undoing the delete brings it back).
+        # Rewritten only when the particles it lists would change: moving
+        # a particle between sets -- most edits -- leaves it as it is, and
+        # rewriting a large selection on every click cost ~60 ms each.
+        if self.umap_selection or self._umap_saved:
+            present = frozenset(b[6] for b in self.boxes if b[6] in self.umap_selection)
+            if present != self._umap_saved:
+                self._save_umap_selection()
         if only is None:
             settings_by_name = {
                 self.sets[k]: {"boxsize": self.boxsize[k], "color": categories.manual_color_hex(k)}
@@ -2051,6 +2075,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # a bookkeeping gap fails open rather than hiding things wrongly.
         # Computed once here rather than per-box.
         focus_active = self.focus_selected_action.isChecked()
+        # Show Active Set Only while the UMAP Selection tab is on screen:
+        # only the selected particles, whichever sets they are in
+        umap_solo = not focus_active and self._umap_solo_active()
+        umap_selection = self.umap_selection
 
         for ax in axis:
             ia, view, loc = pms[ax]
@@ -2069,6 +2097,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 if focus_active:
                     class_visible = (b[6] in self._selected_uids
                                       and self._focus_home_class.get(b[6], b[5]) == b[5])
+                elif umap_solo:
+                    class_visible = b[6] in umap_selection
                 else:
                     class_visible = b[5] in self.sets_visible
                 if inplane and class_visible:
@@ -2170,6 +2200,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.focus_selected_action.isChecked():
             return (box[6] in self._selected_uids
                     and self._focus_home_class.get(box[6], box[5]) == box[5])
+        if self._umap_solo_active():
+            return box[6] in self.umap_selection
         return box[5] in self.sets_visible
 
     def inside_box(self, n, x=-1, y=-1, z=-1):
@@ -2638,6 +2670,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         scores = {self.boxes[i][6]: (self.boxes[i][4], self.boxes[i][7] is not None) for i in self.boxids}
         self.boxesviewer.rebuild_tabs(self.sets)
         self.boxesviewer.sync_particles(triples, scores)
+        if self.umap_window is not None and self.umap_window.isVisible():
+            self.umap_window.schedule_refresh()
 
     def refresh_all(self):
         """Force everything to fully re-derive and redraw -- unlike the
@@ -3405,6 +3439,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         you're doing" key, and the one place that selection can actually be
         cleared from, so it's never unreachable regardless of which widget
         focus happens to be sitting on."""
+        win = self.umap_window
+        if win is not None and win.isVisible() and QtWidgets.QApplication.activeWindow() is win:
+            # the map's own selection, not the particle list's: cancel a
+            # lasso in progress, otherwise clear the UMAP selection
+            if not win.canvas.cancel_lasso():
+                self.clear_umap_selection()
+            return
         drawing = self._select_drawing
         if drawing is not None and drawing["kind"] == "freeform":
             self._select_cancel_drawing()
@@ -3452,10 +3493,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         since nothing was listening for exactly that tab change. "All"
         means "show everything" -- the same thing that tab itself
         displays -- since there's no single class to isolate to there."""
+        umap_now = self.boxesviewer.is_umap_selection_active()
+        umap_changed = umap_now != self._last_tab_was_umap
+        self._last_tab_was_umap = umap_now
         if not self.view_only_selected_action.isChecked():
             return
         target = set(self.sets.keys()) if cid is None else {cid}
-        if self.sets_visible == target:
+        if self.sets_visible == target and not umap_changed:
             return
         self.sets_visible = target
         self.boxesviewer.refresh_visibility_checkboxes()
@@ -3487,6 +3531,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if not self._switching:
             print("Exiting")
         self.save_picks()
+        if self.umap_window is not None:
+            self.umap_window.close()
         self.boxesviewer.close()
         try:
             self.xyview.close()
@@ -3499,6 +3545,74 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # closes them too but must leave the session running.
         if self.session_controller is not None and not self._switching:
             self.session_controller.tomogram_closed_by_user(self)
+
+    # -- UMAP map and its selection ----------------------------------------------
+    def open_umap_window(self):
+        from .umap_view import UmapWindow
+        if self.umap_window is None:
+            self.umap_window = UmapWindow(self)
+        self.umap_window.show()
+        self.umap_window.raise_()
+        self.umap_window.activateWindow()
+
+    def set_umap_selection(self, uids, mode="replace", from_map=False):
+        """mode: "replace" (the lasso's particles become the selection),
+        "add" (Ctrl+lasso), or "toggle" (Ctrl+click adds or removes).
+        Saved straight away, like every other edit. A selection made on the
+        map also brings its tab to the front, since seeing those particles
+        is why you made it."""
+        uids = {int(u) for u in uids}
+        if mode == "add":
+            new = self.umap_selection | uids
+        elif mode == "toggle":
+            new = self.umap_selection ^ uids
+        else:
+            new = uids
+        if new == self.umap_selection:
+            return
+        self.umap_selection = new
+        self._save_umap_selection()
+        if self._umap_solo_active():
+            self.update_all()
+        else:
+            self.update_boximgs()
+        if from_map and new:
+            self.boxesviewer.activate_umap_tab()
+
+    def clear_umap_selection(self):
+        self.set_umap_selection([], "replace")
+
+    def _umap_solo_active(self):
+        # the slice views can be drawn during start-up, before the particle
+        # list (and so any tab) exists
+        viewer = getattr(self, "boxesviewer", None)
+        return (viewer is not None and self.view_only_selected_action.isChecked()
+                and viewer.is_umap_selection_active())
+
+    def _save_umap_selection(self):
+        records = [{"x": b[0], "y": b[1], "z": b[2], "uid": b[6], "embedding_row": b[7], "score": b[4]}
+                   for b in self.boxes if b[6] in self.umap_selection]
+        metadata.save_umap_selection(self.picksdir, records)
+        self._umap_saved = frozenset(r["uid"] for r in records)
+
+    def _load_umap_selection(self):
+        """Match the saved selection back to particles by uid, which is
+        stable across saves and reassignments; fall back to the embedding
+        row for a record whose uid no longer exists (uids are reassigned
+        on load only for duplicates, which should not happen)."""
+        records = metadata.load_umap_selection(self.picksdir)
+        if not records:
+            return
+        uids = {b[6] for b in self.boxes}
+        by_row = {b[7]: b[6] for b in self.boxes if b[7] is not None}
+        selection = set()
+        for r in records:
+            if r["uid"] is not None and r["uid"] in uids:
+                selection.add(r["uid"])
+            elif r["embedding_row"] is not None and r["embedding_row"] in by_row:
+                selection.add(by_row[r["embedding_row"]])
+        self.umap_selection = selection
+        self._umap_saved = frozenset(selection)
 
     def session_windows(self):
         """This tomogram's top-level windows, for the session controller to
@@ -3539,6 +3653,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._do_close_all()
         self.close()
         self._focus_pulse_timer.stop()
+        if self.umap_window is not None:
+            self.umap_window.deleteLater()
+            self.umap_window = None
         self.boxesviewer.dispose()
         self.data = None
         self._volume_slots = {"primary": None, "companion": None}

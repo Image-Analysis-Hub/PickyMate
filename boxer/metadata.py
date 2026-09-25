@@ -210,6 +210,36 @@ def save_class_records(pdir: str, classname: str, records) -> None:
     _write_records_csv(class_file(pdir, classname), records)
 
 
+UMAP_SELECTION_FILENAME = "UMAP Selection.csv"
+
+
+def umap_selection_path(pdir: str) -> str:
+    return os.path.join(pdir, UMAP_SELECTION_FILENAME)
+
+
+def save_umap_selection(pdir: str, records) -> None:
+    """The particles last selected on the UMAP map, in the same rich
+    format as a class file (coordinates, uid, embedding_row, score), so it
+    reloads after a restart and can be read like any pick list. Its
+    extension is .csv, not .txt, on purpose: discover_classes treats every
+    "*.txt" here as a set, and a selection is a view onto particles that
+    stay in their own sets -- it must never become one. An empty selection
+    removes the file rather than leaving an empty one behind."""
+    records = list(records)
+    path = umap_selection_path(pdir)
+    if not records:
+        if os.path.isfile(path):
+            os.remove(path)
+        return
+    os.makedirs(pdir, exist_ok=True)
+    _write_records_csv(path, records)
+
+
+def load_umap_selection(pdir: str) -> list:
+    """Records saved by save_umap_selection, or [] if there are none."""
+    return _parse_particle_file(umap_selection_path(pdir))
+
+
 def archive_recycle_bin(pdir: str, records) -> str:
     """Write a timestamped, hidden backup of the given records -- used
     when "emptying" the Recycle Bin, so that only ever means "out of the

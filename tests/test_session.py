@@ -151,6 +151,9 @@ try:
     # themselves to their contents on first show, which raises its minimum
     # width, so a geometry read before that pass is not what gets saved
     gallery_before = win.boxesviewer.geometry()
+    win.open_umap_window()                      # an open map must go with its tomogram
+    old_map = win.umap_window
+    app.processEvents()
 
     ctl.open("TS_037")
     app.processEvents()
@@ -158,6 +161,7 @@ try:
     import shiboken6
     assert not shiboken6.isValid(win) and not shiboken6.isValid(old_gallery), \
         "the previous tomogram's windows must be deleted, not just hidden"
+    assert not shiboken6.isValid(old_map), "the previous tomogram's UMAP window was left behind"
     # TS_037's working directory defines no colour overrides, so the orange
     # set on TS_026's set 0 must be gone rather than repainting TS_037's
     assert not os.path.isfile(f"{TMP}/TS_037_picks/config.settings")

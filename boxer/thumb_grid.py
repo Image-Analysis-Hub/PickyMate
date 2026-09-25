@@ -939,6 +939,9 @@ class ParticleListPanel(QtWidgets.QWidget):
             self.view_toolbar.addSeparator()
             self.view_toolbar.addAction(target.view_only_selected_action)
             self.view_toolbar.addAction(target.show_all_sets_action)
+            if hasattr(target, "umap_action"):
+                self.view_toolbar.addSeparator()
+                self.view_toolbar.addAction(target.umap_action)
             layout.addWidget(self.view_toolbar)
 
         # Deliberately the loudest thing in this window: computing/sorting
@@ -1092,6 +1095,18 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.grid = ParticleGrid()
         self.tabs.addTab(self.grid, "All")
         self._connect_grid(self.grid)
+
+        # "UMAP Selection": the particles last selected on the UMAP map (see
+        # umap_view). Like "All", a view -- grouped by set, each thumbnail
+        # bordered in its set's colour, nothing moved out of its own set --
+        # so particles can be confirmed or recycled from here and simply
+        # stay, with their new colour. Its tab only exists while there is a
+        # selection, pinned right after "All" so the two views sit together.
+        self.umap_grid = ParticleGrid()
+        self._connect_grid(self.umap_grid)
+        self._pending_umap_entries = None
+        self._syncing = False       # see sync_particles
+        self._resync = None
 
         self._class_grids = {}     # classid -> ParticleGrid (docked, in a tab)
         self._class_names = {}     # classid -> name currently shown
@@ -1260,6 +1275,14 @@ class ParticleListPanel(QtWidgets.QWidget):
         # whatever the gallery is showing regardless of whether that tab
         # could ever become the active picking class.
         self.active_tab_changed.emit(cid)
+
+        if widget is self.umap_grid:
+            if self._pending_umap_entries is not None:
+                self.umap_grid.sync_particles_grouped(self._pending_umap_entries,
+                                                      self._all_visible_class_order())
+                self.umap_grid.apply_selection(self._selected_uids)
+                self._pending_umap_entries = None
+            return
 
         if widget is self.grid:
             if self._pending_all_entries is not None:
@@ -1462,6 +1485,46 @@ class ParticleListPanel(QtWidgets.QWidget):
                             and self.compute_distance_loo_check.isChecked()),
             negative_classid=self.compute_distance_negative_combo.currentData(),
             reference_tomograms=self.reference_tomograms())
+
+    # -- UMAP selection tab ------------------------------------------------------
+    def _umap_selection(self):
+        target = self._target_or_none()
+        return getattr(target, "umap_selection", set()) if target is not None else set()
+
+    def _sync_umap_tab(self, count):
+        """Show the tab while the selection holds particles, labelled with how
+        many; remove it once the selection is empty."""
+        idx = self.tabs.indexOf(self.umap_grid)
+        if count and idx < 0:
+            self.tabs.insertTab(1, self.umap_grid, "")
+            self._pin_fixed_tabs()
+        elif not count and idx >= 0:
+            if self.tabs.currentWidget() is self.umap_grid:
+                self.tabs.setCurrentWidget(self.grid)
+            # Look the tab up again: switching away from it notifies the
+            # main window, which can redraw -- and so remove this tab --
+            # before control comes back here. Removing by the index read
+            # above then took out whatever had moved into position 1: the
+            # Recycle Bin, leaving its particles without a place in the
+            # grouped views and every later redraw failing.
+            idx = self.tabs.indexOf(self.umap_grid)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+        idx = self.tabs.indexOf(self.umap_grid)
+        if idx >= 0:
+            self.tabs.setTabText(idx, f"UMAP Selection ({count})")
+            self.tabs.setTabToolTip(
+                idx, "The particles last selected on the UMAP map. They stay in their own "
+                     "sets -- this is a view, like All -- so they can be confirmed or recycled "
+                     "from here. \"Show Active Set Only\" on this tab shows only them in the "
+                     "tomogram views.")
+
+    def is_umap_selection_active(self):
+        return self.tabs.currentWidget() is self.umap_grid
+
+    def activate_umap_tab(self):
+        if self.tabs.indexOf(self.umap_grid) >= 0:
+            self.tabs.setCurrentWidget(self.umap_grid)
 
     # -- reference scope (multi-tomogram sessions) ------------------------------
     def reference_tomograms(self):
@@ -1744,11 +1807,13 @@ class ParticleListPanel(QtWidgets.QWidget):
 
     def set_mouse_mode(self, mode):
         self.grid.set_mouse_mode(mode)
+        self.umap_grid.set_mouse_mode(mode)
         for g in self._class_grids.values():
             g.set_mouse_mode(mode)
 
     def _all_grids(self):
         yield self.grid
+        yield self.umap_grid
         yield from self._class_grids.values()
         for win in self._detached.values():
             yield win.grid
@@ -1796,7 +1861,11 @@ class ParticleListPanel(QtWidgets.QWidget):
                     # dance.
                     if self.tabs.currentWidget() is grid:
                         self.tabs.setCurrentWidget(self.grid)
-                    self.tabs.removeTab(idx)
+                    # re-read: the switch above can run a redraw that
+                    # changes the tab bar before we get back here
+                    idx = self.tabs.indexOf(grid)
+                    if idx >= 0:
+                        self.tabs.removeTab(idx)
 
         for classid in list(self._detached.keys()):
             if classid not in wanted:
@@ -1853,7 +1922,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         """"All", "+", and the fixed categories can't be dragged -- only
         normal sets can (see _ConstrainedTabBar)."""
         widget = self.tabs.widget(index)
-        if widget is self.grid or widget is self._plus_placeholder:
+        if widget in (self.grid, self._plus_placeholder, self.umap_grid):
             return True
         for cid, grid in self._class_grids.items():
             if grid is widget:
@@ -1867,7 +1936,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         (see _ConstrainedTabBar.mousePressEvent), not cached, so it
         reflects the pinned tabs' actual current widths."""
         bar = self.tabs.tabBar()
-        fixed_count = 1 + sum(1 for cid in categories.FIXED_CLASS_IDS if cid in self._class_grids)
+        fixed_count = (1 + (self.tabs.indexOf(self.umap_grid) >= 0)
+                       + sum(1 for cid in categories.FIXED_CLASS_IDS if cid in self._class_grids))
         lo = bar.tabRect(fixed_count - 1).right() + 1
         plus_idx = self.tabs.indexOf(self._plus_placeholder)
         hi = bar.tabRect(plus_idx).left() - 1
@@ -1897,6 +1967,11 @@ class ParticleListPanel(QtWidgets.QWidget):
             if all_idx >= 0 and all_idx != 0:
                 bar.moveTab(all_idx, 0)
             pos = 1
+            umap_idx = self.tabs.indexOf(self.umap_grid)
+            if umap_idx >= 0:
+                if umap_idx != pos:
+                    bar.moveTab(umap_idx, pos)
+                pos += 1
             for cid in categories.FIXED_CLASS_IDS:
                 grid = self._class_grids.get(cid)
                 if grid is None:
@@ -2044,6 +2119,27 @@ class ParticleListPanel(QtWidgets.QWidget):
 
     # -- particle sync --------------------------------------------------------
     def sync_particles(self, entries, scores=None):
+        """Re-entrancy-safe front for _sync_particles_now. A sync can switch
+        tabs (removing the UMAP Selection tab moves off it first), a tab
+        switch notifies the main window, and with Show Active Set Only on
+        that redraws everything -- including another sync, started while
+        this one is half done. Running it there corrupted the tab bar, so a
+        nested request is queued instead and replayed, with the latest
+        data, once the current sync has finished."""
+        if self._syncing:
+            self._resync = (list(entries), scores)
+            return
+        self._syncing = True
+        try:
+            self._sync_particles_now(entries, scores)
+            while self._resync is not None:
+                entries, scores = self._resync
+                self._resync = None
+                self._sync_particles_now(entries, scores)
+        finally:
+            self._syncing = False
+
+    def _sync_particles_now(self, entries, scores=None):
         """entries: iterable of (uid, img, classid). scores: {uid:
         (score, has_embedding)} as built by TomoBoxer.update_boximgs --
         cached (self._uid_scores) for use by any tab currently showing
@@ -2051,6 +2147,15 @@ class ParticleListPanel(QtWidgets.QWidget):
         switched on later without a fresh sync happening."""
         entries = list(entries)
         self._uid_scores = scores if scores is not None else {}
+        selection = self._umap_selection()
+        umap_entries = [e for e in entries if e[0] in selection] if selection else []
+        self._sync_umap_tab(len(umap_entries))
+        if self.tabs.currentWidget() is self.umap_grid:
+            self.umap_grid.sync_particles_grouped(umap_entries, self._all_visible_class_order())
+            self.umap_grid.apply_selection(self._selected_uids)
+            self._pending_umap_entries = None
+        else:
+            self._pending_umap_entries = umap_entries
         current_widget = self.tabs.currentWidget()
         if current_widget is self.grid:
             self.grid.sync_particles_grouped(entries, self._all_visible_class_order())
@@ -2107,7 +2212,7 @@ class ParticleListPanel(QtWidgets.QWidget):
             win.close()
             win.deleteLater()
         self._detached.clear()
-        for grid in [self.grid, *self._class_grids.values()]:
+        for grid in [self.grid, self.umap_grid, *self._class_grids.values()]:
             grid._images.clear()
         self._pending_entries.clear()
         self._pending_all_entries = None
