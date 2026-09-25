@@ -176,12 +176,20 @@ def load_particle_list(path: str) -> list:
     return [(r["x"], r["y"], r["z"]) for r in _parse_particle_file(path)]
 
 
-def load_class_records(pdir: str, classname: str) -> list:
+def load_particle_records(path: str) -> list:
     """Like load_particle_list, but returns the full per-particle dict
-    (uid/embedding_row/score, None for any the file doesn't carry) --
-    used when loading the app's own persisted per-class files, which need
-    to recover a particle's stable identity and any embedding link."""
-    return _parse_particle_file(class_file(pdir, classname))
+    (uid/embedding_row/score, None for any the file doesn't carry) for a
+    file named by path -- for anything that needs a particle's stable
+    identity, its embedding link, or its last computed score, and knows
+    the file rather than the class. load_class_records is the
+    by-class-name counterpart."""
+    return _parse_particle_file(path)
+
+
+def load_class_records(pdir: str, classname: str) -> list:
+    """load_particle_records for one of the app's own persisted per-class
+    files, named by class rather than by path."""
+    return load_particle_records(class_file(pdir, classname))
 
 
 def _write_records_csv(path: str, records) -> None:
@@ -370,7 +378,7 @@ def save_embeddings_settings(pdir: str, spaces) -> None:
                       f"{int(s['n'])} {os.path.abspath(s['path'])}\n")
 
 
-def load_embeddings_settings(pdir: str):
+def load_embeddings_settings(pdir: str, include_missing: bool = False):
     """[{"name", "method", "kind", "n", "path"}, ...] for every attached
     space whose file still exists, or [] if nothing's attached. A space
     whose file has since been moved or deleted is dropped silently --
@@ -380,7 +388,12 @@ def load_embeddings_settings(pdir: str):
     Files written before more than one bundle could be attached used
     separate "method"/"embeddings"/"n"/"umap" keys (and, earlier still,
     "h5" with no method at all, which meant CryoSIAM since that was the
-    only reader). Both older shapes are converted to spaces here."""
+    only reader). Both older shapes are converted to spaces here.
+
+    include_missing=True keeps the spaces whose file is gone too, each with
+    an "exists" flag -- for a caller that can supply the file's new
+    location, such as a session manifest after the data has moved to
+    another machine."""
     path = embeddings_settings_path(pdir)
     if not os.path.isfile(path):
         return []
@@ -416,4 +429,6 @@ def load_embeddings_settings(pdir: str):
             spaces.append({"name": f"{method}_umap", "method": method, "kind": "umap",
                            "n": n, "path": legacy["umap"]})
 
-    return [s for s in spaces if os.path.isfile(s["path"])]
+    for sp in spaces:
+        sp["exists"] = os.path.isfile(sp["path"])
+    return spaces if include_missing else [sp for sp in spaces if sp["exists"]]

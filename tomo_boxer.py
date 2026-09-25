@@ -2,6 +2,7 @@
 """PickyMate: a standalone tomogram particle-picking tool.
 
 Usage:
+    python tomo_boxer.py --session session.csv [--native_memmap] [...]
     python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
         [--working_dir DIR] [--particle_lists PATH [PATH ...]]
         [--embedded_particle_list PATH]
@@ -22,6 +23,13 @@ show up as separate choices in the ranking dropdown. For example:
         --cryosiam_umap       CryoSIAM/TS_026_embeds_umap_data.csv \\
         --tomotwin_embeddings TomoTwin/TS_026.temb \\
         --tomotwin_umap       TomoTwin/TS_026.tumap
+
+Several tomograms can be worked on as one session: --session takes a CSV
+manifest with one row per tomogram and the same columns as the flags above
+(tomogram, working_dir, embedded_particle_list, cryosiam_embeddings,
+cryosiam_umap, tomotwin_embeddings, tomotwin_umap, companion_tomogram). A
+navigator lists them and opens one at a time; ranking can then pool the
+Confirmed and Recycle Bin particles of every tomogram. See boxer/session.py.
 """
 from __future__ import annotations
 
@@ -35,7 +43,16 @@ from boxer.main_window import TomoBoxer
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("tomogram", help="Tomogram (MRC/REC) to pick particles from")
+    parser.add_argument("tomogram", nargs="?", default=None,
+                        help="Tomogram (MRC/REC) to pick particles from (omit with --session)")
+    parser.add_argument(
+        "--session", type=str, default=None, metavar="CSV",
+        help="Work on several tomograms together: a CSV manifest, one row per tomogram, "
+             "with columns tomogram, working_dir, embedded_particle_list, "
+             "cryosiam_embeddings, cryosiam_umap, tomotwin_embeddings, tomotwin_umap, "
+             "companion_tomogram (relative paths are resolved against the manifest's "
+             "folder; only 'tomogram' is required). Import columns are only used the "
+             "first time a tomogram is opened.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--box2d", action="store_true", help="Pick 2D particles from tomogram slices")
     mode.add_argument("--box3d", action="store_true", help="Pick 3D sub-volumes (default)")
@@ -94,6 +111,17 @@ def main():
              "full original precision and a much lower RAM ceiling.")
     options = parser.parse_args()
 
+    if options.session and options.tomogram:
+        parser.error("give either a tomogram or --session, not both")
+    if not options.session and not options.tomogram:
+        parser.error("give a tomogram to open, or --session with a manifest")
+    if options.session and (options.embedded_particle_list or options.cryosiam_embeddings
+                            or options.cryosiam_umap or options.tomotwin_embeddings
+                            or options.tomotwin_umap or options.companion_tomogram
+                            or options.working_dir or options.particle_lists):
+        parser.error("with --session, per-tomogram paths belong in the manifest, "
+                     "not on the command line")
+
     if options.cryosiam_umap and not options.cryosiam_embeddings:
         parser.error("--cryosiam_umap requires --cryosiam_embeddings")
     if options.tomotwin_umap and not options.tomotwin_embeddings:
@@ -111,8 +139,18 @@ def main():
     options.mode = "2D" if options.box2d and not options.box3d else "3D"
 
     app = QApplication(sys.argv)
-    boxer = TomoBoxer(options, datafile=options.tomogram)
-    boxer.show()
+    if options.session:
+        from boxer.session import Session
+        from boxer.session_window import SessionController
+        try:
+            session = Session.from_manifest(options.session)
+        except (OSError, ValueError) as e:
+            parser.error(f"--session: {e}")
+        controller = SessionController(session, options)
+        controller.start()
+    else:
+        boxer = TomoBoxer(options, datafile=options.tomogram)
+        boxer.show()
     sys.exit(app.exec())
 
 

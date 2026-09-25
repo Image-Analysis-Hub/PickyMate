@@ -64,6 +64,17 @@ def clear_manual_color(classid: int) -> None:
     _manual_colors.pop(classid, None)
 
 
+def clear_all_manual_colors() -> None:
+    """Forget every per-class override. Class ids are only unique within
+    one tomogram, and each tomogram's overrides are loaded from its own
+    working directory, so a multi-tomogram session calls this before
+    opening the next tomogram -- otherwise one tomogram's colour for its
+    set 0 would silently paint the next tomogram's set 0. The Toggle
+    Colors rotation is deliberately kept: it is a display preference for
+    the whole run, not a property of any one tomogram."""
+    _manual_colors.clear()
+
+
 def has_manual_color(classid: int) -> bool:
     return classid in _manual_colors
 

@@ -67,6 +67,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.initialized = False
         self._closing = False
         self.options = options
+        # Set when this window is one tomogram of a multi-tomogram session
+        # (tomo_boxer.py --session): the controller owns the navigator and
+        # does the switching, the session reads other tomograms' working
+        # directories. Both None in ordinary single-tomogram use, and every
+        # session feature below is keyed off that.
+        self.session_controller = getattr(options, "session_controller", None)
+        self.session = self.session_controller.session if self.session_controller else None
+        self.session_name = metadata.base_name(datafile)
+        self._switching = False
         self.boxshape = "circle" if options.mode == "3D" else "rect"
         self.setWindowTitle(f"PickyMate — {metadata.base_name(datafile)}")
 
@@ -122,7 +131,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.splitter_top = QtWidgets.QSplitter(Qt.Horizontal)
         self.splitter_bottom = QtWidgets.QSplitter(Qt.Horizontal)
-        splitter_wrapper = QtWidgets.QSplitter(Qt.Vertical)
+        self.splitter_wrapper = splitter_wrapper = QtWidgets.QSplitter(Qt.Vertical)
 
         self.xyview = ImageView2D(sizehint=(1024, 1024))
         self.xzview = ImageView2D(sizehint=(1024, 256))
@@ -646,7 +655,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.companion_path:
             self.companion_path = os.path.abspath(self.companion_path)
 
-        data = Volume.from_file(datafile, native_memmap=self._native_memmap)
+        data = (self.session.take_prefetched(datafile, self._native_memmap)
+                if self.session is not None else None)
+        if data is None:
+            data = Volume.from_file(datafile, native_memmap=self._native_memmap)
         if options.apix:
             data.apix = options.apix
         self._volume_slots["primary"] = data
@@ -679,17 +691,42 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # order the dropdown shows.
         self.embedding_spaces = {}
         self.last_import_notes = []
-        for saved in metadata.load_embeddings_settings(self.picksdir):
+        # A session manifest can name the current location of embedding
+        # files this working directory recorded somewhere that no longer
+        # exists (see SessionEntry.embedding_path_fixes); outside a session
+        # there are none and a missing file is simply skipped, as before.
+        path_fixes = getattr(options, "embedding_path_fixes", None) or {}
+        repaired = []
+        for saved in metadata.load_embeddings_settings(self.picksdir, include_missing=True):
+            path = saved["path"]
+            if not saved["exists"]:
+                if saved["name"] not in path_fixes:
+                    continue
+                path = path_fixes[saved["name"]]
             try:
                 if saved["kind"] == "umap":
-                    array = embeddings_io.load_umap(saved["method"], saved["path"])["umap_xy"]
+                    array = embeddings_io.load_umap(saved["method"], path)["umap_xy"]
                 else:
                     array = embeddings_io.load_embeddings(
-                        saved["method"], saved["path"], n_expected=saved["n"])["embeddings"]
-                self._register_embedding_space(
-                    saved["method"], saved["kind"], array, saved["path"])
+                        saved["method"], path, n_expected=saved["n"])["embeddings"]
+                self._register_embedding_space(saved["method"], saved["kind"], array, path)
+                if path != saved["path"]:
+                    repaired.append((saved["name"], saved["path"], path))
             except (OSError, ValueError) as e:
                 print(f"warning: could not reload the {saved['name']!r} embeddings: {e}")
+        if repaired:
+            # Write the corrected locations back, so the working directory
+            # also opens correctly on its own, outside the session. Only the
+            # repaired paths change: rewriting from the spaces that loaded
+            # would silently erase the record of any that could not be
+            # loaded, and with it the only note of where that file was.
+            fixed = {name: new_path for name, _, new_path in repaired}
+            metadata.save_embeddings_settings(self.picksdir, [
+                dict(sp, path=fixed.get(sp["name"], sp["path"]))
+                for sp in metadata.load_embeddings_settings(self.picksdir, include_missing=True)])
+            for name, old_path, new_path in repaired:
+                print(f"note: {name!r} embeddings were recorded at {old_path}, which no longer "
+                      f"exists; now using {new_path} from the session manifest")
 
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle(f"PickyMate — Particle List — {metadata.base_name(datafile)}")
@@ -1573,8 +1610,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return unique_name, count
 
     # -- Mahalanobis distance -------------------------------------------------
+    def ordered_space_names(self):
+        """Attached embedding spaces in the order they are offered --
+        TomoTwin's full embedding first (see embeddings_io.display_order)."""
+        return embeddings_io.display_order(self.embedding_spaces)
+
     def compute_mahalanobis(self, reference_classid, target_classid, space=None,
-                             leave_one_out=False, negative_classid=None):
+                             leave_one_out=False, negative_classid=None,
+                             reference_tomograms=None):
         """Score every embedded particle in target_classid by its
         Mahalanobis distance to reference_classid's embedding
         distribution (mean + covariance, built from whichever of the
@@ -1626,7 +1669,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if negative_classid is not None and negative_classid == reference_classid:
             raise ValueError("The \"far from\" set can't be the same as the \"close to\" set.")
         if space is None and self.embedding_spaces:
-            space = next(iter(self.embedding_spaces))
+            space = self.ordered_space_names()[0]
         entry = self.embedding_spaces.get(space)
         if entry is None:
             known = ", ".join(self.embedding_spaces) or "none attached"
@@ -1637,12 +1680,29 @@ class TomoBoxer(QtWidgets.QMainWindow):
         target_total = sum(1 for b in self.boxes if b[5] == target_classid)
         skipped = target_total - len(target_rows)
 
+        # Other tomograms of a session contribute the particles of their
+        # own set of the same name -- their Confirmed for "close to
+        # Confirmed", their Recycle Bin for "far from Recycle Bin" -- read
+        # from their working directories and pooled with this tomogram's.
+        extra_pos = extra_neg = None
+        used, notes = [], []
+        others = [t for t in (reference_tomograms or []) if t != self.session_name]
+        if others and self.session is not None:
+            dims = array.shape[1]
+            extra_pos, used, not_used = self.session.reference_vectors(
+                space, self.sets[reference_classid], others, dims)
+            notes += [f"{t}: {why}" for t, why in not_used]
+            if negative_classid is not None:
+                extra_neg, _, not_used = self.session.reference_vectors(
+                    space, self.sets[negative_classid], others, dims)
+                notes += [f"{t}: {why} (far from)" for t, why in not_used]
+
         positive, ref_size = self._mahalanobis_distances(
-            reference_classid, target_classid, target_rows, array, leave_one_out)
+            reference_classid, target_classid, target_rows, array, leave_one_out, extra=extra_pos)
 
         if negative_classid is not None:
             negative, _ = self._mahalanobis_distances(
-                negative_classid, target_classid, target_rows, array, leave_one_out)
+                negative_classid, target_classid, target_rows, array, leave_one_out, extra=extra_neg)
             combined = {i: positive[i] - negative[i] for i in positive if i in negative}
             skipped += len(positive) - len(combined)
         else:
@@ -1653,12 +1713,17 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.save_json(only={target_classid})
         self.update_all(reslice=False, only_indices=[])
-        return {"scored": len(combined), "skipped_no_embedding": skipped, "reference_size": ref_size}
+        return {"scored": len(combined), "skipped_no_embedding": skipped, "reference_size": ref_size,
+                "space": space, "other_tomograms_used": used,
+                "extra_reference_size": 0 if extra_pos is None else len(extra_pos),
+                "extra_negative_size": 0 if extra_neg is None else len(extra_neg),
+                "notes": notes}
 
     def _mahalanobis_rows_of(self, classid):
         return [(i, b[7]) for i, b in enumerate(self.boxes) if b[5] == classid and b[7] is not None]
 
-    def _mahalanobis_distances(self, reference_classid, target_classid, target_rows, array, leave_one_out):
+    def _mahalanobis_distances(self, reference_classid, target_classid, target_rows, array,
+                               leave_one_out, extra=None):
         """{box_index: squared Mahalanobis distance} for every (index,
         embedding_row) pair in target_rows, relative to reference_classid's
         own embedding distribution in `array`. target_rows is computed
@@ -1666,29 +1731,40 @@ class TomoBoxer(QtWidgets.QMainWindow):
         call) so "does this particle have an embedding at all" is only
         ever decided from the target set itself, not re-derived per
         reference. Raises ValueError if the reference set has fewer than
-        2 embedded particles. Returns (distances, reference_size)."""
+        2 embedded particles. Returns (distances, reference_size).
+
+        `extra`: an (M, D) array of further reference vectors -- the same
+        set's particles in other tomograms of a session -- pooled with this
+        tomogram's own. They are never among the particles being scored,
+        so leave-one-out only ever removes this tomogram's own."""
         ref_rows = self._mahalanobis_rows_of(reference_classid)
-        if len(ref_rows) < 2:
+        n_extra = 0 if extra is None else len(extra)
+        if len(ref_rows) + n_extra < 2:
             name = self.sets.get(reference_classid, reference_classid)
             raise ValueError(
-                f"\"{name}\" has only {len(ref_rows)} particle(s) with an embedding -- "
+                f"\"{name}\" has only {len(ref_rows) + n_extra} particle(s) with an embedding -- "
                 f"need at least 2 to build a distribution.")
+
+        def pooled(rows):
+            own = array[rows] if len(rows) else np.empty((0, array.shape[1]))
+            return own if extra is None else np.vstack([own, extra])
+
         distances = {}
         if leave_one_out and reference_classid == target_classid:
             for i, row in target_rows:
                 others = [r for idx2, r in ref_rows if idx2 != i]
-                if len(others) < 2:
+                if len(others) + n_extra < 2:
                     continue
-                mu, covinv = self._mahalanobis_distribution(array[others])
+                mu, covinv = self._mahalanobis_distribution(pooled(others))
                 distances[i] = float(self._mahalanobis_scores(mu, covinv, array[[row]])[0])
         else:
-            mu, covinv = self._mahalanobis_distribution(array[[row for _, row in ref_rows]])
+            mu, covinv = self._mahalanobis_distribution(pooled([row for _, row in ref_rows]))
             idx_list = [i for i, _ in target_rows]
             rows_list = [row for _, row in target_rows]
             d2 = self._mahalanobis_scores(mu, covinv, array[rows_list])
             for i, d in zip(idx_list, d2):
                 distances[i] = float(d)
-        return distances, len(ref_rows)
+        return distances, len(ref_rows) + n_extra
 
     @staticmethod
     def _mahalanobis_distribution(vectors):
@@ -1788,7 +1864,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             msg += f"\n\n{note}"
         QtWidgets.QMessageBox.information(self, title, msg)
 
-    def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out, negative_classid=None):
+    def run_compute_distance(self, target_classid, reference_classid, space, leave_one_out,
+                             negative_classid=None, reference_tomograms=None):
         """Triggered by the particle list's own inline "Rank by Embedding Distance"
         controls (see ParticleListPanel) -- there's no dialog or menu
         entry point, this is the feature's only one, deliberately
@@ -1799,7 +1876,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         old dialog-based version this doesn't re-check that itself."""
         try:
             result = self.compute_mahalanobis(
-                reference_classid, target_classid, space, leave_one_out, negative_classid)
+                reference_classid, target_classid, space, leave_one_out, negative_classid,
+                reference_tomograms=reference_tomograms)
         except ValueError as e:
             self._show_gallery_notice(QtWidgets.QMessageBox.Critical, "Rank Particles", str(e))
             return
@@ -1814,6 +1892,15 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if negative_classid is not None:
             msg += f", far from \"{self.sets[negative_classid]}\""
         msg += "."
+        if result["other_tomograms_used"]:
+            msg += (f"\nReferences pooled from this tomogram and "
+                    f"{len(result['other_tomograms_used'])} other(s): "
+                    f"{', '.join(result['other_tomograms_used'])} "
+                    f"(+{result['extra_reference_size']} \"close to\" particle(s)"
+                    + (f", +{result['extra_negative_size']} \"far from\"" if negative_classid is not None else "")
+                    + ").")
+        if result["notes"]:
+            msg += "\nNot used: " + "; ".join(result["notes"]) + "."
         if result["skipped_no_embedding"]:
             msg += f"\n{result['skipped_no_embedding']} particle(s) not scored (no embedding, or excluded by leave-one-out)."
         self._show_gallery_notice(QtWidgets.QMessageBox.Information, "Rank Particles", msg)
@@ -3397,7 +3484,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     def _do_close_all(self):
         self._closing = True
-        print("Exiting")
+        if not self._switching:
+            print("Exiting")
         self.save_picks()
         self.boxesviewer.close()
         try:
@@ -3406,6 +3494,57 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.zyview.close()
         except RuntimeError:
             pass
+        # Closing a tomogram's windows by hand ends the whole session, the
+        # same as it ends the program in single-tomogram mode; a switch
+        # closes them too but must leave the session running.
+        if self.session_controller is not None and not self._switching:
+            self.session_controller.tomogram_closed_by_user(self)
+
+    def session_windows(self):
+        """This tomogram's top-level windows, for the session controller to
+        carry their positions over to the next tomogram it opens. Only real
+        windows belong here: the three slice views are panels inside this
+        window's splitters, and restoring a saved window geometry onto a
+        panel moves it behind the splitter's back (offset by a title bar's
+        height), leaving it misplaced until something forces a relayout --
+        their proportions are carried by session_layout instead."""
+        return {"main": self, "gallery": self.boxesviewer}
+
+    def session_layout(self):
+        """The proportions of the slice-view panels, as splitter state."""
+        return {"top": self.splitter_top.saveState(),
+                "bottom": self.splitter_bottom.saveState(),
+                "wrapper": self.splitter_wrapper.saveState()}
+
+    def restore_session_layout(self, state):
+        for key, splitter in (("top", self.splitter_top), ("bottom", self.splitter_bottom),
+                              ("wrapper", self.splitter_wrapper)):
+            if key in state:
+                splitter.restoreState(state[key])
+
+    def close_for_switch(self):
+        """Save and close every window without asking -- the session is
+        about to open another tomogram in its place -- then let go of
+        everything this tomogram holds in memory.
+
+        Closing alone frees nothing. The particle list is its own top-level
+        window, not a child of this one, so deleting this window does not
+        delete it; and its signals hold references back to this window's
+        methods, a cycle that runs through Qt where Python's garbage
+        collector cannot see it. Left like that, every switch kept the
+        previous tomogram's volume, embeddings and thumbnails alive -- about
+        a gigabyte per switch -- so the heavy data is dropped explicitly
+        and the particle list is deleted along with this window."""
+        self._switching = True
+        self._do_close_all()
+        self.close()
+        self._focus_pulse_timer.stop()
+        self.boxesviewer.dispose()
+        self.data = None
+        self._volume_slots = {"primary": None, "companion": None}
+        self.embedding_spaces = {}
+        self.boxesimgs = []
+        self.boxes = []
 
     def request_close_all(self):
         """Called by the particle list / options windows when the user

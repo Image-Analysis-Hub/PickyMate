@@ -1005,6 +1005,32 @@ class ParticleListPanel(QtWidgets.QWidget):
         controls_row.addStretch(1)
         group_layout.addLayout(controls_row)
 
+        # Multi-tomogram sessions only: which tomograms' particles make up
+        # the "close to" / "far from" references. The same set name is
+        # looked up in each -- Confirmed pools every chosen tomogram's
+        # Confirmed, Recycle Bin every Recycle Bin. "This tomogram" is the
+        # default, and is exactly what ranking did before sessions existed.
+        self.compute_distance_scope_row = QtWidgets.QWidget()
+        scope_layout = QtWidgets.QHBoxLayout(self.compute_distance_scope_row)
+        scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.addWidget(QtWidgets.QLabel("References from:"))
+        self.compute_distance_scope_combo = QtWidgets.QComboBox()
+        self.compute_distance_scope_combo.addItem("this tomogram", "this")
+        self.compute_distance_scope_combo.addItem("all tomograms in the session", "all")
+        self.compute_distance_scope_combo.addItem("chosen tomograms...", "choose")
+        self.compute_distance_scope_combo.setToolTip(
+            "Which tomograms' particles form the \"close to\" and \"far from\" references. "
+            "Each chosen tomogram contributes its own set of the same name, read from its "
+            "working directory, pooled with this tomogram's.")
+        self.compute_distance_scope_combo.activated.connect(self._on_scope_activated)
+        scope_layout.addWidget(self.compute_distance_scope_combo)
+        scope_layout.addStretch(1)
+        group_layout.addWidget(self.compute_distance_scope_row)
+        in_session = target is not None and getattr(target, "session", None) is not None
+        self.compute_distance_scope_row.setVisible(in_session)
+        if in_session:
+            self._restore_scope(target.session_controller)
+
         self.compute_distance_button = QtWidgets.QPushButton("▶  Rank by Embedding Distance")
         # Saved so _update_compute_distance_state can restore it after
         # temporarily swapping in a "why is this disabled" tooltip (for a
@@ -1369,8 +1395,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         previous_space = space_combo.currentData()
         space_combo.blockSignals(True)
         space_combo.clear()
-        for name, entry in target.embedding_spaces.items():
-            space_combo.addItem(entry["label"], name)
+        for name in target.ordered_space_names():
+            space_combo.addItem(target.embedding_spaces[name]["label"], name)
         idx = space_combo.findData(previous_space) if previous_space else -1
         space_combo.setCurrentIndex(idx if idx >= 0 else 0)
         space_combo.blockSignals(False)
@@ -1434,7 +1460,57 @@ class ParticleListPanel(QtWidgets.QWidget):
             space=self.compute_distance_space_combo.currentData(),
             leave_one_out=(self.compute_distance_loo_check.isEnabled()
                             and self.compute_distance_loo_check.isChecked()),
-            negative_classid=self.compute_distance_negative_combo.currentData())
+            negative_classid=self.compute_distance_negative_combo.currentData(),
+            reference_tomograms=self.reference_tomograms())
+
+    # -- reference scope (multi-tomogram sessions) ------------------------------
+    def reference_tomograms(self):
+        """None for "this tomogram"; otherwise every tomogram whose
+        references are pooled, this one included."""
+        target = self._target_or_none()
+        if target is None or getattr(target, "session", None) is None:
+            return None
+        scope, chosen = target.session_controller.reference_scope
+        if scope == "all":
+            return list(target.session.names)
+        if scope == "choose":
+            return [target.session_name] + [t for t in chosen if t != target.session_name]
+        return None
+
+    def _restore_scope(self, controller):
+        """The scope is a session-wide choice, kept on the controller, so it
+        survives switching tomograms rather than resetting with each one."""
+        scope, chosen = controller.reference_scope
+        combo = self.compute_distance_scope_combo
+        combo.setCurrentIndex(max(combo.findData(scope), 0))
+        self._label_chosen(chosen)
+
+    def _label_chosen(self, chosen):
+        combo = self.compute_distance_scope_combo
+        idx = combo.findData("choose")
+        combo.setItemText(idx, f"chosen tomograms ({len(chosen)})..." if chosen
+                          else "chosen tomograms...")
+
+    def _on_scope_activated(self, index):
+        target = self._target_or_none()
+        if target is None or getattr(target, "session", None) is None:
+            return
+        controller = target.session_controller
+        scope = self.compute_distance_scope_combo.itemData(index)
+        previous_scope, chosen = controller.reference_scope
+        if scope == "choose":
+            from .session_window import ChooseTomogramsDialog
+            dlg = ChooseTomogramsDialog(
+                [t for t in target.session.names if t != target.session_name], chosen, self)
+            if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.chosen():
+                chosen = dlg.chosen()
+            elif not chosen:
+                # nothing chosen, ever: fall back to what was selected before
+                self.compute_distance_scope_combo.setCurrentIndex(
+                    max(self.compute_distance_scope_combo.findData(previous_scope), 0))
+                return
+        controller.reference_scope = (scope, chosen)
+        self._label_chosen(chosen)
 
     def _empty_recycle_bin(self):
         target = self._target_or_none()
@@ -2018,6 +2094,25 @@ class ParticleListPanel(QtWidgets.QWidget):
             # always keep them eagerly in sync.
             win.grid.sync_particles(by_class.get(classid, []))
             win.grid.apply_selection(self._selected_uids)
+
+    def dispose(self):
+        """Free this window and everything it caches, for good -- used when
+        a session switches tomograms (see TomoBoxer.close_for_switch).
+        Every grid keeps a raw numpy copy of each thumbnail for re-scaling,
+        which at tens of thousands of particles is hundreds of megabytes,
+        and detached tabs are top-level windows of their own that would
+        otherwise outlive this one."""
+        for win in list(self._detached.values()):
+            win.grid._images.clear()
+            win.close()
+            win.deleteLater()
+        self._detached.clear()
+        for grid in [self.grid, *self._class_grids.values()]:
+            grid._images.clear()
+        self._pending_entries.clear()
+        self._pending_all_entries = None
+        self._uid_scores = {}
+        self.deleteLater()
 
     def closeEvent(self, event):
         target = self._target() if self._target is not None else None

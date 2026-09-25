@@ -60,6 +60,22 @@ def space_key(method: str, kind: str) -> str:
     return method if kind == "embeddings" else f"{method}_umap"
 
 
+# The order spaces are offered in, wherever a choice of space is shown.
+# TomoTwin's full embedding comes first because it was the most reliable
+# ranking space in every benchmark on EMPIAR-10988 -- it never fell below
+# the template-matching order in any tomogram, and it transfers between
+# tomograms -- so it is also the default when nothing else is chosen.
+SPACE_DISPLAY_ORDER = ("tomotwin", "tomotwin_umap", "cryosiam", "cryosiam_umap")
+
+
+def display_order(names):
+    """`names` (space keys) sorted into SPACE_DISPLAY_ORDER; anything not
+    listed there keeps its original relative order, after the known ones."""
+    names = list(names)
+    rank = {n: i for i, n in enumerate(SPACE_DISPLAY_ORDER)}
+    return sorted(names, key=lambda n: (rank.get(n, len(rank)), names.index(n)))
+
+
 def space_label(method: str, kind: str, dims: int) -> str:
     """What the ranking dropdown shows, e.g. "CryoSIAM - full (1024-d)"."""
     pretty = DISPLAY_NAMES.get(method, method)
