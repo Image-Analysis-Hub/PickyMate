@@ -1,74 +1,61 @@
 # Ranking by Embedding Distance
 
-If one of your sets came from an external classifier or feature extractor
-that produced a per-particle embedding vector, PickyMate can rank that
-set's particles by Mahalanobis distance to a reference set — useful for
-pushing likely junk (or likely gems) to one end of the gallery instead of
-reviewing everything in pick order.
+This is the heart of PickyMate. Each imported pick carries an embedding
+vector from a foundation model; as you fill **Confirmed** and the **Recycle
+Bin**, any set can be re-ranked by Mahalanobis distance to those examples —
+so the particles most like your confirmed ones surface first, and you decide
+in bulk instead of in pick order.
+
+![The same set before and after ranking](images/ranking-before-after.png)
 
 ## Bringing embeddings in
 
-Embeddings attach to one particle list at import time, either from the
-command line (`--embedded_particle_list`, `--embeddings_h5`, and optionally
-`--embeddings_umap` — see [Getting Started](getting-started.md)) or from
-**File > Import Particle List with Embeddings...**. Only one particle list
-can carry embeddings at a time. Once loaded, the ranking row appears at the
-bottom of the Particle List window, above its toolbar:
+Embeddings attach when a particle list is imported: from the command line
+(`--embedded_particle_list` with `--tomotwin_embeddings` /
+`--cryosiam_embeddings` and their `--*_umap` companions — see
+[Getting Started](getting-started.md)) or from **File > Import Particle List
+with Embeddings...**. Attaching both methods at once is fine; **File >
+Attach Embeddings to Current Particles...** adds a second method later.
 
-![Ranking panel, annotated](images/ranking-panel.png)
+Every attached method contributes its full embedding and, when given, its 2D
+UMAP as separate **ranking spaces** — e.g. *TomoTwin - full (32-d)*,
+*TomoTwin - UMAP (2-d)*, *CryoSIAM - full (1024-d)* — selectable in the
+ranking row's space dropdown, so the same picks can be ranked by either
+method and compared.
 
-1. **"close to"** — the reference set to measure distance *toward*. A
-   particle scores low (ranks first after sorting) the more it resembles
-   this set in embedding space.
-2. **"far from"** — optional second reference set to measure distance
-   *away from* at the same time (defaults to **(none)**, which is the
-   plain single-distance behavior described below).
-3. **Leave-One-Out** — only selectable when the current tab's own set is
-   used as a reference (either "close to" or "far from"). Without it, a
-   particle scored against its own set would trivially look close to
-   itself; Leave-One-Out excludes each particle from the reference
-   statistics while scoring it against its own set.
-4. **Rank by Embedding Distance** — runs the computation and offers to sort
-   the current tab by the resulting score immediately after.
+## The ranking row
 
-The space dropdown next to "far from" picks which embedding to measure in:
-the full-dimensionality vector from `--embeddings_h5`, or (if
-`--embeddings_umap` was also supplied) the 2D UMAP projection instead.
+At the bottom of the Particle List, above its toolbar:
 
-## Single distance ("close to" only)
+![Ranking row](images/ranking-panel.png)
 
-With "far from" left at **(none)**, each particle in the current tab is
-scored by its Mahalanobis distance to the "close to" set: how many standard
-deviations away it sits from that set's mean, accounting for how the
-reference set's own points are correlated/spread out in embedding space —
-not just a plain Euclidean distance. Lower means "more like the reference
-set."
+- **Rank ... close to** — the reference set to resemble. Lower score = more
+  like this set. Usually **Confirmed**.
+- **far from** — optional second reference to move away from, usually the
+  **Recycle Bin**: the score becomes
+  `distance_to(close to) − distance_to(far from)`. Left at **(none)**, the
+  plain single distance is used. The two can't be the same set.
+- **space dropdown** — which embedding to measure in.
+- **Leave-One-Out** — only when a reference is the current tab itself:
+  excludes each particle from the statistics it is scored against, so
+  nothing trivially matches itself.
+- **References from** — appears in a [session](sessions-and-umap.md): pool
+  the reference sets of *this tomogram*, *all tomograms*, or *chosen
+  tomograms*. Decisions made in finished tomograms then rank a fresh one
+  before you have confirmed anything in it.
+- **▶ Rank by Embedding Distance** — computes the scores and sorts the
+  current tab by them.
 
-## Double distance ("close to" + "far from")
-
-Setting both fields scores each particle by the difference of two
-Mahalanobis distances:
-
-```
-score = distance_to("close to" set) − distance_to("far from" set)
-```
-
-This is useful when you have two positive/negative example sets already —
-say, particles you've moved to **Confirmed** and particles you've sent to
-the **Recycle Bin** — and want to rank the rest by how much they look like
-the good examples *and* how little they look like the bad ones, in one
-pass. A lower (more negative) score means "closer to the confirmed
-examples, farther from the discarded ones."
-
-The two fields can't be set to the same set — doing so disables only the
-**Rank by Embedding Distance** button itself (with a tooltip explaining
-why), never the dropdowns, so you can always change either one back to fix
-it.
+Mahalanobis distance measures how many standard deviations a particle sits
+from the reference set's mean, accounting for how the reference spreads in
+embedding space — not a plain Euclidean distance.
 
 ## After ranking
 
-The result reports how many particles were actually scored (a particle
-with no embedding row, or excluded by Leave-One-Out, is skipped) and offers
-to sort the current tab by score. You can re-sort by score later at any
-time with the gallery toolbar's **Sort by Rank** button — it's the same
-ranking values computed here, not a separate concept.
+The result reports how many particles were scored (a particle without an
+embedding is skipped). The current tab is laid out best-first; ranking is a
+one-shot sort, so later edits don't reshuffle it. **Sort by Rank** in the
+toolbar re-applies the last scores at any time; **Sort by Original ID**
+returns to pick order. Re-rank whenever you have confirmed or rejected more —
+it takes about a second, which is what makes the confirm-a-few, re-rank,
+sweep-in-bulk loop work.

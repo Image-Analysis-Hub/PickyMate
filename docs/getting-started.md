@@ -3,66 +3,83 @@
 ## Installing
 
 ```
+git clone https://github.com/MohamadHarastani/PickyMate.git
+cd PickyMate
 conda env create -f environment.yml
 conda activate pickymate
 ```
 
-This creates a conda environment named `pickymate` and installs PickyMate
-into it as the `pickymate` command, in editable mode -- the command runs the
-code in the folder you installed from, so changes to that code take effect
-without reinstalling. To install into an environment you already have, run
-`pip install -e .` from the PickyMate folder instead.
+This creates a conda environment named `pickymate` with PickyMate installed
+as the `pickymate` command, in editable mode: the command runs the code in
+the cloned folder, so updating the clone needs no reinstall. Alternatives,
+into an environment you already have:
+
+```
+pip install -e .        # from inside the clone
+pip install git+https://github.com/MohamadHarastani/PickyMate.git
+```
 
 ## Running
 
+One tomogram:
+
 ```
-conda activate pickymate
-pickymate tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
-    [--working_dir DIR] [--particle_lists PATH [PATH ...]]
-    [--embedded_particle_list PATH --embeddings_h5 PATH [--embeddings_umap PATH]]
+pickymate tomogram.mrc [options]
 ```
 
-- `--box2d` / `--box3d` — pick 2D particles from slices, or 3D sub-volumes
-  (default).
-- `--label NAME` — open with the named set already selected.
-- `--clean` — start with the Eraser tool already active.
-- `--apix` — override the pixel size read from the file header.
-- `--working_dir DIR` — store/load picks from `DIR` instead of the default
-  `<tomogram>_picks` next to the tomogram file. Resolved relative to the
-  current directory.
-- `--particle_lists PATH [PATH ...]` — one or more plain-text `x y z`
-  coordinate files, space-separated; each becomes its own brand new set
-  (named after the file) copied into the working directory immediately,
-  exactly like File > Import Particle List. A name already in use (including
-  from a previous run against the same working directory) gets a numeric
-  suffix rather than being skipped or overwritten, since the same name can
-  legitimately carry different picks run to run.
-- `--embedded_particle_list PATH` — a single `x y z` coordinate file to
-  import with a matched embeddings bundle attached (requires
-  `--embeddings_h5`). Separate from `--particle_lists` since only one
-  particle list can have embeddings attached at a time. See
-  [Ranking by Embedding Distance](ranking.md) for what this unlocks.
-- `--embeddings_h5 PATH` — an HDF5 file with the full-dimensionality
-  embedding for each particle in `--embedded_particle_list`, in the same
-  order.
-- `--embeddings_umap PATH` — an optional companion CSV with a 2D
-  UMAP-reduced embedding per particle, usable as an alternate ranking space.
+A whole dataset at once — see [Sessions and UMAP Maps](sessions-and-umap.md):
+
+```
+pickymate --session session.csv
+```
+
+The typical start, importing template-matching picks with both embedding
+methods attached:
+
+```
+pickymate TS_026.rec \
+    --embedded_particle_list picks/TS_026.txt \
+    --tomotwin_embeddings tomotwin/TS_026.temb --tomotwin_umap tomotwin/TS_026.tumap \
+    --cryosiam_embeddings cryosiam/TS_026_embeds.h5 --cryosiam_umap cryosiam/TS_026_umap.csv
+```
+
+### Options
+
+- `--working_dir DIR` — store/load picks in `DIR` instead of the default
+  `<tomogram>_picks` next to the tomogram.
+- `--particle_lists PATH [PATH ...]` — plain `x y z` text files, each
+  imported as its own new set (a taken name gets a numeric suffix).
+- `--embedded_particle_list PATH` — one `x y z` file to import *with
+  embeddings attached*, enabling [ranking](ranking.md).
+- `--tomotwin_embeddings PATH` / `--tomotwin_umap PATH` — TomoTwin `.temb`
+  and `.tumap` files for those picks. The `.temb` carries its own
+  coordinates, so `--embedded_particle_list` is optional with TomoTwin (and
+  cross-checked if given).
+- `--cryosiam_embeddings PATH` / `--cryosiam_umap PATH` — CryoSIAM `.h5`
+  embeddings and UMAP `.csv`. The `.h5` has no coordinates, so
+  `--embedded_particle_list` is required with CryoSIAM.
+- Both methods can be given at once; each shows up as its own ranking space.
+- `--companion_tomogram PATH` — a second version of the same tomogram (e.g.
+  denoised), switchable in the View menu. Loaded only when first switched to.
+- `--native_memmap` — read tomograms from disk at their exact on-disk dtype
+  instead of loading into RAM; slower access, much lower memory.
+
+Import options are only needed the first time: everything is recorded in the
+working directory, and later launches of `pickymate tomogram.mrc` resume
+from it.
 
 ## The two windows
 
 ![Main tomogram window, annotated](images/main-window-overview.png)
 
-1. **Tools toolbar** — Pick, Eraser, and Select; exactly one is ever active.
-   See [Picking and Tools](picking-and-tools.md).
-2. **XY view** — the main slice view, at the current Z depth.
-3. **ZY view** — the far-left vertical slider steps through X; this view
-   updates as it moves (Shift+wheel over the view itself also steps it).
-4. **XZ view** — the bottom slider (not pictured above the view, but sized
-   to match it) steps through Y the same way.
-5. **Selection toolbar** — acts on whatever particles are currently
-   multi-selected, from either window. See
+1. **Tools toolbar** — Pick, Eraser, Select; exactly one is active. See
+   [Picking and Tools](picking-and-tools.md).
+2. **XY view** — the main slice view at the current Z; the bottom slider and
+   Shift+wheel step through Z.
+3. **ZY view** — stepped through X by the far-left slider.
+4. **XZ view** — stepped through Y by the slider beneath it.
+5. **Selection toolbar** — acts on the currently selected particles. See
    [Selection, Undo, and Saving](selection-and-saving.md).
 
-The second window, the **Particle List**, is the thumbnail gallery and also
-where sets are created, renamed, colored, and deleted — there's no separate
-"Sets" window. See [The Particle List](particle-list.md).
+The second window, the **Particle List**, is the thumbnail gallery and where
+sets are managed — see [The Particle List](particle-list.md).

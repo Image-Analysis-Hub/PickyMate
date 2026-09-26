@@ -6,7 +6,7 @@ environment in environment.yml); `python tomo_boxer.py` works the same.
 
 Usage:
     pickymate --session session.csv [--native_memmap] [...]
-    pickymate tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
+    pickymate tomogram.mrc
         [--working_dir DIR] [--particle_lists PATH [PATH ...]]
         [--embedded_particle_list PATH]
         [--cryosiam_embeddings PATH [--cryosiam_umap PATH]]
@@ -56,12 +56,11 @@ def main():
              "companion_tomogram (relative paths are resolved against the manifest's "
              "folder; only 'tomogram' is required). Import columns are only used the "
              "first time a tomogram is opened.")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--box2d", action="store_true", help="Pick 2D particles from tomogram slices")
-    mode.add_argument("--box3d", action="store_true", help="Pick 3D sub-volumes (default)")
-    parser.add_argument("--label", type=str, default=None, help="Start viewing the specified particle set/label")
-    parser.add_argument("--clean", action="store_true", help="Start in eraser (cleaning) mode")
-    parser.add_argument("--apix", type=float, default=None, help="Override pixel size (Angstrom/pixel)")
+    # Options retired from the command line but still honored by the code if
+    # set programmatically, so they can come back without re-implementation:
+    # 2D mode (options.mode = "2D"; picking was only ever used in 3D),
+    # options.label (start on a named set), options.clean (start with the
+    # Eraser active) and options.apix (override the header pixel size).
     parser.add_argument(
         "--working_dir", type=str, default=None,
         help="Directory to store/load picks from (default: <tomogram>_picks next to the tomogram), "
@@ -139,7 +138,7 @@ def main():
         parser.error("--embedded_particle_list is for importing a list *with* embeddings; "
                      "use --particle_lists for a plain coordinate file")
 
-    options.mode = "2D" if options.box2d and not options.box3d else "3D"
+    options.mode = "3D"
 
     app = QApplication(sys.argv)
     if options.session:

@@ -7,43 +7,15 @@ hang a tooltip off of, and no live object to introspect a list of them from.
 This dialog is the one place they're all written down for in-app lookup,
 reachable from the Help menu or F1 from anywhere in the app.
 
-Keep _SHORTCUTS/_NOTES here in sync by hand with README.md's own "Shortcut
-reference" table and prose -- they're two hand-maintained copies of the same
-information, not generated from one shared source.
+The table itself is shortcuts.REFERENCE_SHORTCUTS -- one shared source,
+also used to generate the documentation's table -- so this dialog can never
+drift from the docs. The notes below are in-app-only prose.
 """
 from __future__ import annotations
 
 from PySide6 import QtWidgets
 
-_SHORTCUTS = [
-    ("Add particle", "Click empty space (tomogram view)"),
-    ("Move particle", "Click + drag (tomogram view)"),
-    ("Switch active picking class + gallery tab", "1-9"),
-    ("Reorder a set's tab", "Drag it in the gallery"),
-    ("Pan", "Right-click + drag (tomogram view or gallery)"),
-    ("Zoom", "Mouse wheel"),
-    ("Step depth/slice", "Shift + wheel (tomogram view)"),
-    ("Send to Recycle Bin / delete from bin", "Shift + click"),
-    ("Send this + rest of list to Recycle Bin", "Shift + Ctrl + click (gallery)"),
-    ("Send to Confirmed", "Space + click"),
-    ("Multi-select toggle", "Ctrl + click (gallery or tomogram view)"),
-    ("Multi-select range", "Alt + click (gallery)"),
-    ("Send every selected particle to Recycle Bin", "Delete"),
-    ("Send every selected particle to Confirmed", "Insert"),
-    ("Navigate to the neighboring particle", "Arrow keys (gallery)"),
-    ("Shape-select (rectangle/circle)", "Click + drag, Select tool active"),
-    ("Shape-select (freeform)", "Click to place points, Select tool active"),
-    ("Finish freeform selection", "Double-click, Enter, or click near the start point"),
-    ("Undo last freeform point", "Backspace (while placing points)"),
-    ("Cancel freeform selection", "Escape"),
-    ("Clear the current selection (anywhere in the app)", "Escape"),
-    ("New set", "Click the gallery's \"+\" tab, or Set > New Set..."),
-    ("Rename set", "Double-click its tab, or Set > Rename Set..."),
-    ("Undo", "Ctrl+Z"),
-    ("Redo", "Ctrl+Y, Ctrl+Shift+Z, or your platform's native Redo key"),
-    ("Force everything to re-derive and redraw", "F5 (Edit > Refresh)"),
-    ("This reference", "F1"),
-]
+from .shortcuts import REFERENCE_SHORTCUTS
 
 _NOTES = [
     "Box size and eraser radius apply once you press Enter, click elsewhere, "
@@ -130,7 +102,7 @@ class ShortcutsDialog(QtWidgets.QDialog):
         rows = "".join(
             f"<tr><td>{action}</td>"
             f"<td style='padding-left:20px'><b>{keys}</b></td></tr>"
-            for action, keys in _SHORTCUTS
+            for action, keys in REFERENCE_SHORTCUTS
         )
         notes = "".join(f"<li style='margin-bottom:6px'>{n}</li>" for n in _NOTES)
         return (

@@ -672,7 +672,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 if self.session is not None else None)
         if data is None:
             data = Volume.from_file(datafile, native_memmap=self._native_memmap)
-        if options.apix:
+        if getattr(options, "apix", None):
             data.apix = options.apix
         self._volume_slots["primary"] = data
         self.data = None
@@ -908,7 +908,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.new_set("particles_00")
 
         self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
-        if options.label:
+        if getattr(options, "label", None):
             sid = [i for i in self.sets if self.sets[i] == options.label]
             if sid:
                 self.currentset = sid[0]
@@ -922,7 +922,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.sets_visible.discard(categories.RECYCLE_BIN_ID)
         self.wboxsize.setValue(self.get_boxsize())
 
-        if options.clean:
+        if getattr(options, "clean", False):
             self.tool_eraser_action.setChecked(True)
             self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
 

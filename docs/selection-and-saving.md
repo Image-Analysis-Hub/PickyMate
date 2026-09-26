@@ -2,54 +2,36 @@
 
 ## Selecting from the tomogram window
 
-- **Ctrl+click** a particle in any of the three tomogram views toggles it
-  in/out of the multi-selection — the exact same selection the gallery
-  uses, so it works interchangeably with Ctrl/Alt+click in the gallery.
-- A small label at the bottom-right of the tomogram window shows "N
-  particle(s) selected", the way a file manager shows a selection count.
-- The **Selection** toolbar acts on that selection directly: **Confirm
-  Selected**, **Recycle Selected**, and **Move Selected To** (type a set
-  name — existing or new — into the box beside it, then Move Selected To).
-  Each one clears the selection afterward, the same way a file manager
-  doesn't keep files selected once you've moved them.
-- **Escape** clears the current selection from anywhere in the app, not
-  just while a tomogram view has keyboard focus.
-- **Show Only Selected** (also in the Selection toolbar) shows a particle
-  in the tomogram views only if it's both currently selected *and* still
-  in whatever set it was in when it joined the selection — moving it to
-  another set (Space/Shift+click, drag, Move Selected To) hides it right
-  away without deselecting it, even though its new set is itself visible.
-  Selecting particles from several different sets at once is fine — each
-  one's own set at the moment it's selected is what it's compared against,
-  not a single shared one. If nothing is selected, nothing shows. Updates
-  live as the selection changes.
-- **Delete** sends every currently selected particle to the Recycle Bin,
-  the same as clicking Recycle Selected; **Insert** sends them to
-  Confirmed instead, the same as Confirm Selected.
+- **Ctrl+click** a particle in any view toggles it in the multi-selection —
+  the same selection the gallery and the UMAP map use, interchangeably. A
+  count shows at the bottom-right of the tomogram window.
+- The **Selection** toolbar acts on it: **Confirm Selected**, **Recycle
+  Selected**, **Move Selected To** (type a set name — existing or new). Each
+  clears the selection afterwards.
+- **Delete** = Recycle Selected; **Insert** = Confirm Selected.
+- **Escape** clears the selection, from anywhere in the app.
+- **Show Only Selected** shows a particle only while it is selected *and*
+  still in the set it was in when selected — so moving it (Space/Shift+click,
+  drag, Move Selected To) hides it immediately, without deselecting it.
+  That makes it a review mode: what remains visible is what you have not
+  acted on yet.
 
 ## Undo / redo
 
-Every add, delete, and reassignment (recycle/confirm/move) is undoable and
-redoable, including permanent deletes from the Recycle Bin. The **Edit**
-menu and toolbar mirror Undo/Redo with visible buttons alongside the
-keyboard shortcuts. **Refresh** (Edit menu, toolbar, or F5) forces
-everything to fully re-derive and redraw — regenerating every gallery
-thumbnail from the volume and fully re-slicing the tomogram views — in
-case rendering ever visibly gets stuck; not needed for normal use.
+Every add, delete, and reassignment is undoable and redoable, including
+permanent deletes from the Recycle Bin. **Refresh** (F5) forces a full
+redraw if rendering ever gets stuck; not needed in normal use.
 
 ## Saving
 
-Picks persist automatically as one plain-text `x y z` file per set (plus
-Recycle Bin/Confirmed) inside `<tomogram>_picks/`, and a `config.settings`
-file for any non-default box sizes — no separate save step needed.
+Picks save automatically, continuously: one plain-text file per set inside
+the working directory (default `<tomogram>_picks/`), plus `config.settings`
+for box sizes and colors. No save step. Every file is documented in
+[Files on Disk](files-on-disk.md).
 
-The **File** menu offers:
+The **File** menu adds:
 
-- **Save** — forces an immediate write of every set's picks and box sizes
-  (happens automatically anyway) and confirms with the folder it wrote to.
-- **Import Particle List...** — import an `x y z` coordinate text file as a
-  brand new set, named after the file (auto-renamed with a numeric suffix if
-  that name's already taken).
-- **Export Particle Coordinates...** — copies the already-saved coordinate
-  file(s) — all sets, or one you pick — to a folder of your choice, for your
-  own records.
+- **Save** — force an immediate write and confirm where it went.
+- **Import Particle List...** — an `x y z` text file becomes a new set.
+- **Export Particle Coordinates...** — copy the saved coordinate files (all
+  sets or one) to a folder of your choice.
