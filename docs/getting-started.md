@@ -3,13 +3,21 @@
 ## Installing
 
 ```
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate pickymate
 ```
+
+This creates a conda environment named `pickymate` and installs PickyMate
+into it as the `pickymate` command, in editable mode -- the command runs the
+code in the folder you installed from, so changes to that code take effect
+without reinstalling. To install into an environment you already have, run
+`pip install -e .` from the PickyMate folder instead.
 
 ## Running
 
 ```
-python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
+conda activate pickymate
+pickymate tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
     [--working_dir DIR] [--particle_lists PATH [PATH ...]]
     [--embedded_particle_list PATH --embeddings_h5 PATH [--embeddings_umap PATH]]
 ```

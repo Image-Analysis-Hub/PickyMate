@@ -1,0 +1,15 @@
+# A conda environment with PickyMate installed as the `pickymate` command:
+#     conda env create -f environment.yml
+#     conda activate pickymate
+#     pickymate tomogram.mrc
+# PickyMate is installed in editable mode from the folder this file is in, so
+# the command always runs the code in this folder -- edits take effect without
+# reinstalling. Its dependencies come from requirements.txt via pyproject.toml.
+name: pickymate
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - "-e .[plots]"

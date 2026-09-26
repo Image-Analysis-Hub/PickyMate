@@ -3444,7 +3444,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             # the map's own selection, not the particle list's: cancel a
             # lasso in progress, otherwise clear the UMAP selection
             if not win.canvas.cancel_lasso():
-                self.clear_umap_selection()
+                win.clear_selection()     # this tomogram's, or every tomogram's on a session map
             return
         drawing = self._select_drawing
         if drawing is not None and drawing["kind"] == "freeform":
@@ -3654,7 +3654,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.close()
         self._focus_pulse_timer.stop()
         if self.umap_window is not None:
-            self.umap_window.deleteLater()
+            self.umap_window.dispose()
             self.umap_window = None
         self.boxesviewer.dispose()
         self.data = None

@@ -38,6 +38,12 @@ class SessionController(QtCore.QObject):
         self.reference_scope = ("this", [])
         self._geometry = {}
         self._layout = {}
+        # The session map and its background computation belong to the
+        # session, not to whichever tomogram is open, so switching tomograms
+        # neither drops a computed map nor kills one being computed.
+        from .session_map import SessionMapJob, SessionMapStore
+        self.session_map = SessionMapStore(session)
+        self.session_map_job = SessionMapJob(self.session_map)
         self.navigator = SessionNavigator(self)
 
     def start(self, name=None):
@@ -100,6 +106,37 @@ class SessionController(QtCore.QObject):
             QtWidgets.QApplication.restoreOverrideCursor()
             self.navigator.set_busy(None)
 
+    def apply_session_selection(self, picked, mode):
+        """A selection made on the session map, applied to every tomogram.
+        picked: {tomogram name: set of uids}; mode as for
+        TomoBoxer.set_umap_selection. "replace" gives every tomogram exactly
+        what was picked in it -- nothing, for those the lasso missed. The
+        open tomogram's selection is set live (its "UMAP Selection" tab);
+        every other tomogram's is written to its working directory, which
+        it loads as that tab the next time it is opened."""
+        here = self.current_name
+        new_here = None
+        for name in self.session.names:
+            pick = set(picked.get(name, ()))
+            current = (set(self.current.umap_selection) if name == here
+                       else self.session.selection_uids(name))
+            if mode == "add":
+                new = current | pick
+            elif mode == "toggle":
+                new = current ^ pick
+            else:
+                new = pick
+            if name == here:
+                new_here = new
+            elif new != current:
+                self.session.write_selection(name, new)
+        if self.current is not None and new_here is not None:
+            # other tomograms first, so the map refresh this triggers reads them
+            self.current.set_umap_selection(new_here, "replace", from_map=bool(new_here))
+            if self.current.umap_window is not None:
+                self.current.umap_window.schedule_refresh()
+        self.navigator.refresh()
+
     def step(self, delta):
         names = self.session.names
         if self.current_name is None:
@@ -119,7 +156,7 @@ class SessionController(QtCore.QObject):
 
 
 class SessionNavigator(QtWidgets.QWidget):
-    COLUMNS = ("Tomogram", "Confirmed", "Recycle Bin", "Unlabelled", "Reviewed")
+    COLUMNS = ("Tomogram", "Confirmed", "Recycle Bin", "Unlabelled", "Reviewed", "UMAP selected")
 
     def __init__(self, controller):
         super().__init__()
@@ -192,7 +229,9 @@ class SessionNavigator(QtWidgets.QWidget):
             name = ("▶ " if entry.name == current else "   ") + entry.name
             if not os.path.isdir(entry.working_dir):
                 reviewed = "not started"
-            values = (name, c["confirmed"], c["recycle"], c["unlabelled"], reviewed)
+            selected = len(self.controller.session.selection_uids(entry.name))
+            values = (name, c["confirmed"], c["recycle"], c["unlabelled"], reviewed,
+                      selected or "")
             for col, v in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(str(v))
                 if col:

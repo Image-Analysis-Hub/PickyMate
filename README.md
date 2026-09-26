@@ -10,9 +10,15 @@ coordinates.
 ## Quickstart
 
 ```
-pip install -r requirements.txt
-python tomo_boxer.py tomogram.mrc
+conda env create -f environment.yml
+conda activate pickymate
+pickymate tomogram.mrc
 ```
+
+This installs PickyMate as the `pickymate` command, in editable mode: the
+command runs the code in this folder, so pulling changes or editing it needs
+no reinstall. In an existing environment, `pip install -e .` from this folder
+does the same. `python tomo_boxer.py` still works too.
 
 ## Documentation
 

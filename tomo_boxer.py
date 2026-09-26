@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """PickyMate: a standalone tomogram particle-picking tool.
 
+Installed as the `pickymate` command (pip install -e . , or the conda
+environment in environment.yml); `python tomo_boxer.py` works the same.
+
 Usage:
-    python tomo_boxer.py --session session.csv [--native_memmap] [...]
-    python tomo_boxer.py tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
+    pickymate --session session.csv [--native_memmap] [...]
+    pickymate tomogram.mrc [--box2d | --box3d] [--label NAME] [--clean] [--apix APIX]
         [--working_dir DIR] [--particle_lists PATH [PATH ...]]
         [--embedded_particle_list PATH]
         [--cryosiam_embeddings PATH [--cryosiam_umap PATH]]
@@ -17,7 +20,7 @@ rank the same picks by each and compare: the first creates the set, the rest
 attach to those same particles, and every method's full embedding and UMAP
 show up as separate choices in the ranking dropdown. For example:
 
-    python tomo_boxer.py TS_026.rec \\
+    pickymate TS_026.rec \\
         --embedded_particle_list Picks_3DTM/TS_026.txt \\
         --cryosiam_embeddings CryoSIAM/TS_026_embeds.h5 \\
         --cryosiam_umap       CryoSIAM/TS_026_embeds_umap_data.csv \\

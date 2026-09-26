@@ -131,6 +131,8 @@ class Session:
         self.entries = entries
         self.manifest_path = manifest_path
         self._ref_cache = {}
+        self._table_cache = {}
+        self._selection_cache = {}
         self._prefetched = {}
         self._prefetch_lock = threading.Lock()
 
@@ -268,8 +270,11 @@ class Session:
         return (np.vstack(blocks) if blocks else None), used, skipped
 
     @staticmethod
-    def _space_array(entry, space):
-        """(array, None), or (None, reason) when it can't be read."""
+    def space_file(entry, space):
+        """(record, None) for the file holding `space` in this tomogram's
+        working directory -- {"method", "kind", "n", "path"}, with the
+        manifest's location standing in for a recorded one that no longer
+        exists -- or (None, reason)."""
         fixes = entry.embedding_path_fixes()
         for saved in metadata.load_embeddings_settings(entry.working_dir, include_missing=True):
             if saved["name"] != space:
@@ -277,8 +282,77 @@ class Session:
             path = saved["path"] if saved["exists"] else fixes.get(space)
             if path is None:
                 return None, f"its {space} file is missing ({saved['path']})"
-            if saved["kind"] == "umap":
-                return embeddings_io.load_umap(saved["method"], path)["umap_xy"], None
-            return embeddings_io.load_embeddings(
-                saved["method"], path, n_expected=saved["n"])["embeddings"], None
+            return dict(saved, path=path), None
         return None, f"no {space} embeddings attached"
+
+    @classmethod
+    def _space_array(cls, entry, space):
+        """(array, None), or (None, reason) when it can't be read."""
+        rec, why = cls.space_file(entry, space)
+        if rec is None:
+            return None, why
+        if rec["kind"] == "umap":
+            return embeddings_io.load_umap(rec["method"], rec["path"])["umap_xy"], None
+        return embeddings_io.load_embeddings(
+            rec["method"], rec["path"], n_expected=rec["n"])["embeddings"], None
+
+    # -- particles and UMAP selections of tomograms that are not open --------------
+    def particle_table(self, name):
+        """Every embedded particle of a tomogram, read from its working
+        directory: {"rows", "uids", "cats", "records"} where rows are
+        embedding rows, cats the category of each (CAT_* below) and records
+        the full per-particle dicts keyed by uid. What the session map needs
+        to place, colour and select particles of a tomogram that is not
+        open. Cached until any of its set files changes on disk."""
+        e = self.entry(name)
+        classes = metadata.discover_classes(e.working_dir) if os.path.isdir(e.working_dir) else []
+        stamp = tuple(sorted((c, *_stat(metadata.class_file(e.working_dir, c))) for c in classes))
+        cached = self._table_cache.get(name)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        rows, uids, cats, records = [], [], [], {}
+        for c in classes:
+            cat = (CAT_CONFIRMED if c == categories.CONFIRMED_NAME else
+                   CAT_RECYCLE if c == categories.RECYCLE_BIN_NAME else CAT_UNLABELLED)
+            for r in metadata.load_class_records(e.working_dir, c):
+                if r["embedding_row"] is None or r["uid"] is None:
+                    continue
+                rows.append(r["embedding_row"])
+                uids.append(r["uid"])
+                cats.append(cat)
+                records[r["uid"]] = dict(r, set=c)
+        table = {"rows": np.asarray(rows, dtype=np.int64), "uids": np.asarray(uids, dtype=np.int64),
+                 "cats": np.asarray(cats, dtype=np.int8), "records": records}
+        self._table_cache[name] = (stamp, table)
+        return table
+
+    def selection_uids(self, name):
+        """uids in a tomogram's saved UMAP selection (its "UMAP Selection.csv")."""
+        path = metadata.umap_selection_path(self.entry(name).working_dir)
+        stamp = _stat(path)
+        cached = self._selection_cache.get(name)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        uids = {r["uid"] for r in metadata.load_umap_selection(self.entry(name).working_dir)
+                if r["uid"] is not None}
+        self._selection_cache[name] = (stamp, uids)
+        return uids
+
+    def write_selection(self, name, uids):
+        """Replace a (not open) tomogram's saved UMAP selection -- it is
+        loaded as that tomogram's "UMAP Selection" tab when it is opened.
+        Only particles that exist in its sets are written."""
+        table = self.particle_table(name)
+        records = [table["records"][u] for u in sorted(uids) if u in table["records"]]
+        metadata.save_umap_selection(self.entry(name).working_dir, records)
+
+
+CAT_UNLABELLED, CAT_RECYCLE, CAT_CONFIRMED = 0, 1, 2
+
+
+def _stat(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, -1)

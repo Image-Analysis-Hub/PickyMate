@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pickymate"
+version = "0.1.0"
+description = "Tomogram particle picking and triage, ranked by embedding similarity"
+readme = "README.md"
+requires-python = ">=3.10"
+# read from requirements.txt, so there is a single list of dependencies
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+# only the plotting scripts use it, not PickyMate itself
+plots = ["matplotlib>=3.5"]
+
+[project.scripts]
+# the `pickymate` command; `python tomo_boxer.py` keeps working as well
+pickymate = "tomo_boxer:main"
+
+[tool.setuptools]
+py-modules = ["tomo_boxer"]
+packages = ["boxer"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
