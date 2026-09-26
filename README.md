@@ -14,14 +14,15 @@ finished re-rank the ones you have not opened yet.
 
 ![What PickyMate does](docs/images/overview.png)
 
-The moment that matters, live from the app — one click reorders 15,000
-picks around the handful you confirmed:
+The moment that matters, live from the app — you confirm a few good
+particles, and one click reorders thousands of picks around them:
 
 ![Ranking, animated](docs/images/ranking.gif)
 
-Picking by hand (or fixing individual picks) works too: three orthogonal
-slice views, click to pick, organize into sets, everything saved as plain
-`x y z` text files.
+Everything can also be fixed by hand — three orthogonal slice views, click
+to add or remove a pick, organize into sets, all saved as plain `x y z`
+text files. But start from the template-matching list: only its picks carry
+embeddings, so a particle picked by hand cannot take part in the ranking.
 
 ## Install
 

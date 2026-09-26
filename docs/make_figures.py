@@ -219,25 +219,78 @@ def shot_particle_list(win, out):
          out, "particle-list-overview.png")
 
 
-def shot_umap(win, out):
+def shot_umap(win, out, tmp):
+    """The UMAP-selection GIF: the map, a lasso being drawn, the selection
+    lighting up, and the UMAP Selection tab it becomes in the Particle
+    List."""
     from boxer import categories
+    from boxer.umap_view import points_in_polygon
     win.open_umap_window()
     uw = win.umap_window
     uw.setMinimumSize(760, 700)
     QtWidgets.QApplication.processEvents()
     uw.refresh(refit=True)
     QtWidgets.QApplication.processEvents()
-    # lasso-like selection: everything within an ellipse of the confirmed cloud
     c = uw.canvas
+    grab(uw).save(os.path.join(tmp, "umap_plain.png"))
+
+    # a hand-drawn-looking lasso around the confirmed cloud, in data coords
     conf = c._classes == categories.CONFIRMED_ID
-    if conf.any():
-        cx, cy = np.median(c._xy[conf], axis=0)
-        r = 0.9 * np.median(np.abs(c._xy[conf] - [cx, cy]).max(axis=1))
-        inside = np.abs(c._xy - [cx, cy]).max(axis=1) < r
-        win.set_umap_selection(uw._uids[inside].tolist(), "replace")
+    cx, cy = np.median(c._xy[conf], axis=0)
+    rx = 1.25 * np.percentile(np.abs(c._xy[conf, 0] - cx), 92)
+    ry = 1.25 * np.percentile(np.abs(c._xy[conf, 1] - cy), 92)
+    th = np.linspace(0, 2 * np.pi, 80)
+    poly = np.c_[cx + rx * (1 + 0.10 * np.sin(3 * th)) * np.cos(th),
+                 cy + ry * (1 + 0.10 * np.cos(2 * th)) * np.sin(th)]
+    lasso = grab(uw)
+    sx, sy = c._to_screen(poly)
+    o = c.mapTo(uw, QtCore.QPoint(0, 0))
+    p = QtGui.QPainter(lasso)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.setPen(QtGui.QPen(ACCENT, 3, QtCore.Qt.DashLine))
+    p.drawPolyline(QtGui.QPolygonF(
+        [QtCore.QPointF(x + o.x(), y + o.y()) for x, y in zip(sx, sy)]))
+    p.end()
+    lasso.save(os.path.join(tmp, "umap_lasso.png"))
+
+    inside = points_in_polygon(c._xy[:, 0], c._xy[:, 1], poly)
+    win.set_umap_selection(uw._uids[inside].tolist(), "replace")
+    QtWidgets.QApplication.processEvents()
+    uw.refresh()
+    grab(uw).save(os.path.join(tmp, "umap_selected.png"))
+    print(f"umap gif: lassoed {int(inside.sum())} picks")
+
+    bv = win.boxesviewer
+    bv.tabs.setCurrentWidget(bv.umap_grid)
+    grab(bv)   # let the freshly shown tab's deferred sync finish
+    # centre the gallery on a Confirmed member of the selection, so the
+    # frame shows the colour-bordered groups rather than one red block
+    cls = {b[6]: b[5] for b in win.boxes}
+    conf_sel = [u for u in uw._uids[inside].tolist()
+                if cls.get(u) == categories.CONFIRMED_ID]
+    item = bv.umap_grid._items.get(conf_sel[0]) if conf_sel else None
+    if item is not None:
+        bv.umap_grid.centerOn(item)
         QtWidgets.QApplication.processEvents()
-        uw.refresh()
-    save(grab(uw), out, "umap-map.png")
+        bv.umap_grid.centerOn(item)
+    grab(bv).save(os.path.join(tmp, "umap_tab.png"))
+
+    from PIL import Image
+    frames = [caption_frame(os.path.join(tmp, f), text) for f, text in (
+        ("umap_plain.png", "The UMAP map: every embedded pick, colored by set, live"),
+        ("umap_lasso.png", "Drag to lasso a region..."),
+        ("umap_selected.png", "...it becomes the selection — picks stay in their sets"),
+        ("umap_tab.png", "...and appears as the UMAP Selection tab in the Particle List"))]
+    w, h = max(f.width for f in frames), max(f.height for f in frames)
+    canvas = []
+    for f in frames:
+        page = Image.new("RGB", (w, h), "white")
+        page.paste(f, ((w - f.width) // 2, (h - f.height) // 2))
+        canvas.append(page)
+    path = os.path.join(out, "umap-selection.gif")
+    canvas[0].save(path, save_all=True, append_images=canvas[1:],
+                   duration=[2800, 2200, 2200, 4200], loop=0, optimize=True)
+    print(f"wrote {path}  ({os.path.getsize(path) // 1024} KB)")
     win.clear_umap_selection()
     uw.close()
 
@@ -345,17 +398,14 @@ def shot_ranking(data, out, tmp):
     rows = {r["embedding_row"] for r in real if r["embedding_row"] is not None}
     idx = [i for i, b in enumerate(win.boxes) if b[7] in rows][:60]
     cid = next(c for c in win.sets if c not in categories.FIXED_CLASS_IDS)
-    win.currentset = cid
-    win._reassign_boxes(idx, categories.CONFIRMED_ID)
 
-    shot_tools(win, out, tmp)
-
-    bv = win.boxesviewer
-    bv.activate_class_tab(cid)
-    QtWidgets.QApplication.processEvents()
+    # ground-truth colour-coding for the static panels
     is_particle = gt_matcher(data)
     coords = {b[6]: (b[0], b[1], b[2]) for b in win.boxes}
     is_ok = lambda uid: is_particle(*coords[uid])
+    bv = win.boxesviewer
+    bv.activate_class_tab(cid)
+    QtWidgets.QApplication.processEvents()
     grid = bv.tabs.currentWidget()
 
     def head_marked(name):
@@ -366,26 +416,82 @@ def shot_ranking(data, out, tmp):
         pm = pm.copy(0, y_off, pm.width() - 18, 560)
         mark_grid(grid, pm, y_off, is_ok).save(os.path.join(tmp, name))
 
+    # the pristine import is the "before" everywhere: removing particles
+    # from a live tab leaves holes in its layout (sync_particles keeps
+    # slots), so the untouched template-matching order must be grabbed
+    # before anything is confirmed
     head_marked("rank_before.png")
-    bar0 = grid.verticalScrollBar()
-    bar0.setValue(bar0.maximum())
-    grab(grid).copy(0, grab(grid).height() - 560, grid.width() - 18, 560).save(
-        os.path.join(tmp, "gif_before.png"))
+    bar = grid.verticalScrollBar()
+    bar.setValue(bar.maximum())
+    pm = grab(grid)
+    y_off = pm.height() - 560
+    pm = pm.copy(0, y_off, pm.width() - 18, 560)
+    pm.save(os.path.join(tmp, "gif_pick.png"))
+    # ...and the same view with the picks about to be confirmed outlined:
+    # the GIF must show where the confirmed particles come from
+    conf_uids = {win.boxes[i][6] for i in idx}
+    p = QtGui.QPainter(pm)
+    p.setPen(QtGui.QPen(QtGui.QColor("#2ecc71"), 5))
+    shown = 0
+    for uid in conf_uids:
+        item = grid._items.get(uid)
+        if item is None:
+            continue
+        r = grid.mapFromScene(item.sceneBoundingRect()).boundingRect()
+        r.translate(0, -y_off)
+        if r.top() >= 0 and r.bottom() < pm.height() and r.right() < pm.width():
+            p.drawRect(r.adjusted(3, 3, -3, -3))
+            shown += 1
+    p.end()
+    pm.save(os.path.join(tmp, "gif_confirm.png"))
+    print(f"ranking gif: {shown} of the confirmed picks visible in the head")
+
+    win.currentset = cid
+    win._reassign_boxes(idx, categories.CONFIRMED_ID)
+
+    shot_tools(win, out, tmp)
+
+    bv.activate_class_tab(cid)
+    QtWidgets.QApplication.processEvents()
     grab(bv).copy(0, bv.height() - 190, bv.width(), 190).save(
         os.path.join(tmp, "gif_rank.png"))
 
-    win.run_compute_distance(target_classid=cid, reference_classid=categories.CONFIRMED_ID,
-                             space="tomotwin", leave_one_out=False,
-                             negative_classid=None)
-    for w in QtWidgets.QApplication.topLevelWidgets():
-        if isinstance(w, QtWidgets.QMessageBox):
-            w.close()
-    QtWidgets.QApplication.processEvents()
-    head_marked("rank_after.png")
+    def rank():
+        win.run_compute_distance(target_classid=cid,
+                                 reference_classid=categories.CONFIRMED_ID,
+                                 space="tomotwin", leave_one_out=False,
+                                 negative_classid=None)
+        for w in QtWidgets.QApplication.topLevelWidgets():
+            if isinstance(w, QtWidgets.QMessageBox):
+                w.close()
+        QtWidgets.QApplication.processEvents()
+
+    rank()
+    bar0 = grid.verticalScrollBar()
     bar0.setValue(bar0.maximum())
     grab(grid).copy(0, grab(grid).height() - 560, grid.width() - 18, 560).save(
         os.path.join(tmp, "gif_after.png"))
     ranking_gif(out, tmp)
+
+    # For the static "after" panel only: its point is "review from the top",
+    # so recycle the ground-truth junk that ranked into the visible head and
+    # re-rank -- which also re-compacts the layout -- until the head is
+    # clean. Pure illustration; the GIF above is the unretouched reorder.
+    for _ in range(8):
+        bar0.setValue(bar0.maximum())
+        grab(grid)
+        h = grid.viewport().height()
+        junk = []
+        for uid, item in grid._items.items():
+            v = grid.mapFromScene(item.sceneBoundingRect()).boundingRect()
+            if v.bottom() > h - 566 and v.top() < h and not is_ok(uid):
+                junk.append(uid)
+        if not junk:
+            break
+        win._reassign_boxes([i for i, b in enumerate(win.boxes) if b[6] in set(junk)],
+                            categories.RECYCLE_BIN_ID)
+        rank()
+    head_marked("rank_after.png")
 
     fig, axes = plt.subplots(1, 2, figsize=(13.6, 5.2))
     for ax, name, title in (
@@ -439,23 +545,26 @@ def caption_frame(png_path, text, width=880):
 
 
 def ranking_gif(out, tmp):
-    """README animation: the gallery reordering the moment picks are ranked.
-    Every frame shares one canvas (GIF frames must); the middle frame is the
-    dimmed before-grid with the ranking row overlaid, as if just clicked."""
+    """README animation: the pick-order gallery, the picks the user confirms
+    outlined in green, the rank click, and the reorder. Every frame shares
+    one canvas (GIF frames must); the rank frame is the dimmed gallery with
+    the ranking row overlaid, as if just clicked."""
     from PIL import Image
-    before = caption_frame(os.path.join(tmp, "gif_before.png"),
-                           "Template-matching picks, in pick order — junk and particles mixed")
+    pick = caption_frame(os.path.join(tmp, "gif_pick.png"),
+                         "Template-matching picks, in pick order — junk and particles mixed")
+    confirm = caption_frame(os.path.join(tmp, "gif_confirm.png"),
+                            "You confirm good particles as you meet them (green)...")
     after = caption_frame(os.path.join(tmp, "gif_after.png"),
                           "Reordered: closest to your Confirmed first — review from the top, decide in bulk")
-    rank = caption_frame(os.path.join(tmp, "gif_before.png"),
-                         "You confirm a few good particles...  then ▶ Rank by Embedding Distance")
+    rank = caption_frame(os.path.join(tmp, "gif_confirm.png"),
+                         "...then ▶ Rank by Embedding Distance")
     rank = Image.blend(rank, Image.new("RGB", rank.size, "white"), 0.55)
     panel = Image.open(os.path.join(tmp, "gif_rank.png")).convert("RGB")
     panel = panel.resize((rank.width, int(panel.height * rank.width / panel.width)),
                          Image.LANCZOS)
     rank.paste(panel, (0, (rank.height - panel.height) // 2))
-    frames = [before, rank] + [Image.blend(rank, after, t) for t in (0.25, 0.5, 0.75)] + [after]
-    durations = [2600, 2000, 120, 120, 120, 3800]
+    frames = [pick, confirm, rank] + [Image.blend(rank, after, t) for t in (0.25, 0.5, 0.75)] + [after]
+    durations = [2600, 2600, 1800, 120, 120, 120, 3800]
     path = os.path.join(out, "ranking.gif")
     frames[0].save(path, save_all=True, append_images=frames[1:],
                    duration=durations, loop=0, optimize=True)
@@ -499,6 +608,10 @@ def shot_session(data, out, tmp):
 # the README overview figure -- pure matplotlib, straight from the data
 # ---------------------------------------------------------------------------
 def hero(data, out):
+    """Two rows, five panels: the picks, the embeddings, the decisions made
+    in the gallery, the distance doing the sorting, and the finished order.
+    Pure matplotlib, straight from the data."""
+    from matplotlib.patches import ConnectionPatch
     from boxer import embeddings_io, metadata
     from boxer.volume import Volume
 
@@ -509,16 +622,21 @@ def hero(data, out):
     umap = embeddings_io.load_tomotwin_umap(
         os.path.join(data, "TomoTwin/Ribosomes_embeddings/TS_026.tumap"))["umap_xy"]
     wd = os.path.join(data, "Ribosomes_PickyMate/TS_026_picks")
-    conf_rows = np.array([r["embedding_row"] for r in
-                          metadata.load_class_records(wd, "Confirmed")
-                          if r["embedding_row"] is not None])
-    junk_rows = np.array([r["embedding_row"] for r in
-                          metadata.load_class_records(wd, "Recycle Bin")
-                          if r["embedding_row"] is not None])
+    conf_set = {r["embedding_row"] for r in metadata.load_class_records(wd, "Confirmed")
+                if r["embedding_row"] is not None}
+    junk_set = {r["embedding_row"] for r in metadata.load_class_records(wd, "Recycle Bin")
+                if r["embedding_row"] is not None}
     vol = Volume.from_file(os.path.join(data, "Tomograms/TS_026.rec"), native_memmap=True)
 
-    # a handful of early decisions, as at the start of a session
-    few_conf, few_junk = conf_rows[:40], junk_rows[:60]
+    # the user's first pass: the head of the pick-order list, each pick
+    # decided the way the real curation session decided it
+    head_n = 30
+    while head_n < 400 and (len(conf_set & set(range(head_n))) < 10
+                            or len(junk_set & set(range(head_n))) < 10):
+        head_n += 10
+    head = np.arange(head_n)
+    few_conf = np.array(sorted(conf_set & set(range(head_n))))
+    few_junk = np.array(sorted(junk_set & set(range(head_n))))
 
     # rank everything else by Mahalanobis distance to those few confirmed
     ref = np.asarray(emb[few_conf], dtype=np.float64)
@@ -527,25 +645,45 @@ def hero(data, out):
     covinv = np.linalg.pinv(c.T @ c / (len(ref) - 1), hermitian=True)
     d = np.asarray(emb, dtype=np.float64) - mu
     score = ((d @ covinv) * d).sum(1)
-    undecided = np.setdiff1d(np.arange(len(picks)), np.concatenate([few_conf, few_junk]))
+    undecided = np.setdiff1d(np.arange(len(picks)), np.union1d(few_conf, few_junk))
     order = undecided[np.argsort(score[undecided])]
 
     def thumb(row):
+        # a thin slab, light smoothing and a tight display range: ribosomes
+        # are faint, and a thick unsmoothed mean washes them into the
+        # cytoplasm texture
+        from scipy.ndimage import gaussian_filter
         x, y, z = picks[row]
-        cube = vol.get_clip_centered(x, y, z, 44, 44, 7)
-        return norm(cube.mean(axis=0, dtype=np.float32))
+        cube = vol.get_clip_centered(x, y, z, 34, 34, 3)
+        img = gaussian_filter(cube.mean(axis=0, dtype=np.float32), 1.0)
+        lo, hi = np.percentile(img, (4.0, 96.0))
+        return np.clip((img - lo) / ((hi - lo) or 1.0), 0, 1)
+
+    def off_edge(row):
+        x, y, z = picks[row]
+        return (22 <= x < vol.nx - 22 and 22 <= y < vol.ny - 22
+                and 2 <= z < vol.nz - 2)
 
     is_particle = gt_matcher(data)
+    GREEN, RED = (0.18, 0.80, 0.44), (0.91, 0.30, 0.24)
 
-    def block(rows, n_cols=6, n_rows=2):
-        """Thumbnails as RGB, each with a thin band along the top: green if
-        the pick is a real ribosome by the ground truth, red if junk."""
-        rows = list(rows[: n_cols * n_rows])
+    def block(rows, n_cols, n_rows, decided=False):
+        """Thumbnails as RGB. decided: a thick frame in the colour of the
+        user's real decision on that pick. Otherwise a thin band along the
+        top: green if the pick is a real ribosome by the ground truth, red
+        if junk."""
         cells = []
-        for r in rows:
+        for r in list(rows)[: n_cols * n_rows]:
             t = np.repeat(thumb(r)[:, :, None], 3, axis=2)
-            colour = (0.18, 0.80, 0.44) if is_particle(*picks[r]) else (0.91, 0.30, 0.24)
-            t[:4, :] = colour
+            if decided:
+                if r in conf_set or r in junk_set:
+                    colour = GREEN if r in conf_set else RED
+                    t[:3, :] = colour
+                    t[-3:, :] = colour
+                    t[:, :3] = colour
+                    t[:, -3:] = colour
+            else:
+                t[:3, :] = GREEN if is_particle(*picks[r]) else RED
             cells.append(np.pad(t, ((1, 1), (1, 1), (0, 0)), constant_values=1.0))
         return np.vstack([np.hstack(cells[i * n_cols:(i + 1) * n_cols])
                           for i in range(n_rows)])
@@ -559,57 +697,88 @@ def hero(data, out):
     y0 = int(np.clip(cy - 240, 0, full.shape[0] - 480))
     sl = norm(full[y0:y0 + 480, x0:x0 + 480])
 
-    fig = plt.figure(figsize=(15.5, 4.4), facecolor="white")
-    gs = fig.add_gridspec(1, 4, wspace=0.14, left=0.015, right=0.985, top=0.82, bottom=0.10)
+    fig = plt.figure(figsize=(13.2, 8.2), facecolor="white")
+    gs = fig.add_gridspec(2, 3, wspace=0.16, hspace=0.50,
+                          left=0.02, right=0.98, top=0.90, bottom=0.075)
 
-    ax = fig.add_subplot(gs[0])
-    ax.imshow(sl, cmap="gray", origin="lower")
-    ax.scatter(picks[near, 0] - x0, picks[near, 1] - y0, s=60, facecolors="none",
-               edgecolors="#39c0ed", linewidths=1.0)
-    ax.set_xlim(0, 480)
-    ax.set_ylim(0, 480)
-    ax.set_title("Template matching over-picks:\nthousands of hits, most junk",
-                 fontsize=11, color=TEXT)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(sl, cmap="gray", origin="lower")
+    ax1.scatter(picks[near, 0] - x0, picks[near, 1] - y0, s=60, facecolors="none",
+                edgecolors="#39c0ed", linewidths=1.0)
+    ax1.set_xlim(0, 480)
+    ax1.set_ylim(0, 480)
+    ax1.set_title("1 · Template matching over-picks:\nthousands of hits, most junk",
+                  fontsize=11, color=TEXT)
 
-    ax = fig.add_subplot(gs[1])
-    ax.scatter(umap[:, 0], umap[:, 1], s=2, c="0.75", linewidths=0)
-    ax.set_title("A foundation model embeds\nevery pick", fontsize=11, color=TEXT)
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.scatter(umap[:, 0], umap[:, 1], s=2, c="0.75", linewidths=0)
+    ax2.set_title("2 · A foundation model embeds\nevery pick (TomoTwin, UMAP shown)",
+                  fontsize=11, color=TEXT)
 
-    ax = fig.add_subplot(gs[2])
-    ax.scatter(umap[:, 0], umap[:, 1], s=2, c="0.82", linewidths=0)
-    ax.scatter(umap[few_junk, 0], umap[few_junk, 1], s=14, c="crimson", linewidths=0,
-               label="you reject a few")
-    ax.scatter(umap[few_conf, 0], umap[few_conf, 1], s=14, c="limegreen", linewidths=0,
-               label="you confirm a few")
-    ax.legend(loc="lower right", fontsize=8, frameon=False)
-    ax.set_title("You make a handful\nof decisions", fontsize=11, color=TEXT)
+    ax3 = fig.add_subplot(gs[0, 2])
+    # the raw head of this list is nearly all junk; sample it so both
+    # decisions are visible, keeping pick order
+    disp_conf = [r for r in few_conf if off_edge(r)][:8]
+    rej = [r for r in few_junk if off_edge(r)]
+    n_rej = 15 - len(disp_conf)
+    disp = sorted(disp_conf + rej[:: max(1, len(rej) // n_rej)][:n_rej])
+    ax3.imshow(block(disp, 5, 3, decided=True))
+    ax3.set_title("3 · You review the top of the list in the\n"
+                  "gallery: confirm the good, reject the junk",
+                  fontsize=11, color=TEXT)
 
-    ax = fig.add_subplot(gs[3])
-    ranked = block(order)
-    unranked = block(undecided)
-    gap = np.ones((10, ranked.shape[1], 3))
-    ax.imshow(np.vstack([unranked, gap, ranked]))
-    ax.text(-0.02, 0.76, "pick\norder", transform=ax.transAxes, fontsize=10,
-            ha="right", va="center", color=TEXT)
-    ax.text(-0.02, 0.26, "after\nranking", transform=ax.transAxes, fontsize=10,
-            ha="right", va="center", color="#1e8449")
-    ax.set_title("PickyMate reorders the rest,\nlive — decide in bulk",
-                 fontsize=11, color=TEXT)
+    ax4 = fig.add_subplot(gs[1, 0])
+    ax4.scatter(umap[:, 0], umap[:, 1], s=2, c="0.85", linewidths=0)
+    ax4.scatter(umap[order[:300], 0], umap[order[:300], 1], s=6, c="#a9dfbf",
+                linewidths=0)
+    ax4.scatter(umap[few_junk, 0], umap[few_junk, 1], s=16, c="crimson", linewidths=0)
+    ax4.scatter(umap[few_conf, 0], umap[few_conf, 1], s=16, c="#1e8449", linewidths=0)
+    mx, my = np.median(umap[few_conf], axis=0)
+    ax4.annotate("nearest to your Confirmed\n→ the front of the list", xy=(mx, my),
+                 xytext=(0.03, 0.03), textcoords="axes fraction", fontsize=8.5,
+                 color="#1e8449",
+                 arrowprops=dict(arrowstyle="->", color="#1e8449", lw=1.2))
+    ax4.set_title("4 · Every remaining pick is scored by its\n"
+                  "embedding distance to your decisions",
+                  fontsize=11, color=TEXT)
+
+    ax5 = fig.add_subplot(gs[1, 1:])
+    ax5.imshow(block(order, 10, 3))
+    ax5.set_title("5 · PickyMate reorders the rest, live: lookalikes of your confirmed\n"
+                  "come to the front — review from the top, decide in bulk",
+                  fontsize=11, color=TEXT)
 
     for ax in fig.axes:
         ax.set_xticks([])
         ax.set_yticks([])
         for sp in ax.spines.values():
             sp.set_color("0.85")
-    for x in (0.253, 0.498, 0.743):
-        fig.text(x, 0.47, "→", fontsize=26, color=ACCENT.name(), ha="center", va="center")
-    fig.text(0.878, 0.028, "bands: ground truth, figure only\n"
-                           "green = real particle · red = junk",
+
+    def arrow_between(a, b):
+        pa, pb = a.get_position(), b.get_position()
+        fig.text((pa.x1 + pb.x0) / 2, (pa.y0 + pa.y1) / 2, "→",
+                 fontsize=26, color=ACCENT.name(), ha="center", va="center")
+    arrow_between(ax1, ax2)
+    arrow_between(ax2, ax3)
+    arrow_between(ax4, ax5)
+    fig.add_artist(ConnectionPatch(
+        xyA=(0.35, -0.22), coordsA=ax3.transAxes, xyB=(0.72, 1.26),
+        coordsB=ax4.transAxes, arrowstyle="-|>", mutation_scale=18,
+        color=ACCENT.name(), lw=2.2, connectionstyle="arc3,rad=0.18"))
+
+    p3 = ax3.get_position()
+    fig.text((p3.x0 + p3.x1) / 2, p3.y0 - 0.030,
+             "frames: green = you confirmed · red = you rejected",
+             fontsize=8.5, color="0.4", ha="center", va="center")
+    p5 = ax5.get_position()
+    fig.text((p5.x0 + p5.x1) / 2, 0.018,
+             "top bands: ground truth, figure only — green = real particle · red = junk",
              fontsize=8.5, color="0.4", ha="center", va="center")
 
     fig.savefig(os.path.join(out, "overview.png"), dpi=115)
     plt.close(fig)
-    print(f"wrote {out}/overview.png")
+    print(f"wrote {out}/overview.png  ({len(few_conf)} confirmed, "
+          f"{len(few_junk)} rejected of the first {head_n} picks)")
     owner = getattr(vol, "_mmap_owner", None)
     if owner is not None:
         owner.close()
@@ -644,7 +813,7 @@ def main():
             if want("gallery"):
                 shot_particle_list(win, a.out)
             if want("umap"):
-                shot_umap(win, a.out)
+                shot_umap(win, a.out, tmp)
             close(win)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

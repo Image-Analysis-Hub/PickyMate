@@ -8,14 +8,38 @@ A session opens many tomograms as one job:
 pickymate --session session.csv
 ```
 
-`session.csv` has one row per tomogram, with the same columns as the
-single-tomogram options (relative paths resolve against the manifest's
-folder; only `tomogram` is required):
+A dataset ready for a session is just the usual folders side by side —
+tomograms, template-matching picks, embeddings — plus one manifest. A real
+layout (EMPIAR-10988, ribosomes):
 
 ```
-tomogram,working_dir,embedded_particle_list,cryosiam_embeddings,cryosiam_umap,tomotwin_embeddings,tomotwin_umap,companion_tomogram
-../Tomograms/TS_026.rec,TS_026_picks,../picks/TS_026.txt,...
+EMPIAR-10988/
+├── Tomograms/                     TS_026.rec, TS_027.rec, ...
+├── TemplateMatching/              TS_026.txt, ...      ← picks, one file per tomogram
+├── TomoTwin/                      TS_026.temb + TS_026.tumap, ...
+├── CryoSiam/                      TS_026_embeds.h5, ... (+ vis/ with the UMAP CSVs)
+└── curation/                      ← everything PickyMate itself touches
+    ├── session.csv                ← the manifest: one row per tomogram
+    ├── .pickymate_session/        ← cached session UMAP maps
+    ├── TS_026_picks/              ← working directories, created as you work
+    ├── TS_027_picks/
+    └── ...
 ```
+
+`session.csv` has one row per tomogram, with the same columns as the
+single-tomogram command-line options. Only `tomogram` is required — the
+others attach the picks and embeddings on the tomogram's first open.
+Relative paths resolve against the manifest's own folder, so the whole tree
+moves or shares as one piece:
+
+```
+tomogram,working_dir,embedded_particle_list,tomotwin_embeddings,tomotwin_umap,cryosiam_embeddings,cryosiam_umap
+../Tomograms/TS_026.rec,TS_026_picks,../TemplateMatching/TS_026.txt,../TomoTwin/TS_026.temb,../TomoTwin/TS_026.tumap,../CryoSiam/TS_026_embeds.h5,../CryoSiam/vis/TS_026_embeds_umap_data.csv
+../Tomograms/TS_027.rec,TS_027_picks,../TemplateMatching/TS_027.txt,../TomoTwin/TS_027.temb,../TomoTwin/TS_027.tumap,../CryoSiam/TS_027_embeds.h5,../CryoSiam/vis/TS_027_embeds_umap_data.csv
+```
+
+(A `companion_tomogram` column — a denoised twin of each tomogram, used
+only for display — is accepted too.)
 
 ![The session navigator](images/session-navigator.png)
 
@@ -37,15 +61,16 @@ decision in the new one.
 embedded particle of the open tomogram at its 2D UMAP position, colored by
 set, updating live as you work:
 
-![The UMAP map with a selection](images/umap-map.png)
+![Lassoing a selection on the UMAP map](images/umap-selection.gif)
 
 - **Drag** to lasso a selection; **Ctrl+drag** adds a region; **Ctrl+click**
   adds or removes one particle; **Escape** clears. Wheel zooms, right-drag
   pans, double-click fits.
-- The selection becomes the **UMAP Selection** tab in the Particle List — a
-  view like All, grouped and color-bordered. Particles never leave their
-  sets; confirm or recycle them right from that tab. **Show Active Set
-  Only** on it shows just those particles in the tomogram views.
+- As the animation shows, the selection immediately becomes the **UMAP
+  Selection** tab in the Particle List — a view like All, grouped and
+  color-bordered. Particles never leave their sets; confirm or recycle them
+  right from that tab. **Show Active Set Only** on it shows just those
+  particles in the tomogram views.
 - The selection is saved (`UMAP Selection.csv` in the working directory) and
   restored on reopen.
 
