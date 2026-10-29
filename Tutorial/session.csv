@@ -1,0 +1,3 @@
+tomogram,working_dir,embedded_particle_list,tomotwin_embeddings,tomotwin_umap
+tomograms/TS_027.rec,TS_027_picks,GapStop_ribosomes/TS_027.txt,TomoTwin/TS_027.temb,TomoTwin/TS_027.tumap
+tomograms/TS_028.rec,TS_028_picks,GapStop_ribosomes/TS_028.txt,TomoTwin/TS_028.temb,TomoTwin/TS_028.tumap

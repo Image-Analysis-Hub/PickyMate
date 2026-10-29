@@ -1,0 +1,12 @@
+# the tutorial has already template matching (GapStop) picks for ribosomes that need curation, and their corresponding TomoTwin embeddings
+
+# If you have installed PickyMate, you only need to download a couple of tomograms from EMPIAR-10988 DEF, tomograms TS_027 and TS_28 into the folder tomograms
+
+cd tomograms
+wget https://ftp.ebi.ac.uk/empiar/world_availability/10988/data/DEF/tomograms/TS_027.rec && wget https://ftp.ebi.ac.uk/empiar/world_availability/10988/data/DEF/tomograms/TS_028.rec
+
+# get back to the tutorial directory and run pickymate session on the two tomograms
+cd ..
+conda activate pickymate
+pickymate --session session.csv
+
