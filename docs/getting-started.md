@@ -3,7 +3,7 @@
 ## Installing
 
 ```
-git clone https://github.com/MohamadHarastani/PickyMate.git
+git clone https://github.com/Image-Analysis-Hub/PickyMate.git
 cd PickyMate
 conda env create -f environment.yml
 conda activate pickymate
@@ -16,7 +16,7 @@ into an environment you already have:
 
 ```
 pip install -e .        # from inside the clone
-pip install git+https://github.com/MohamadHarastani/PickyMate.git
+pip install git+https://github.com/Image-Analysis-Hub/PickyMate.git
 ```
 
 ## Running
