@@ -29,7 +29,7 @@ embeddings, so a particle picked by hand cannot take part in the ranking.
 With conda (creates a `pickymate` environment with the `pickymate` command):
 
 ```
-git clone https://github.com/MohamadHarastani/PickyMate.git
+git clone https://github.com/Image-Analysis-Hub/PickyMate.git
 cd PickyMate
 conda env create -f environment.yml
 conda activate pickymate
@@ -40,7 +40,7 @@ from GitHub:
 
 ```
 pip install -e .                # from inside the clone; edits take effect immediately
-pip install git+https://github.com/MohamadHarastani/PickyMate.git
+pip install git+https://github.com/Image-Analysis-Hub/PickyMate.git
 ```
 
 ## Run
