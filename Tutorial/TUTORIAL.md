@@ -16,7 +16,7 @@ positives. You will clean these lists in bulk instead of one by one:
 
 Plan on about 30 minutes. If you have not
 installed PickyMate yet, see the
-[Getting Started guide](https://github.com/MohamadHarastani/PickyMate/blob/main/docs/getting-started.md)
+[Getting Started guide](https://github.com/Image-Analysis-Hub/PickyMate/blob/main/docs/getting-started.md)
 first.
 
 ## Contents
