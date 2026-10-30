@@ -25,6 +25,5 @@ struck through.)
 
 ## Known performance debts (measured earlier, unfixed)
 
-- `del_box` is quadratic in the number of picks (7 s at 40k).
 - The gallery builds ~3 QGraphicsItems per particle up front (~25 s at
   100k); real fix is virtualization.
