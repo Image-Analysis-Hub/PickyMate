@@ -32,6 +32,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from . import categories
+from .session_browser import OtherTomogramsWindow
+from .session_map import MAPPABLE
 
 BACKGROUND = (30, 30, 30)
 HALO = (255, 255, 0)        # the app's selection colour (categories.SELECTED_COLOR)
@@ -425,7 +427,6 @@ class UmapWindow(QtWidgets.QWidget):
                    and target.embedding_spaces[n]["array"].shape[1] == 2]
         ctl = self._controller() if self._controller else None
         if ctl is not None:
-            from .session_map import MAPPABLE
             n = len(ctl.session.names)
             for space, label in MAPPABLE.items():
                 if space in target.embedding_spaces:
@@ -669,7 +670,6 @@ class UmapWindow(QtWidgets.QWidget):
             target.clear_umap_selection()
 
     def open_browser(self):
-        from .session_browser import OtherTomogramsWindow
         target = self._target()
         if target is None or self._controller is None:
             return

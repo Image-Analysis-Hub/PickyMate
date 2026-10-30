@@ -29,6 +29,7 @@ from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
 from .settings_dialog import KeyboardShortcutsDialog
 from .thumb_grid import ParticleListPanel
+from .umap_view import UmapWindow
 from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
 from . import categories
 from . import metadata
@@ -51,7 +52,27 @@ _SELECT_CLOSE_PIXELS = 8  # screen-pixel radius for "clicked near the first free
 
 
 class TomoBoxer(QtWidgets.QMainWindow):
-    """Main window: orthogonal slice views + picking controls."""
+    """Main window: orthogonal slice views + picking controls.
+
+    The particle list (thumb_grid), the map (umap_view), the browser of
+    other tomograms (session_browser) and the session controller
+    (session_window) hold a weak reference to this window and use only
+    what is listed here -- nothing else of it is theirs to touch, and
+    tests/test_interface.py checks that:
+
+        state    boxes sets sets_visible embedding_spaces umap_selection
+                 umap_window session_name session session_controller
+                 closing
+        verbs    new_set rename_set delete_set show_set hide_set
+                 empty_recycle_bin set_class_color reset_class_color
+                 is_solo_active nlayers ordered_space_names
+                 run_compute_distance set_umap_selection
+                 clear_umap_selection request_close_all
+                 session_windows session_layout restore_session_layout
+                 close_for_switch
+        actions  view_only_selected_action umap_action
+                 toggle_colors_action show_all_sets_action
+    """
 
     keyPress = QtCore.Signal(QtGui.QKeyEvent)
 
@@ -65,7 +86,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
     def __init__(self, options, datafile):
         super().__init__()
         self.initialized = False
-        self._closing = False
+        self.closing = False
         self.options = options
         # Set when this window is one tomogram of a multi-tomogram session
         # (tomo_boxer.py --session): the controller owns the navigator and
@@ -3352,7 +3373,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.save_picks(only=only)
 
     def closeEvent(self, event):
-        if self._closing:
+        if self.closing:
             event.accept()
             return
         if not self._confirm_close():
@@ -3368,7 +3389,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return reply == QtWidgets.QMessageBox.Yes
 
     def _do_close_all(self):
-        self._closing = True
+        self.closing = True
         if not self._switching:
             print("Exiting")
         self.save_picks()
@@ -3389,7 +3410,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     # -- UMAP map and its selection ----------------------------------------------
     def open_umap_window(self):
-        from .umap_view import UmapWindow
         if self.umap_window is None:
             self.umap_window = UmapWindow(self)
         self.umap_window.show()
@@ -3507,7 +3527,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         """Called by the particle list / options windows when the user
         tries to close them directly: confirms once, then closes every
         window in the app, including this one."""
-        if self._closing:
+        if self.closing:
             return
         if not self._confirm_close():
             return

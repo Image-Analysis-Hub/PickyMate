@@ -1562,6 +1562,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         scope = self.compute_distance_scope_combo.itemData(index)
         previous_scope, chosen = controller.reference_scope
         if scope == "choose":
+            # here, not at module level: session_window imports main_window, which imports us
             from .session_window import ChooseTomogramsDialog
             dlg = ChooseTomogramsDialog(
                 [t for t in target.session.names if t != target.session_name], chosen, self)
@@ -2221,7 +2222,7 @@ class ParticleListPanel(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         target = self._target() if self._target is not None else None
-        if target is not None and not getattr(target, "_closing", False):
+        if target is not None and not target.closing:
             event.ignore()
             target.request_close_all()
             return

@@ -35,6 +35,8 @@ import time
 import numpy as np
 from PySide6 import QtCore
 
+from .umap_worker import pca
+
 MAPPABLE = {"tomotwin": "TomoTwin full", "cryosiam": "CryoSIAM full"}
 CACHE_DIRNAME = ".pickymate_session"
 PCA_DIMS = 50
@@ -193,7 +195,6 @@ class SessionMapJob(QtCore.QObject):
             params = dict(UMAP_PARAMS, input_dims=int(X.shape[1]))
             if X.shape[1] > PCA_DIMS:
                 self.status.emit(f"Reducing {X.shape[1]} dimensions to {PCA_DIMS} by PCA...")
-                from .umap_worker import pca
                 X, kept = pca(X, PCA_DIMS)
                 params.update(pca_dims=PCA_DIMS, pca_variance_kept=kept)
             if self._cancelled:

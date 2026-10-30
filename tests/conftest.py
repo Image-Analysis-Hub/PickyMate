@@ -91,7 +91,7 @@ def close_window(win):
     window, drop the volume, no confirmation -- then delete the windows so
     they don't pile up, hidden, across tests."""
     app = QtWidgets.QApplication.instance()
-    if shiboken6.isValid(win) and not win._closing:
+    if shiboken6.isValid(win) and not win.closing:
         win.close_for_switch()
     for w in (win, getattr(win, "boxesviewer", None)):
         if w is not None and shiboken6.isValid(w):
