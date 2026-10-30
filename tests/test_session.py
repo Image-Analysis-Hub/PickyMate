@@ -36,6 +36,13 @@ FRESH = "TS_043"                      # never opened: exercises the first-open i
 MOVED = "TS_045"                      # initialised on another machine: its recorded paths are stale
 for t in OPENED + [MOVED]:
     shutil.copytree(f"{DATA}/Ribosomes_PickyMate/{t}_picks", f"{TMP}/{t}_picks")
+# MOVED must look like it was initialised elsewhere whatever state the
+# dataset's own copy is in (opening it once repairs the paths for good):
+# point every recorded embedding file at a folder that doesn't exist here
+moved_dir = f"{TMP}/{MOVED}_picks"
+metadata.save_embeddings_settings(moved_dir, [
+    dict(sp, path=f"/another/machine/{os.path.basename(sp['path'])}")
+    for sp in metadata.load_embeddings_settings(moved_dir, include_missing=True)])
 
 manifest = os.path.join(TMP, "session.csv")
 with open(manifest, "w", newline="") as f:
@@ -75,7 +82,9 @@ try:
 
     # -- 2. references from other tomograms --------------------------------------
     vec, used, skipped = session.reference_vectors("tomotwin", "Confirmed", ["TS_037"], 32)
-    rows = [r["embedding_row"] for r in metadata.load_class_records(f"{TMP}/TS_037_picks", "Confirmed")]
+    # only embedded particles can be references: a hand pick in Confirmed has no row
+    rows = [r["embedding_row"] for r in metadata.load_class_records(f"{TMP}/TS_037_picks", "Confirmed")
+            if r["embedding_row"] is not None]
     assert used == ["TS_037"] and vec.shape == (len(rows), 32), (used, vec.shape)
     _, used, skipped = session.reference_vectors("tomotwin", "Confirmed", [FRESH], 32)
     assert used == [] and skipped and skipped[0][0] == FRESH, skipped

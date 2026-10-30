@@ -14,6 +14,8 @@ dynamic = ["dependencies"]
 [project.optional-dependencies]
 # only the plotting scripts use it, not PickyMate itself
 plots = ["matplotlib>=3.5"]
+# running the tests: `pytest` from the clone (see tests/conftest.py)
+dev = ["pytest"]
 
 [project.scripts]
 # the `pickymate` command; `python tomo_boxer.py` keeps working as well
@@ -25,3 +27,8 @@ packages = ["boxer"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["dataset: the original end-to-end scripts; need EMPIAR-10988 on disk, skipped without it"]
