@@ -1,6 +1,6 @@
 """Ranking by Mahalanobis distance in an embedding space -- the maths
 behind "Rank by Embedding Distance", with no window involved, so the
-benchmarks in benchmarking/ rank with exactly the code the application
+benchmarks in tools/benchmarking/ rank with exactly the code the application
 runs.
 
 A reference set (the Confirmed particles, say) defines a distribution:

@@ -15,10 +15,10 @@ from pathlib import Path
 # The PickyMate checkout this folder sits in, ahead of any installed copy:
 # the benchmark must rank (boxer.ranking) and read working directories
 # (boxer.metadata) with the code it is committed next to.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import boxer  # noqa: E402
-if Path(boxer.__file__).resolve().parents[1] != Path(__file__).resolve().parents[2]:
+if Path(boxer.__file__).resolve().parents[1] != Path(__file__).resolve().parents[3]:
     raise ImportError(f"boxer was already imported from {boxer.__file__}; import "
                       f"experiment_functions first so the benchmark uses the checkout it sits in")
 
