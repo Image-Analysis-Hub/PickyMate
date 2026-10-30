@@ -2,22 +2,26 @@
 
 ## Installing
 
+Python 3.10 or later. Straight from GitHub:
+
+```
+pip install git+https://github.com/Image-Analysis-Hub/PickyMate.git
+```
+
+or editable from a clone, so that updating the clone needs no reinstall:
+
 ```
 git clone https://github.com/Image-Analysis-Hub/PickyMate.git
 cd PickyMate
-conda env create -f environment.yml
-conda activate pickymate
+pip install -e .
 ```
 
-This creates a conda environment named `pickymate` with PickyMate installed
-as the `pickymate` command, in editable mode: the command runs the code in
-the cloned folder, so updating the clone needs no reinstall. Alternatives,
-into an environment you already have:
+Either way installs the `pickymate` command. In a fresh conda environment,
+create it first: `conda create -n pickymate python=3.12 pip`, then
+`conda activate pickymate`.
 
-```
-pip install -e .        # from inside the clone
-pip install git+https://github.com/Image-Analysis-Hub/PickyMate.git
-```
+New to PickyMate? The [tutorial](../tutorial/) walks through a complete
+session on two EMPIAR-10988 tomograms; this page is the reference.
 
 ## Running
 

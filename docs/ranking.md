@@ -59,3 +59,28 @@ toolbar re-applies the last scores at any time; **Sort by Original ID**
 returns to pick order. Re-rank whenever you have confirmed or rejected more —
 it takes about a second, which is what makes the confirm-a-few, re-rank,
 sweep-in-bulk loop work.
+
+## What it buys you
+
+![Fig. 2 of the paper](images/figure2.png)
+
+Measured on the ten defocus tomograms of EMPIAR-10988, ribosomes, TomoTwin
+embeddings, with a simulated curator who knows the deposited annotations
+(**a**–**c**: the data; **i**: the human curation, validated by subtomogram
+averaging):
+
+- **d** — one re-ranking after only 50 confirmed picks raises the average
+  precision of the unvisited list from 0.56 to 0.78; from about 25 confirmed
+  picks on, every tomogram improves.
+- **e** — re-ranking during the curation saves 26% of the decisions with the
+  single distance (once, early) and 39% with the relative distance, *far
+  from* the Recycle Bin (repeatedly); rejecting everything outside a
+  region-of-interest mask first brings it to 47%.
+- **g, h** — the picks of one curated tomogram rank the next one about as
+  well as its own picks would, saving about 40% of its decisions before a
+  single decision is taken in it; the gain holds as more tomograms are
+  pooled.
+
+The experiments are reproducible with
+[tools/benchmarking/](../tools/benchmarking/), which calls the same ranking
+code as the application.

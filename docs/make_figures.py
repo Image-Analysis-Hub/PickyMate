@@ -5,8 +5,8 @@
 
 Screenshots are taken from the app itself, rendered offscreen, on a
 temporary copy of a real curated working directory (EMPIAR-10988 TS_026,
-ribosomes) -- never on the original. The README overview figure and the
-composed panels are drawn with matplotlib from the same data. Rerun this
+ribosomes) -- never on the original. The composed panels are drawn with
+matplotlib from the same data. Rerun this
 whenever the interface changes so the documentation cannot drift away from
 what the app actually looks like.
 
@@ -604,192 +604,12 @@ def shot_session(data, out, tmp):
     QtWidgets.QApplication.processEvents()
 
 
-# ---------------------------------------------------------------------------
-# the README overview figure -- pure matplotlib, straight from the data
-# ---------------------------------------------------------------------------
-def hero(data, out):
-    """Two rows, five panels: the picks, the embeddings, the decisions made
-    in the gallery, the distance doing the sorting, and the finished order.
-    Pure matplotlib, straight from the data."""
-    from matplotlib.patches import ConnectionPatch
-    from boxer import embeddings_io, metadata
-    from boxer.volume import Volume
-
-    picks = np.array(metadata.load_particle_list(
-        os.path.join(data, "TemplateMatching_Ribosomes_PicksOnly/TS_026.txt")))
-    emb = embeddings_io.load_tomotwin_embeddings(
-        os.path.join(data, "TomoTwin/Ribosomes_embeddings/TS_026.temb"))["embeddings"]
-    umap = embeddings_io.load_tomotwin_umap(
-        os.path.join(data, "TomoTwin/Ribosomes_embeddings/TS_026.tumap"))["umap_xy"]
-    wd = os.path.join(data, "Ribosomes_PickyMate/TS_026_picks")
-    conf_set = {r["embedding_row"] for r in metadata.load_class_records(wd, "Confirmed")
-                if r["embedding_row"] is not None}
-    junk_set = {r["embedding_row"] for r in metadata.load_class_records(wd, "Recycle Bin")
-                if r["embedding_row"] is not None}
-    vol = Volume.from_file(os.path.join(data, "Tomograms/TS_026.rec"), native_memmap=True)
-
-    # the user's first pass: the head of the pick-order list, each pick
-    # decided the way the real curation session decided it
-    head_n = 30
-    while head_n < 400 and (len(conf_set & set(range(head_n))) < 10
-                            or len(junk_set & set(range(head_n))) < 10):
-        head_n += 10
-    head = np.arange(head_n)
-    few_conf = np.array(sorted(conf_set & set(range(head_n))))
-    few_junk = np.array(sorted(junk_set & set(range(head_n))))
-
-    # rank everything else by Mahalanobis distance to those few confirmed
-    ref = np.asarray(emb[few_conf], dtype=np.float64)
-    mu = ref.mean(0)
-    c = ref - mu
-    covinv = np.linalg.pinv(c.T @ c / (len(ref) - 1), hermitian=True)
-    d = np.asarray(emb, dtype=np.float64) - mu
-    score = ((d @ covinv) * d).sum(1)
-    undecided = np.setdiff1d(np.arange(len(picks)), np.union1d(few_conf, few_junk))
-    order = undecided[np.argsort(score[undecided])]
-
-    def thumb(row):
-        # a thin slab, light smoothing and a tight display range: ribosomes
-        # are faint, and a thick unsmoothed mean washes them into the
-        # cytoplasm texture
-        from scipy.ndimage import gaussian_filter
-        x, y, z = picks[row]
-        cube = vol.get_clip_centered(x, y, z, 34, 34, 3)
-        img = gaussian_filter(cube.mean(axis=0, dtype=np.float32), 1.0)
-        lo, hi = np.percentile(img, (4.0, 96.0))
-        return np.clip((img - lo) / ((hi - lo) or 1.0), 0, 1)
-
-    def off_edge(row):
-        x, y, z = picks[row]
-        return (22 <= x < vol.nx - 22 and 22 <= y < vol.ny - 22
-                and 2 <= z < vol.nz - 2)
-
-    is_particle = gt_matcher(data)
-    GREEN, RED = (0.18, 0.80, 0.44), (0.91, 0.30, 0.24)
-
-    def block(rows, n_cols, n_rows, decided=False):
-        """Thumbnails as RGB. decided: a thick frame in the colour of the
-        user's real decision on that pick. Otherwise a thin band along the
-        top: green if the pick is a real ribosome by the ground truth, red
-        if junk."""
-        cells = []
-        for r in list(rows)[: n_cols * n_rows]:
-            t = np.repeat(thumb(r)[:, :, None], 3, axis=2)
-            if decided:
-                if r in conf_set or r in junk_set:
-                    colour = GREEN if r in conf_set else RED
-                    t[:3, :] = colour
-                    t[-3:, :] = colour
-                    t[:, :3] = colour
-                    t[:, -3:] = colour
-            else:
-                t[:3, :] = GREEN if is_particle(*picks[r]) else RED
-            cells.append(np.pad(t, ((1, 1), (1, 1), (0, 0)), constant_values=1.0))
-        return np.vstack([np.hstack(cells[i * n_cols:(i + 1) * n_cols])
-                          for i in range(n_rows)])
-
-    z = int(np.bincount(picks[:, 2].astype(int)).argmax())
-    near = np.abs(picks[:, 2] - z) < 8
-    cx, cy = np.median(picks[near, 0]), np.median(picks[near, 1])
-    full = vol.slab_projection("z", z, 2)
-    # clamp: a negative start index would wrap around and slice nothing
-    x0 = int(np.clip(cx - 240, 0, full.shape[1] - 480))
-    y0 = int(np.clip(cy - 240, 0, full.shape[0] - 480))
-    sl = norm(full[y0:y0 + 480, x0:x0 + 480])
-
-    fig = plt.figure(figsize=(13.2, 8.2), facecolor="white")
-    gs = fig.add_gridspec(2, 3, wspace=0.16, hspace=0.50,
-                          left=0.02, right=0.98, top=0.90, bottom=0.075)
-
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.imshow(sl, cmap="gray", origin="lower")
-    ax1.scatter(picks[near, 0] - x0, picks[near, 1] - y0, s=60, facecolors="none",
-                edgecolors="#39c0ed", linewidths=1.0)
-    ax1.set_xlim(0, 480)
-    ax1.set_ylim(0, 480)
-    ax1.set_title("1 · Template matching over-picks:\nthousands of hits, most junk",
-                  fontsize=11, color=TEXT)
-
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.scatter(umap[:, 0], umap[:, 1], s=2, c="0.75", linewidths=0)
-    ax2.set_title("2 · A foundation model embeds\nevery pick (TomoTwin, UMAP shown)",
-                  fontsize=11, color=TEXT)
-
-    ax3 = fig.add_subplot(gs[0, 2])
-    # the raw head of this list is nearly all junk; sample it so both
-    # decisions are visible, keeping pick order
-    disp_conf = [r for r in few_conf if off_edge(r)][:8]
-    rej = [r for r in few_junk if off_edge(r)]
-    n_rej = 15 - len(disp_conf)
-    disp = sorted(disp_conf + rej[:: max(1, len(rej) // n_rej)][:n_rej])
-    ax3.imshow(block(disp, 5, 3, decided=True))
-    ax3.set_title("3 · You review the top of the list in the\n"
-                  "gallery: confirm the good, reject the junk",
-                  fontsize=11, color=TEXT)
-
-    ax4 = fig.add_subplot(gs[1, 0])
-    ax4.scatter(umap[:, 0], umap[:, 1], s=2, c="0.85", linewidths=0)
-    ax4.scatter(umap[order[:300], 0], umap[order[:300], 1], s=6, c="#a9dfbf",
-                linewidths=0)
-    ax4.scatter(umap[few_junk, 0], umap[few_junk, 1], s=16, c="crimson", linewidths=0)
-    ax4.scatter(umap[few_conf, 0], umap[few_conf, 1], s=16, c="#1e8449", linewidths=0)
-    mx, my = np.median(umap[few_conf], axis=0)
-    ax4.annotate("nearest to your Confirmed\n→ the front of the list", xy=(mx, my),
-                 xytext=(0.03, 0.03), textcoords="axes fraction", fontsize=8.5,
-                 color="#1e8449",
-                 arrowprops=dict(arrowstyle="->", color="#1e8449", lw=1.2))
-    ax4.set_title("4 · Every remaining pick is scored by its\n"
-                  "embedding distance to your decisions",
-                  fontsize=11, color=TEXT)
-
-    ax5 = fig.add_subplot(gs[1, 1:])
-    ax5.imshow(block(order, 10, 3))
-    ax5.set_title("5 · PickyMate reorders the rest, live: lookalikes of your confirmed\n"
-                  "come to the front — review from the top, decide in bulk",
-                  fontsize=11, color=TEXT)
-
-    for ax in fig.axes:
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_color("0.85")
-
-    def arrow_between(a, b):
-        pa, pb = a.get_position(), b.get_position()
-        fig.text((pa.x1 + pb.x0) / 2, (pa.y0 + pa.y1) / 2, "→",
-                 fontsize=26, color=ACCENT.name(), ha="center", va="center")
-    arrow_between(ax1, ax2)
-    arrow_between(ax2, ax3)
-    arrow_between(ax4, ax5)
-    fig.add_artist(ConnectionPatch(
-        xyA=(0.35, -0.22), coordsA=ax3.transAxes, xyB=(0.72, 1.26),
-        coordsB=ax4.transAxes, arrowstyle="-|>", mutation_scale=18,
-        color=ACCENT.name(), lw=2.2, connectionstyle="arc3,rad=0.18"))
-
-    p3 = ax3.get_position()
-    fig.text((p3.x0 + p3.x1) / 2, p3.y0 - 0.030,
-             "frames: green = you confirmed · red = you rejected",
-             fontsize=8.5, color="0.4", ha="center", va="center")
-    p5 = ax5.get_position()
-    fig.text((p5.x0 + p5.x1) / 2, 0.018,
-             "top bands: ground truth, figure only — green = real particle · red = junk",
-             fontsize=8.5, color="0.4", ha="center", va="center")
-
-    fig.savefig(os.path.join(out, "overview.png"), dpi=115)
-    plt.close(fig)
-    print(f"wrote {out}/overview.png  ({len(few_conf)} confirmed, "
-          f"{len(few_junk)} rejected of the first {head_n} picks)")
-    owner = getattr(vol, "_mmap_owner", None)
-    if owner is not None:
-        owner.close()
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data", default=DATA)
     ap.add_argument("--out", default=os.path.join(HERE, "docs", "images"))
     ap.add_argument("--only", nargs="+", default=None,
-                    help="regenerate a subset: hero, main, gallery, umap, tools, ranking, "
+                    help="regenerate a subset: main, gallery, umap, tools, ranking, "
                          "session, shortcuts")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -800,8 +620,6 @@ def main():
     try:
         if want("shortcuts"):
             write_shortcut_table()
-        if want("hero"):
-            hero(a.data, a.out)
         if want("ranking") or want("tools"):
             shot_ranking(a.data, a.out, tmp)
         if want("session"):
