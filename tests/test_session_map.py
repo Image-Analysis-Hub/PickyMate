@@ -4,7 +4,7 @@ Computes a real map in the background on copies of three EMPIAR-10988
 working directories, then checks cross-tomogram selection, the navigator's
 counts, the view-only browser, Escape, switching tomograms (including in
 the middle of a computation) and out-of-date detection. Needs umap-learn in
-the running environment (requirements.txt / environment.yml); skipped if it
+the running environment (pip install -e .); skipped if it
 is missing or the dataset is absent.
 
     QT_QPA_PLATFORM=offscreen python3 tests/test_session_map.py
@@ -29,7 +29,7 @@ if not os.path.isdir(DATA):
     sys.exit(0)
 if subprocess.run([sys.executable, "-c", "import umap"], capture_output=True).returncode != 0:
     print(f"SKIPPED: umap-learn is not installed in {sys.executable} "
-          f"(conda env create -f environment.yml)")
+          f"(pip install umap-learn)")
     sys.exit(0)
 
 TMP = tempfile.mkdtemp(prefix="pickymate_session_map_test_")

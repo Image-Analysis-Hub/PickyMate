@@ -8,14 +8,19 @@ version = "0.1.0"
 description = "Tomogram particle picking and triage, ranked by embedding similarity"
 readme = "README.md"
 requires-python = ">=3.10"
-# read from requirements.txt, so there is a single list of dependencies
-dynamic = ["dependencies"]
+dependencies = [
+    "PySide6>=6.5",
+    "numpy>=1.24",
+    "mrcfile>=1.4",
+    "h5py>=3.0",
+    "pandas>=1.5",
+    # the session map: one UMAP over every tomogram of a session
+    "umap-learn>=0.5",
+]
 
 [project.optional-dependencies]
-# only the plotting scripts use it, not PickyMate itself
-plots = ["matplotlib>=3.5"]
-# running the tests: `pytest` from the clone (see tests/conftest.py)
-dev = ["pytest"]
+# pytest for the tests, matplotlib for docs/make_figures.py; neither is needed to run PickyMate
+dev = ["pytest", "matplotlib>=3.5"]
 
 [project.scripts]
 # the `pickymate` command; `python tomo_boxer.py` keeps working as well
@@ -24,9 +29,6 @@ pickymate = "tomo_boxer:main"
 [tool.setuptools]
 py-modules = ["tomo_boxer"]
 packages = ["boxer"]
-
-[tool.setuptools.dynamic]
-dependencies = { file = ["requirements.txt"] }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

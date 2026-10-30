@@ -43,8 +43,8 @@ PCA_DIMS = 50
 UMAP_PARAMS = {"neighbors": 15, "min_dist": 0.1}
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "umap_worker.py")
 MISSING_UMAP = ("umap-learn is not installed in this environment, and the session map needs "
-                "it. Install PickyMate's requirements (pip install -r requirements.txt), or run "
-                "PickyMate from its conda environment (conda env create -f environment.yml).")
+                "it: pip install umap-learn, or reinstall PickyMate with its dependencies "
+                "(pip install -e . from the clone).")
 
 
 class SessionMap:
