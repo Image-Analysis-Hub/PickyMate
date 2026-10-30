@@ -32,6 +32,7 @@ from .thumb_grid import ParticleListPanel
 from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
 from . import categories
 from . import metadata
+from . import ranking
 from . import shortcuts
 from .picks import Particle, Picks
 from .shapes import Shape
@@ -1637,7 +1638,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         determinant) is a per-particle constant, so it could never change
         the resulting *order* anyway, and it's undefined here besides --
         these embeddings' covariance is severely rank-deficient (see
-        _mahalanobis_distribution), so a real determinant is zero. Both
+        ranking.distribution), so a real determinant is zero. Both
         terms use the same space and leave_one_out setting.
 
         space: the name of one attached embedding space (see
@@ -1676,7 +1677,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             raise ValueError(f"unrecognized embedding space {space!r} (have: {known})")
         array = entry["array"]
 
-        target_rows = self._mahalanobis_rows_of(target_classid)
+        target_rows = self.picks.embedded_rows(target_classid)
         target_total = sum(1 for b in self.boxes if b.classid == target_classid)
         skipped = target_total - len(target_rows)
 
@@ -1697,12 +1698,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     space, self.sets[negative_classid], others, dims)
                 notes += [f"{t}: {why} (far from)" for t, why in not_used]
 
-        positive, ref_size = self._mahalanobis_distances(
-            reference_classid, target_classid, target_rows, array, leave_one_out, extra=extra_pos)
+        positive, ref_size = ranking.scores(
+            target_rows, self.picks.embedded_rows(reference_classid), array,
+            leave_one_out and reference_classid == target_classid, extra_pos,
+            self.sets.get(reference_classid, reference_classid))
 
         if negative_classid is not None:
-            negative, _ = self._mahalanobis_distances(
-                negative_classid, target_classid, target_rows, array, leave_one_out, extra=extra_neg)
+            negative, _ = ranking.scores(
+                target_rows, self.picks.embedded_rows(negative_classid), array,
+                leave_one_out and negative_classid == target_classid, extra_neg,
+                self.sets.get(negative_classid, negative_classid))
             combined = {i: positive[i] - negative[i] for i in positive if i in negative}
             skipped += len(positive) - len(combined)
         else:
@@ -1718,82 +1723,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 "extra_reference_size": 0 if extra_pos is None else len(extra_pos),
                 "extra_negative_size": 0 if extra_neg is None else len(extra_neg),
                 "notes": notes}
-
-    def _mahalanobis_rows_of(self, classid):
-        return [(i, b.embedding_row) for i, b in enumerate(self.boxes) if b.classid == classid and b.embedding_row is not None]
-
-    def _mahalanobis_distances(self, reference_classid, target_classid, target_rows, array,
-                               leave_one_out, extra=None):
-        """{box_index: squared Mahalanobis distance} for every (index,
-        embedding_row) pair in target_rows, relative to reference_classid's
-        own embedding distribution in `array`. target_rows is computed
-        once by the caller (shared across both terms of a double-distance
-        call) so "does this particle have an embedding at all" is only
-        ever decided from the target set itself, not re-derived per
-        reference. Raises ValueError if the reference set has fewer than
-        2 embedded particles. Returns (distances, reference_size).
-
-        `extra`: an (M, D) array of further reference vectors -- the same
-        set's particles in other tomograms of a session -- pooled with this
-        tomogram's own. They are never among the particles being scored,
-        so leave-one-out only ever removes this tomogram's own."""
-        ref_rows = self._mahalanobis_rows_of(reference_classid)
-        n_extra = 0 if extra is None else len(extra)
-        if len(ref_rows) + n_extra < 2:
-            name = self.sets.get(reference_classid, reference_classid)
-            raise ValueError(
-                f"\"{name}\" has only {len(ref_rows) + n_extra} particle(s) with an embedding -- "
-                f"need at least 2 to build a distribution.")
-
-        def pooled(rows):
-            own = array[rows] if len(rows) else np.empty((0, array.shape[1]))
-            return own if extra is None else np.vstack([own, extra])
-
-        distances = {}
-        if leave_one_out and reference_classid == target_classid:
-            for i, row in target_rows:
-                others = [r for idx2, r in ref_rows if idx2 != i]
-                if len(others) + n_extra < 2:
-                    continue
-                mu, covinv = self._mahalanobis_distribution(pooled(others))
-                distances[i] = float(self._mahalanobis_scores(mu, covinv, array[[row]])[0])
-        else:
-            mu, covinv = self._mahalanobis_distribution(pooled([row for _, row in ref_rows]))
-            idx_list = [i for i, _ in target_rows]
-            rows_list = [row for _, row in target_rows]
-            d2 = self._mahalanobis_scores(mu, covinv, array[rows_list])
-            for i, d in zip(idx_list, d2):
-                distances[i] = float(d)
-        return distances, len(ref_rows) + n_extra
-
-    @staticmethod
-    def _mahalanobis_distribution(vectors):
-        """mean + pseudo-inverse covariance of a (N, D) reference array --
-        pinv rather than a true inverse since these embeddings are
-        typically rank-deficient well before N reaches D (verified
-        empirically against real data: covariance rank plateaus far
-        below D even with every available particle as reference), so a
-        true inverse would simply fail. Building the D x D covariance
-        directly (rather than the N x N Gram-matrix/dual approach) is
-        deliberate: at D=1024 it's sub-second regardless of N, and the
-        dual approach is only cheaper when N << D, which isn't the
-        regime this tool runs in."""
-        vectors = np.asarray(vectors, dtype=np.float64)
-        mu = vectors.mean(axis=0)
-        centered = vectors - mu
-        cov = (centered.T @ centered) / (len(vectors) - 1)
-        covinv = np.linalg.pinv(cov, hermitian=True)
-        return mu, covinv
-
-    @staticmethod
-    def _mahalanobis_scores(mu, covinv, targets):
-        """Squared Mahalanobis distance of each row in targets to (mu,
-        covinv). The matmul-based formulation, not einsum -- verified
-        the "obvious" einsum('ij,jk,ik->i', ...) version is over 20x
-        slower than this at realistic sizes, a difference real enough
-        to matter at a few thousand particles."""
-        centered = np.asarray(targets, dtype=np.float64) - mu
-        return ((centered @ covinv) * centered).sum(axis=1)
 
     def menu_file_read_boxloc(self):
         fsp, _ = QtWidgets.QFileDialog.getOpenFileName(

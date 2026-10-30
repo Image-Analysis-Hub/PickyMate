@@ -73,6 +73,12 @@ class Picks:
     def indices_of(self, classid):
         return self._indices_by_class.get(classid, ())
 
+    def embedded_rows(self, classid):
+        """[(index, embedding row)] of the particles of a set that carry an
+        embedding -- the ones a ranking can score, or use as a reference."""
+        return [(i, b.embedding_row) for i, b in enumerate(self.boxes)
+                if b.classid == classid and b.embedding_row is not None]
+
     def rebuild_indices(self):
         by_class, of_uid = {}, {}
         for i, b in enumerate(self.boxes):

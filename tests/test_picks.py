@@ -47,6 +47,12 @@ def test_add_reassign_remove_insert_keep_the_indices_right():
     consistent(p)
 
 
+def test_embedded_rows_skip_hand_picks():
+    p = filled(3)
+    p.boxes[1].embedding_row = 7
+    assert p.embedded_rows(0) == [(1, 7)] and p.embedded_rows(99) == []
+
+
 def test_set_class_resets_the_score():
     p = filled(2)
     p.boxes[0].score = 1.5
