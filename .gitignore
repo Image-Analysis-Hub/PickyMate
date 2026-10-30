@@ -1,3 +1,5 @@
 __pycache__/
 *.egg-info/
 build/
+# written next to a golden screenshot when test_synthetic.py finds it changed
+tests/golden/*.actual.png

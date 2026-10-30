@@ -25,6 +25,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from . import categories
+from .main_window import TomoBoxer
+from .session_map import SessionMapJob, SessionMapStore
 
 
 class SessionController(QtCore.QObject):
@@ -41,7 +43,6 @@ class SessionController(QtCore.QObject):
         # The session map and its background computation belong to the
         # session, not to whichever tomogram is open, so switching tomograms
         # neither drops a computed map nor kills one being computed.
-        from .session_map import SessionMapJob, SessionMapStore
         self.session_map = SessionMapStore(session)
         self.session_map_job = SessionMapJob(self.session_map)
         self.navigator = SessionNavigator(self)
@@ -60,8 +61,6 @@ class SessionController(QtCore.QObject):
             for w in self.current.session_windows().values():
                 w.raise_()
             return
-        from .main_window import TomoBoxer   # here, not at module level: main_window imports us
-
         self.navigator.set_busy(f"Opening {name}...")
         QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
         QtWidgets.QApplication.processEvents()

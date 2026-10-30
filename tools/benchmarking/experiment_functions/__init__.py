@@ -9,7 +9,20 @@
     reference_pooling    pooling the decisions of finished tomograms
     run_report           writing results, and the checks a run makes on itself
 """
-from . import (curation_simulation, evaluation_split, mahalanobis_ranking,
+import sys
+from pathlib import Path
+
+# The PickyMate checkout this folder sits in, ahead of any installed copy:
+# the benchmark must rank (boxer.ranking) and read working directories
+# (boxer.metadata) with the code it is committed next to.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+import boxer  # noqa: E402
+if Path(boxer.__file__).resolve().parents[1] != Path(__file__).resolve().parents[3]:
+    raise ImportError(f"boxer was already imported from {boxer.__file__}; import "
+                      f"experiment_functions first so the benchmark uses the checkout it sits in")
+
+from . import (curation_simulation, evaluation_split, mahalanobis_ranking,  # noqa: E402
                ranking_metrics, reference_pooling, reranking_schedules,
                run_report, tomogram_data)
 

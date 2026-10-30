@@ -1,0 +1,413 @@
+{
+ "ParticleListPanel/ParticleListPanel/Delete Set": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Delete this set, sending every particle in it to the Recycle Bin.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Detach Tab": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Pop the current tab's grid into its own floating window.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Empty Recycle Bin": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": false,
+  "shortcuts": [],
+  "tooltip": "Clear everything currently in the Recycle Bin -- archived to a hidden backup file first (not loaded again), and still undoable with Ctrl+Z right after.",
+  "visible": false
+ },
+ "ParticleListPanel/ParticleListPanel/New Set...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Create a new set.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Organize Grid": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Compact the grid, removing gaps left by deleted particles.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Rename Set...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Rename the current tab's set.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Sort by Original ID": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "One-time re-layout of this set's particles by their original ID.",
+  "visible": true
+ },
+ "ParticleListPanel/ParticleListPanel/Sort by Rank": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "One-time re-layout of this set's particles by their rank -- the distance last computed by \"Rank by Embedding Distance\" above (closest first; particles never ranked come first of all). Doesn't compute anything itself, only re-displays the last result.",
+  "visible": true
+ },
+ "ParticleListPanel/RankingPanel/Rank by Embedding Distance": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Ranks the current tab's particles by their Mahalanobis distance to the \"close to\" set's embedding distribution, then lays them out closest-first. Set a \"far from\" set too for a contrastive rank: distance-to-\"close to\" minus distance-to-\"far from\", favoring particles near the first and away from the second. \"Sort by Rank\" (below) re-displays this same result later without recomputing it.",
+  "visible": true
+ },
+ "RankingPanel/RankingPanel/Rank by Embedding Distance": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Ranks the current tab's particles by their Mahalanobis distance to the \"close to\" set's embedding distribution, then lays them out closest-first. Set a \"far from\" set too for a contrastive rank: distance-to-\"close to\" minus distance-to-\"far from\", favoring particles near the first and away from the second. \"Sort by Rank\" (below) re-displays this same result later without recomputing it.",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Attach Embeddings to Current Particles...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Add another method's embeddings to the particles already imported, so the same picks can be ranked by each method and compared.",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Customize Keyboard Shortcuts...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Customize Keyboard Shortcuts",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Edit": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Edit",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Export Particle Coordinates...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Export Particle Coordinates",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/File": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "File",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Help": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Help",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Import Particle List with Embeddings...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Import Particle List with Embeddings",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Import Particle List...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Import Particle List",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Keyboard Shortcuts...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": true,
+  "shortcuts": [
+   "F1"
+  ],
+  "tooltip": "Keyboard Shortcuts",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Save": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Save",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Set": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Set",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Settings": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Settings",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/Tools": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Tools",
+  "visible": true
+ },
+ "TomoBoxer/QMenu/View": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "View",
+  "visible": true
+ },
+ "TomoBoxer/QToolBar/Edit": {
+  "checkable": true,
+  "checked": true,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Edit",
+  "visible": true
+ },
+ "TomoBoxer/QToolBar/Selection": {
+  "checkable": true,
+  "checked": true,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Selection",
+  "visible": true
+ },
+ "TomoBoxer/QToolBar/Tools": {
+  "checkable": true,
+  "checked": true,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Tools",
+  "visible": true
+ },
+ "TomoBoxer/QToolBar/Volume": {
+  "checkable": true,
+  "checked": true,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Volume",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Confirm Selected": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": false,
+  "shortcuts": [
+   "Ins"
+  ],
+  "tooltip": "Send every currently selected particle to Confirmed. (Insert key)",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Eraser": {
+  "checkable": true,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Click-drag in a tomogram view to send every particle within Radius of the cursor to the Recycle Bin.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Load Companion Volume...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Load a second version of this same tomogram (e.g. denoised) to switch display between -- picks, sets, and box sizes are shared; only the pixel data shown changes. Must match the primary tomogram's dimensions exactly.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Move Selected To": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": false,
+  "shortcuts": [],
+  "tooltip": "Move every currently selected particle to the set named at right.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Pick": {
+  "checkable": true,
+  "checked": true,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Normal picking: click empty space to add, click + drag an existing particle to move it. Shift/Space/Ctrl+click still work for Recycle Bin/Confirmed/multi-select.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Recycle Selected": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": false,
+  "shortcuts": [
+   "Del"
+  ],
+  "tooltip": "Send every currently selected particle to the Recycle Bin. (Delete key)",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Redo": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": false,
+  "shortcuts": [
+   "Ctrl+Y",
+   "Alt+Shift+Backspace",
+   "Ctrl+Shift+Z",
+   "Redo"
+  ],
+  "tooltip": "Redo (Ctrl+Y / Ctrl+Shift+Z)",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Refresh": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": true,
+  "shortcuts": [
+   "F5"
+  ],
+  "tooltip": "Force everything to fully re-derive and redraw -- regenerates every gallery thumbnail from the volume and fully re-slices the tomogram views, in case rendering ever visibly gets stuck. (F5)",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Select": {
+  "checkable": true,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Draw a shape in a tomogram view to select every particle inside it (replacing the current selection), instead of picking/moving particles. Use Confirm/Recycle Selected or Move Selected to act on the result.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Show Active Set Only": {
+  "checkable": true,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "While on, only the active tab's set is shown in the tomogram views -- switching tabs (including via number keys) updates this live. Turning it off restores whatever visibility you had before.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Show All Sets": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Make every set visible in the tomogram views.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Show Companion Volume": {
+  "checkable": true,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": false,
+  "shortcuts": [],
+  "tooltip": "Switch the tomogram views and gallery thumbnails between the primary volume and its loaded companion (e.g. denoised). Contrast and Avg Slices are kept separate per volume; picks/sets are shared.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Show Only Selected": {
+  "checkable": true,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "While on, a particle only shows in the tomogram views if it's both currently selected AND still in whatever set it was in when it joined the selection -- moving it to another set (Space/Shift+click, drag, ...) hides it right away without deselecting it, even though its new set is itself visible. Updates live as the selection changes.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Toggle Colors": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Rotate every normal set to the next color at once. Recycle Bin (red), Confirmed (green), and the yellow selection highlight never change.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/UMAP Map...": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.WindowShortcut",
+  "enabled": true,
+  "shortcuts": [],
+  "tooltip": "Open the UMAP map of this tomogram's particles, coloured by set, and lasso-select particles on it into the \"UMAP Selection\" tab.",
+  "visible": true
+ },
+ "TomoBoxer/TomoBoxer/Undo": {
+  "checkable": false,
+  "checked": false,
+  "context": "ShortcutContext.ApplicationShortcut",
+  "enabled": false,
+  "shortcuts": [
+   "Ctrl+Z"
+  ],
+  "tooltip": "Undo (Ctrl+Z)",
+  "visible": true
+ }
+}

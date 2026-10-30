@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """PickyMate: a standalone tomogram particle-picking tool.
 
-Installed as the `pickymate` command (pip install -e . , or the conda
-environment in environment.yml); `python tomo_boxer.py` works the same.
+Installed as the `pickymate` command (pip install -e .); `python tomo_boxer.py`
+works the same.
 
 Usage:
     pickymate --session session.csv [--native_memmap] [...]

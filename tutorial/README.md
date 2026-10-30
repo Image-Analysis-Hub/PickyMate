@@ -16,7 +16,7 @@ positives. You will clean these lists in bulk instead of one by one:
 
 Plan on about 30 minutes. If you have not
 installed PickyMate yet, see the
-[Getting Started guide](https://github.com/Image-Analysis-Hub/PickyMate/blob/main/docs/getting-started.md)
+[Getting Started guide](../docs/getting-started.md)
 first.
 
 ## Contents
@@ -39,7 +39,7 @@ first.
 ## 1. What is in the tutorial folder
 
 ```
-Tutorial/
+tutorial/
 ├── session.csv              ← the session manifest: one row per tomogram
 ├── tutorial.txt             ← the download and launch commands (same as below)
 ├── GapStop_ribosomes/       ← template-matching picks, plain "x y z" text
@@ -71,13 +71,13 @@ The two tomograms (1.8 GB and 0.9 GB) are fetched straight from
 EMPIAR:
 
 ```bash
-cd Tutorial/tomograms
+cd tutorial/tomograms
 wget https://ftp.ebi.ac.uk/empiar/world_availability/10988/data/DEF/tomograms/TS_027.rec
 wget https://ftp.ebi.ac.uk/empiar/world_availability/10988/data/DEF/tomograms/TS_028.rec
 cd ..
 ```
 
-Then, from the `Tutorial/` folder:
+Then, from the `tutorial/` folder:
 
 ```bash
 conda activate pickymate
@@ -375,7 +375,7 @@ Picks save automatically, continuously, as plain text next to your data —
 there is no save step. After the session the tutorial folder looks like this:
 
 ```
-Tutorial/
+tutorial/
 ├── session.csv
 ├── .pickymate_session/
 │   └── umap_tomotwin.npz      ← cached session map (safe to delete)
@@ -416,4 +416,4 @@ TS_027 and 902 for TS_028, with most of TS_028 still to review.
 | Full list | **F1** (Help > Keyboard Shortcuts) |
 
 For the rest of the interface see the
-[PickyMate documentation](https://github.com/MohamadHarastani/PickyMate/tree/main/docs).
+[PickyMate documentation](../docs/index.md).

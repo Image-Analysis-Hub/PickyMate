@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import metadata
+
 METHODS = ("cryosiam", "tomotwin")
 
 # How each method is spelled in the UI. Every method contributes up to two
@@ -217,8 +219,6 @@ def load_cryosiam_embeddings(path: str, n_expected: int) -> dict:
     against the particle count from the coordinate file, since a square
     array would otherwise be ambiguous. That's why n_expected is required
     here and not for TomoTwin."""
-    from . import metadata
-
     array = metadata.load_embeddings_h5(path)
     if array.shape[0] == n_expected:
         oriented = array
@@ -243,8 +243,6 @@ def load_cryosiam_embeddings(path: str, n_expected: int) -> dict:
 def load_cryosiam_umap(path: str) -> dict:
     """{"umap_xy": (N, 2), "coords_xyz": (N, 3)} -- the existing
     centroid-0/1/2 (z,y,x) plus x,y CSV, read via metadata."""
-    from . import metadata
-
     data = metadata.load_embeddings_umap(path)
     return {
         "umap_xy": data["xy"],

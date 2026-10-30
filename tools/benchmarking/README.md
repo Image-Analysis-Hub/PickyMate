@@ -24,9 +24,7 @@ from which the benchmark uses the particle-list and embedding readers
 experiments produce comma-separated tables and leave plotting to the user.
 
 ```bash
-conda env create -f ../environment.yml      # the environment PickyMate ships
-conda activate pickymate
-export PYTHONPATH=/path/to/PickyMate
+pip install -e ../..        # PickyMate itself, from the clone this folder sits in
 ```
 
 ## Data
