@@ -926,6 +926,35 @@ class ParticleListPanel(QtWidgets.QWidget):
         # cascade from that one.
         self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
+        self._build_view_toolbar(target, layout)
+        self._build_rank_controls(target)
+        self._build_tabs(layout)
+
+        # Menu-only equivalents of the "+" tab and double-clicking a tab
+        # (TomoBoxer's Set menu) -- both gestures already exist and work
+        # fine, these just make them reachable without knowing that.
+        self.new_set_action = QtGui.QAction("New Set...", self)
+        self.new_set_action.setToolTip("Create a new set.")
+        self.new_set_action.triggered.connect(self._prompt_new_set)
+
+        self.rename_set_action = QtGui.QAction("Rename Set...", self)
+        self.rename_set_action.setToolTip("Rename the current tab's set.")
+        self.rename_set_action.triggered.connect(self._prompt_rename_current_set)
+
+        # The Rank panel operates on "whatever tab is currently on screen,"
+        # same as every action in the toolbar just below it -- keeping them
+        # adjacent (rather than the Rank panel sitting above the tabs
+        # entirely, as it used to) makes that relationship visible instead
+        # of implied.
+        layout.addWidget(self.compute_distance_group)
+
+        self._build_gallery_toolbar(layout)
+
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
+
+    def _build_view_toolbar(self, target, layout):
+        """Buttons for the view actions TomoBoxer owns."""
         # Toggle Colors / Show Active Set Only / Show All Sets: the
         # QActions themselves live on TomoBoxer (it owns sets_visible and
         # the color rotation), but the buttons for them live here instead
@@ -944,6 +973,8 @@ class ParticleListPanel(QtWidgets.QWidget):
                 self.view_toolbar.addAction(target.umap_action)
             layout.addWidget(self.view_toolbar)
 
+    def _build_rank_controls(self, target):
+        """The "Rank by Embedding Distance" controls; __init__ adds them to the layout below the tabs."""
         # Deliberately the loudest thing in this window: computing/sorting
         # by Mahalanobis distance used to live as a File menu item (then a
         # popup dialog triggered from a button), which made it easy to miss
@@ -1080,6 +1111,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         # rather than above the tabs entirely: all three act on "whatever
         # tab you're currently looking at," so they read as one group.
 
+    def _build_tabs(self, layout):
+        """The tab widget with "All", the UMAP Selection grid and the "+" tab, and the per-tab state."""
         self.tabs = QtWidgets.QTabWidget()
         # setTabBar must happen before any tabs are added (Qt requirement).
         # setMovable(True) plus _ConstrainedTabBar is what lets normal sets
@@ -1130,24 +1163,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.tabs.setTabToolTip(self.tabs.indexOf(self._plus_placeholder), "Create a new set")
         self._last_tab_index = 0
 
-        # Menu-only equivalents of the "+" tab and double-clicking a tab
-        # (TomoBoxer's Set menu) -- both gestures already exist and work
-        # fine, these just make them reachable without knowing that.
-        self.new_set_action = QtGui.QAction("New Set...", self)
-        self.new_set_action.setToolTip("Create a new set.")
-        self.new_set_action.triggered.connect(self._prompt_new_set)
-
-        self.rename_set_action = QtGui.QAction("Rename Set...", self)
-        self.rename_set_action.setToolTip("Rename the current tab's set.")
-        self.rename_set_action.triggered.connect(self._prompt_rename_current_set)
-
-        # The Rank panel operates on "whatever tab is currently on screen,"
-        # same as every action in the toolbar just below it -- keeping them
-        # adjacent (rather than the Rank panel sitting above the tabs
-        # entirely, as it used to) makes that relationship visible instead
-        # of implied.
-        layout.addWidget(self.compute_distance_group)
-
+    def _build_gallery_toolbar(self, layout):
+        """The toolbar below the tabs: Organize, Detach, the two sorts, Delete Set and Empty Recycle Bin."""
         # A real QToolBar (not a bare row of QPushButtons) so these pick up
         # the exact same flat "chip" look as every other toolbar in the
         # app, rather than looking like a different, unstyled widget glued
@@ -1228,8 +1245,6 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.sort_by_id_button = self.gallery_toolbar.widgetForAction(self.sort_by_id_action)
         self.sort_by_score_button = self.gallery_toolbar.widgetForAction(self.sort_by_rank_action)
         self.empty_recycle_button = self.gallery_toolbar.widgetForAction(self.empty_recycle_action)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
 
     def _target_or_none(self):
         return self._target() if self._target is not None else None

@@ -113,7 +113,82 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # keypress of the session.
         space_key_state()
 
-        # -- menu ---------------------------------------------------------
+        self._build_menus()
+        self._build_views()
+        self._build_control_panel()
+
+        self.curbox = -1
+        self.picks = Picks()  # the particles, their sets and box sizes -- see picks.py
+        self.boxesimgs = []
+        self.dragging = -1
+        self._select_drawing = None  # in-progress shape-select gesture, or None
+        self._undo_stack = []
+        self._redo_stack = []
+
+        self._wire_views()
+        self._build_tools()
+        self._build_edit_actions()
+        self._build_view_actions()
+        self._register_shortcuts()
+
+        # -- load data ---------------------------------------------------------
+        self.datafilename = datafile
+        self._load_volume(options, datafile)
+
+        # Per-class plain-text pick files live in "<basename>_picks/" next
+        # to the tomogram by default, or wherever --working_dir points
+        # (resolved relative to the current working directory) instead.
+        self.picksdir = (
+            os.path.abspath(options.working_dir) if getattr(options, "working_dir", None)
+            else metadata.picks_dir(datafile))
+        self._load_embedding_spaces(options)
+        self._build_particle_list(datafile)
+        self._load_picks()
+        self._import_from_options(options)
+
+        if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
+            self.new_set("particles_00")
+
+        self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
+        if getattr(options, "label", None):
+            sid = [i for i in self.sets if self.sets[i] == options.label]
+            if sid:
+                self.currentset = sid[0]
+            else:
+                print("cannot find specified label")
+
+        # All classes are visible by default when the tomogram is opened,
+        # except the Recycle Bin -- rejected particles are more useful
+        # tucked out of the way until you deliberately want to review them.
+        self.sets_visible.update(self.sets.keys())
+        self.sets_visible.discard(categories.RECYCLE_BIN_ID)
+        self.wboxsize.setValue(self.get_boxsize())
+
+        if getattr(options, "clean", False):
+            self.tool_eraser_action.setChecked(True)
+            self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
+
+        self._load_umap_selection()
+
+        for i in range(len(self.boxes)):
+            self.update_box(i)
+
+        self.update_all()
+        self.initialized = True
+
+        # Land on the first real set's own tab, not "All" -- grouping
+        # every particle across every class (ParticleGrid.
+        # sync_particles_grouped) is the single most expensive gallery
+        # view to build, and isn't what you want staring back at you the
+        # moment a large tomogram finishes opening anyway. Whatever's
+        # first in the gallery's own tab order (after Recycle Bin/
+        # Confirmed), matching what the tab bar actually shows.
+        first_normal = self.boxesviewer.normal_class_order()
+        if first_normal:
+            self.boxesviewer.activate_class_tab(first_normal[0])
+
+    def _build_menus(self):
+        """The menu bar."""
         self.mfile = self.menuBar().addMenu("File")
         self.mfile_save_all = self.mfile.addAction("Save")
         self.mfile.addSeparator()
@@ -151,7 +226,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mhelp_shortcuts_action.setShortcutContext(Qt.ApplicationShortcut)
         self.mhelp_shortcuts_action.triggered.connect(self.show_shortcuts_dialog)
 
-        # -- central layout: 3 orthogonal views + control panel ------------
+    def _build_views(self):
+        """The three slice views, their depth sliders and the splitters that hold them."""
         self.setCentralWidget(QtWidgets.QWidget())
         self.gbl = QtWidgets.QGridLayout(self.centralWidget())
         gblh = QtWidgets.QHBoxLayout()
@@ -203,7 +279,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.splitter_top.splitterMoved.connect(self._on_top_splitter_moved)
         self.splitter_bottom.splitterMoved.connect(self._on_bottom_splitter_moved)
 
-        # -- control panel --------------------------------------------------
+    def _build_control_panel(self):
+        """Coordinates, contrast, box size and Avg Slices, below the XZ view."""
         gbl3 = QtWidgets.QHBoxLayout()
         self.gbl2.addLayout(gbl3, 0, 0, 1, 2)
 
@@ -252,15 +329,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wnlayers.setToolTip(label0.toolTip())
         self.gbl2.addWidget(self.wnlayers, 3, 1)
 
-        self.curbox = -1
-        self.picks = Picks()  # the particles, their sets and box sizes -- see picks.py
-        self.boxesimgs = []
-        self.dragging = -1
-        self._select_drawing = None  # in-progress shape-select gesture, or None
-        self._undo_stack = []
-        self._redo_stack = []
-
-        # -- wiring -----------------------------------------------------------
+    def _wire_views(self):
+        """Connect the menu, the controls and the slice views to their handlers."""
         self.mfile_save_all.triggered.connect(self.menu_file_save_all)
         self.mfile_read_boxloc.triggered.connect(self.menu_file_read_boxloc)
         self.mfile_import_with_embeddings.triggered.connect(self.menu_file_import_with_embeddings)
@@ -310,7 +380,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xzview.keypress.connect(self.key_press)
         self.zyview.keypress.connect(self.key_press)
 
-        # -- tool selector: Pick / Eraser / Select ---------------------------
+    def _build_tools(self):
+        """The Pick / Eraser / Select tools, their options and the Tools toolbar."""
         # These are mutually exclusive *tools* (Photoshop/GIMP-style), not
         # independent settings -- exactly one is ever active, and each has
         # its own small set of options that only matter while it's the
@@ -407,6 +478,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.tools_toolbar.addWidget(self.select_shape_freeform)
         self.tools_toolbar.addWidget(self.tool_3d_checkbox)
 
+    def _build_edit_actions(self):
+        """Undo/Redo, Refresh, the actions on the selection, and the Edit and Selection toolbars."""
         # QAction rather than a bare QShortcut for both: it gives Undo/Redo
         # a visible Edit-menu entry (with the shortcut shown alongside it
         # for free) and a toolbar button, in addition to still responding
@@ -552,6 +625,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._focus_pulse_on = False
         self.focus_selected_action.toggled.connect(self._update_focus_pulse)
 
+    def _build_view_actions(self):
+        """The View menu's actions, the Volume toolbar, the status bar, and the application-wide number-key and Escape shortcuts."""
         # Show Active Set Only / Show All Sets' QActions are created here
         # (TomoBoxer owns sets_visible and the solo logic), but -- like
         # Toggle Colors above -- the buttons for them live in the particle
@@ -641,10 +716,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._escape_shortcut.setContext(Qt.ApplicationShortcut)
         self._escape_shortcut.activated.connect(self._global_escape)
 
-        # -- customizable keyboard shortcuts (Settings > Customize Keyboard
-        # Shortcuts...) -- registered here, now that every action/shortcut
-        # below has its own built-in default already set, so that default
-        # can just be read back rather than duplicated a second time.
+    def _register_shortcuts(self):
+        """Customizable keyboard shortcuts (Settings > Customize Keyboard Shortcuts...) -- registered now that every action and shortcut has its built-in default set, so that default can be read back rather than duplicated."""
         self._shortcut_registry = []
         self._register_shortcut("undo", "Undo", self.undo_action)
         self._register_shortcut("redo", "Redo", self.redo_action, multi=True)
@@ -662,9 +735,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.msettings_shortcuts_action = self.msettings.addAction("Customize Keyboard Shortcuts...")
         self.msettings_shortcuts_action.triggered.connect(self.open_shortcuts_settings)
 
-        # -- load data ---------------------------------------------------------
-        self.datafilename = datafile
-
+    def _load_volume(self, options, datafile):
+        """Read the tomogram (or take the one the session prefetched) and note the companion, if any."""
         # Companion-volume support (e.g. denoised vs. non-denoised display of
         # the exact same tomogram): _volume_slots holds the two possible
         # Volume objects, _active_volume_key says which one self.data
@@ -694,13 +766,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.companion_path:
             self.toggle_companion_action.setEnabled(True)
 
-        # Per-class plain-text pick files live in "<basename>_picks/" next
-        # to the tomogram by default, or wherever --working_dir points
-        # (resolved relative to the current working directory) instead.
-        self.picksdir = (
-            os.path.abspath(options.working_dir) if getattr(options, "working_dir", None)
-            else metadata.picks_dir(datafile))
-
+    def _load_embedding_spaces(self, options):
+        """Reload every embedding space a previous launch attached to this working directory."""
         # Mahalanobis-distance feature: at most one embeddings bundle is
         # attached at a time (see import_particle_list_with_embeddings).
         # Auto-reload whichever one a previous session attached, so it
@@ -755,6 +822,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 print(f"note: {name!r} embeddings were recorded at {old_path}, which no longer "
                       f"exists; now using {new_path} from the session manifest")
 
+    def _build_particle_list(self, datafile):
+        """The particle list window, its signals, and the Set menu."""
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle(f"PickyMate — Particle List — {metadata.base_name(datafile)}")
         self.boxesviewer.set_mouse_mode("App")
@@ -795,7 +864,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self._arrange_windows()
 
-        # -- metadata (picks + classes) ------------------------------------------
+    def _load_picks(self):
+        """Every set's particles from the working directory, with uids made unique and coordinates clamped to the volume."""
         class_settings = metadata.load_class_settings(self.picksdir)
         classnames = metadata.discover_classes(self.picksdir)
         normal_names = [n for n in classnames if n not in categories.FIXED_CLASS_NAMES]
@@ -874,6 +944,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
         self.picks.rebuild_indices()  # the uid repair above changed uids after they were indexed
 
+    def _import_from_options(self, options):
+        """--particle_lists, and the embedded particle list with its embeddings, as given on the command line."""
         # --particle_lists: each path becomes its own brand-new set, copied
         # (written) into self.picksdir immediately, same as File > Read Box
         # Coord -- see import_particle_list. live=False since the boxes
@@ -913,47 +985,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     print(f"note: {note}")
             except (ValueError, OSError) as e:
                 print(f"warning: could not load {method} embeddings from {emb_path!r}: {e}")
-
-        if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
-            self.new_set("particles_00")
-
-        self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
-        if getattr(options, "label", None):
-            sid = [i for i in self.sets if self.sets[i] == options.label]
-            if sid:
-                self.currentset = sid[0]
-            else:
-                print("cannot find specified label")
-
-        # All classes are visible by default when the tomogram is opened,
-        # except the Recycle Bin -- rejected particles are more useful
-        # tucked out of the way until you deliberately want to review them.
-        self.sets_visible.update(self.sets.keys())
-        self.sets_visible.discard(categories.RECYCLE_BIN_ID)
-        self.wboxsize.setValue(self.get_boxsize())
-
-        if getattr(options, "clean", False):
-            self.tool_eraser_action.setChecked(True)
-            self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
-
-        self._load_umap_selection()
-
-        for i in range(len(self.boxes)):
-            self.update_box(i)
-
-        self.update_all()
-        self.initialized = True
-
-        # Land on the first real set's own tab, not "All" -- grouping
-        # every particle across every class (ParticleGrid.
-        # sync_particles_grouped) is the single most expensive gallery
-        # view to build, and isn't what you want staring back at you the
-        # moment a large tomogram finishes opening anyway. Whatever's
-        # first in the gallery's own tab order (after Recycle Bin/
-        # Confirmed), matching what the tab bar actually shows.
-        first_normal = self.boxesviewer.normal_class_order()
-        if first_normal:
-            self.boxesviewer.activate_class_tab(first_normal[0])
 
     def showEvent(self, event):
         super().showEvent(event)
