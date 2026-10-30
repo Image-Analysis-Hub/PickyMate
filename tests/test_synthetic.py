@@ -30,7 +30,11 @@ def particles(win):
 
 
 def files(pdir):
-    return {fn: open(os.path.join(pdir, fn), "rb").read() for fn in sorted(os.listdir(pdir))}
+    out = {}
+    for fn in sorted(os.listdir(pdir)):
+        with open(os.path.join(pdir, fn), "rb") as f:
+            out[fn] = f.read()
+    return out
 
 
 def target_set(win):
@@ -218,7 +222,13 @@ def test_golden_actions(tomo, open_window):
     found = {}
     for owner in (win, win.boxesviewer, win.boxesviewer.ranking):
         for a in owner.findChildren(QtGui.QAction):
-            found[f"{type(owner).__name__}/{a.text()}"] = {
+            if a.isSeparator() or not a.text():   # Qt's own: separators, addWidget() wrappers
+                continue
+            # the parent's type tells a menu's own action from a toolbar's
+            # show/hide toggle of the same name
+            key = f"{type(owner).__name__}/{type(a.parent()).__name__}/{a.text()}"
+            assert key not in found, f"two actions named {key!r}; the golden would hide one"
+            found[key] = {
                 "tooltip": a.toolTip(), "shortcuts": [s.toString() for s in a.shortcuts()],
                 "context": str(a.shortcutContext()), "checkable": a.isCheckable(),
                 "checked": a.isChecked(), "enabled": a.isEnabled(), "visible": a.isVisible()}

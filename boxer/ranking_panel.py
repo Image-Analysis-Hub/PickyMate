@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import weakref
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from . import categories
 from .widgets import make_action

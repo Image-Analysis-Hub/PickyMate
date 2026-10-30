@@ -31,14 +31,14 @@ def test_add_reassign_remove_insert_keep_the_indices_right():
     assert p.boxes[1].score is None and list(p.indices_of(b)) == [1, 3, 5]
     consistent(p)
 
-    removed, kept = p.remove([0, 5, 9])
-    assert [i for i, _ in removed] == [0, 5, 9] and kept == [1, 2, 3, 4, 6, 7, 8]
-    assert len(p.boxes) == 7 and p.index_for_uid(removed[1][1].uid) is None
+    gone = [p.boxes[i] for i in (0, 5, 9)]
+    assert p.remove([0, 5, 9]) == [1, 2, 3, 4, 6, 7, 8]
+    assert len(p.boxes) == 7 and p.index_for_uid(gone[1].uid) is None
     consistent(p)
 
-    p.insert(0, removed[0][1])
+    p.insert(0, gone[0])
     p.rebuild_indices()
-    assert p.index_for_uid(removed[0][1].uid) == 0
+    assert p.index_for_uid(gone[0].uid) == 0
     consistent(p)
 
     p.reassign(list(p.indices_of(b)), 0)

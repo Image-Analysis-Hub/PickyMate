@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import weakref
-
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -1980,8 +1978,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
             "x": (self.zyview, self.x_loc),
         }
 
-        lwi = 2 if self.boxshape == "circle" else 3  # index into geom for linewidth handled separately
-
         for v in (self.xyview, self.xzview, self.zyview):
             v.del_shape("xline")
             v.del_shape("yline")
@@ -2142,9 +2138,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
             return
         affected_classes = {self.boxes[i].classid for i in delids}
         if record_undo:
-            removed = [(i, self.boxes[i].copy(), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in delids]
+            removed = [(i, self.boxes[i], self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in delids]
             self._push_undo({"type": "delete", "removed": removed})
-        _, kpids = self.picks.remove(delids)
+        kpids = self.picks.remove(delids)
         self.boxesimgs = [self.boxesimgs[i] for i in kpids if i < len(self.boxesimgs)]
         for view in (self.xyview, self.xzview, self.zyview):
             view.remap_shape_keys(kpids)
@@ -2303,13 +2299,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         idx = self.picks.index_for_uid(action["uid"])
         if idx is None:
             return
-        box_copy = self.boxes[idx].copy()
+        box = self.boxes[idx]
         img = self.boxesimgs[idx] if idx < len(self.boxesimgs) else None
         self.del_box(idx, record_undo=False)
         # Redoing an "add" is exactly "undoing a delete" of this one
         # particle -- reuse that same (index, box, image) shape so
         # _redo_add can just replay it with _undo_delete's own logic.
-        self._redo_stack.append({"type": "add", "uid": action["uid"], "removed": [(idx, box_copy, img)]})
+        self._redo_stack.append({"type": "add", "uid": action["uid"], "removed": [(idx, box, img)]})
 
     def _redo_add(self, action):
         self._reinsert_boxes(action["removed"])
@@ -2320,25 +2316,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # Redo re-deletes the same particles, resolved by uid at redo time
         # rather than by the original index, so it stays correct even if
         # something else happens to shift positions in between.
-        self._redo_stack.append({"type": "delete", "uids": [box_copy.uid for _, box_copy, _ in action["removed"]]})
+        self._redo_stack.append({"type": "delete", "uids": [box.uid for _, box, _ in action["removed"]]})
 
     def _redo_delete(self, action):
         idx = sorted(i for i in (self.picks.index_for_uid(u) for u in action["uids"]) if i is not None)
         if not idx:
             return
-        removed = [(i, self.boxes[i].copy(), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in idx]
+        removed = [(i, self.boxes[i], self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in idx]
         self.del_box(idx, record_undo=False)
         self._undo_stack.append({"type": "delete", "removed": removed})
 
     def _reinsert_boxes(self, removed):
         """Shared by _undo_delete and _redo_add: reinsert a (orig_index,
-        box_copy, img) list (ascending orig_index) back into self.boxes at
+        box, img) list (ascending orig_index) back into self.boxes at
         those same positions, and rebuild every shape from scratch, since
         insertion shifts every later box's index."""
-        affected_classes = {box_copy.classid for _, box_copy, _ in removed}
-        for orig_index, box_copy, img in removed:
+        affected_classes = {box.classid for _, box, _ in removed}
+        for orig_index, box, img in removed:
             idx = min(orig_index, len(self.boxes))
-            self.picks.insert(idx, box_copy.copy())
+            self.picks.insert(idx, box)
             self.boxesimgs.insert(idx, img)
         self.picks.rebuild_indices()  # insertion shifts every later index
         for i in range(len(self.boxes)):
@@ -2352,7 +2348,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # fired for unrelated reasons like a set's visibility being
         # toggled back on, since that removes and re-adds gallery items
         # the same way a real delete/restore does).
-        self.boxesviewer.replace_selection([box_copy.uid for _, box_copy, _ in removed])
+        self.boxesviewer.replace_selection([box.uid for _, box, _ in removed])
 
     def _undo_reassign(self, action):
         uids = [self.boxes[i].uid for i, _ in action["changes"] if 0 <= i < len(self.boxes)]

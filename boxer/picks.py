@@ -23,9 +23,6 @@ class Particle:
         self.embedding_row = embedding_row
         self.score = score
 
-    def copy(self):
-        return Particle(self.x, self.y, self.z, self.classid, self.uid, self.embedding_row, self.score)
-
     def record(self):
         """The dict metadata.save_class_records writes."""
         return {"x": self.x, "y": self.y, "z": self.z, "uid": self.uid,
@@ -105,22 +102,20 @@ class Picks:
         return i
 
     def insert(self, index, particle):
-        """Put a particle back at a position (undo of a delete). Both
-        indices are stale until rebuild_indices(), so a run of inserts can
-        rebuild once."""
+        """Put a particle back at a position (undo of a delete)."""
+        # shortcut: both indices are stale until rebuild_indices(), fine for
+        # the one caller that inserts a batch; make this rebuild if another appears
         self.boxes.insert(index, particle)
 
     def remove(self, indices):
-        """Drop the particles at these positions. Returns (removed, kept):
-        removed as [(old index, particle)] ascending, kept as the old
-        indices of the survivors in their new order, for whoever holds a
-        list parallel to boxes (thumbnails, the views' shapes)."""
+        """Drop the particles at these positions. Returns the old indices of
+        the survivors in their new order, for whoever holds a list parallel
+        to boxes (thumbnails, the views' shapes)."""
         gone = set(indices)
         kept = [i for i in range(len(self.boxes)) if i not in gone]
-        removed = [(i, self.boxes[i]) for i in sorted(gone)]
         self.boxes = [self.boxes[i] for i in kept]
         self.rebuild_indices()
-        return removed, kept
+        return kept
 
     def set_class(self, index, classid):
         """Move one particle to another set; returns the set it was in. A

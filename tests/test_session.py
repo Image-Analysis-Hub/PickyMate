@@ -249,8 +249,8 @@ try:
     rewritten = [r for r in rewritten if r["name"] != "extra_space"]
     assert all(r["exists"] and r["path"].startswith(DATA) for r in rewritten), rewritten
     assert session.entry(MOVED).embedding_path_fixes() == {}
-    print(f"OK: stale embedding paths from another machine are replaced by the manifest's, "
-          f"the tomogram opens with all 4 spaces, and the corrected paths are saved")
+    print("OK: stale embedding paths from another machine are replaced by the manifest's, "
+          "the tomogram opens with all 4 spaces, and the corrected paths are saved")
 
     # never substitute a file with a different name: it could be other data
     e = session.entry(MOVED)
