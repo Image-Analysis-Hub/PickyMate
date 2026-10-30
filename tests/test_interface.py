@@ -8,8 +8,8 @@ from boxer.main_window import TomoBoxer
 
 BOXER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "boxer")
 # module -> the names its code calls the main window by
-HOLDERS = {"thumb_grid": ["target"], "umap_view": ["target"], "session_browser": ["target"],
-           "session_window": ["win", "old", r"self\.current"]}
+HOLDERS = {"thumb_grid": ["target"], "ranking_panel": ["target"], "umap_view": ["target"],
+           "session_browser": ["target"], "session_window": ["win", "old", r"self\.current"]}
 
 
 def documented():

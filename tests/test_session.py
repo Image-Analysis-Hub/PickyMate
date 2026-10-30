@@ -99,11 +99,11 @@ try:
     win = ctl.current
     assert win is not None and win.session_name == "TS_026"
     assert win.ordered_space_names()[0] == "tomotwin", win.ordered_space_names()
-    combo = win.boxesviewer.compute_distance_space_combo
+    combo = win.boxesviewer.ranking.compute_distance_space_combo
     shown = [combo.itemData(i) for i in range(combo.count())]
     assert shown == ["tomotwin", "tomotwin_umap", "cryosiam", "cryosiam_umap"], shown
-    assert win.boxesviewer.compute_distance_scope_row.isVisibleTo(win.boxesviewer)
-    assert win.boxesviewer.reference_tomograms() is None, "default must be this tomogram only"
+    assert win.boxesviewer.ranking.compute_distance_scope_row.isVisibleTo(win.boxesviewer)
+    assert win.boxesviewer.ranking.reference_tomograms() is None, "default must be this tomogram only"
     print("OK: space dropdown is TomoTwin full, TomoTwin UMAP, CryoSIAM full, CryoSIAM UMAP; "
           "references default to this tomogram")
 
@@ -211,7 +211,7 @@ try:
     # the navigator shows the new state, and the scope survives the switch
     ctl.reference_scope = ("all", [])
     ctl.open("TS_026")
-    assert ctl.current.boxesviewer.reference_tomograms() == session.names
+    assert ctl.current.boxesviewer.ranking.reference_tomograms() == session.names
     ctl.navigator.refresh()
     assert ctl.navigator.table.item(0, 0).text().strip().startswith("▶")
     print("OK: navigator marks the open tomogram; the references choice survives switching")

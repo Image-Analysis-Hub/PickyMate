@@ -54,9 +54,10 @@ _SELECT_CLOSE_PIXELS = 8  # screen-pixel radius for "clicked near the first free
 class TomoBoxer(QtWidgets.QMainWindow):
     """Main window: orthogonal slice views + picking controls.
 
-    The particle list (thumb_grid), the map (umap_view), the browser of
-    other tomograms (session_browser) and the session controller
-    (session_window) hold a weak reference to this window and use only
+    The particle list (thumb_grid) and its ranking panel (ranking_panel),
+    the map (umap_view), the browser of other tomograms (session_browser)
+    and the session controller (session_window) hold a weak reference to
+    this window and use only
     what is listed here -- nothing else of it is theirs to touch, and
     tests/test_interface.py checks that:
 
@@ -858,7 +859,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mset.addAction(self.boxesviewer.sort_by_id_action)
         self.mset.addAction(self.boxesviewer.sort_by_rank_action)
         self.mset.addSeparator()
-        self.mset.addAction(self.boxesviewer.rank_action)
+        self.mset.addAction(self.boxesviewer.ranking.rank_action)
         self.mset.addSeparator()
         self.mset.addAction(self.boxesviewer.empty_recycle_action)
 

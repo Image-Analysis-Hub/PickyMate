@@ -208,9 +208,9 @@ def shot_particle_list(win, out):
     r = bar.tabRect(tab_idx)
     p1 = bar.mapTo(bv, QtCore.QPoint(r.right() + 20, r.center().y()))
     grid_c = grid.mapTo(bv, QtCore.QPoint(80, 80))
-    rank_c = bv.compute_distance_group.mapTo(
-        bv, QtCore.QPoint(bv.compute_distance_group.width() - 40,
-                          bv.compute_distance_group.height() - 60))
+    rank_c = bv.ranking.mapTo(
+        bv, QtCore.QPoint(bv.ranking.width() - 40,
+                          bv.ranking.height() - 60))
     tb_c = bv.gallery_toolbar.mapTo(
         bv, QtCore.QPoint(bv.gallery_toolbar.width() - 40,
                           bv.gallery_toolbar.height() // 2))
@@ -596,7 +596,7 @@ def shot_session(data, out, tmp):
     ctl = SessionController(Session.from_manifest(manifest), base)
     ctl.start("TS_026")
     save(grab(ctl.navigator), out, "session-navigator.png")
-    panel = ctl.current.boxesviewer.compute_distance_group
+    panel = ctl.current.boxesviewer.ranking
     save(grab(panel), out, "ranking-panel.png")
     win = ctl.current
     win._confirm_close = lambda: True
