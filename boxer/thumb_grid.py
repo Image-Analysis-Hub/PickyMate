@@ -1579,7 +1579,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         target = self._target_or_none()
         if target is None:
             return
-        count = sum(1 for b in target.boxes if b[5] == categories.RECYCLE_BIN_ID)
+        count = sum(1 for b in target.boxes if b.classid == categories.RECYCLE_BIN_ID)
         if count == 0:
             return
         reply = QtWidgets.QMessageBox.question(

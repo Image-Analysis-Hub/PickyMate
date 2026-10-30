@@ -25,7 +25,7 @@ def particles(win):
     """{uid: (x, y, z, set name, embedding_row, score)} -- what must survive a
     save and a reload, keyed by uid so the order boxes are held in is free
     to change."""
-    return {b[6]: (b[0], b[1], b[2], win.sets[b[5]], b[7], b[4]) for b in win.boxes}
+    return {b.uid: (b.x, b.y, b.z, win.sets[b.classid], b.embedding_row, b.score) for b in win.boxes}
 
 
 def files(pdir):
@@ -38,7 +38,7 @@ def target_set(win):
 
 def indices(win, rows):
     """Box indices of the particles imported at the given embedding rows."""
-    return [i for i, b in enumerate(win.boxes) if b[7] in rows]
+    return [i for i, b in enumerate(win.boxes) if b.embedding_row in rows]
 
 
 def in_set(win, name):
@@ -58,7 +58,7 @@ def test_roundtrip_is_byte_identical(tomo, open_window):
     win = open_window(tomo)
     pdir = tomo["picks_dir"]
     assert sorted(win.sets.values()) == ["Confirmed", "Recycle Bin", "TS_A"]
-    assert len(win.boxes) == 20 and all(b[7] is not None for b in win.boxes)
+    assert len(win.boxes) == 20 and all(b.embedding_row is not None for b in win.boxes)
     assert win.ordered_space_names() == ["tomotwin", "tomotwin_umap"]
 
     target = target_set(win)
@@ -84,7 +84,7 @@ def test_ranking_from_confirmed_picks(tomo, open_window):
     win.send_to_confirmed(indices(win, CLUSTER_A[:3]))
     res = win.compute_mahalanobis(categories.CONFIRMED_ID, target, "tomotwin")
     assert res["reference_size"] == 3 and res["scored"] == 17
-    scored = [(b[4], b[7]) for b in win.boxes if b[5] == target]
+    scored = [(b.score, b.embedding_row) for b in win.boxes if b.classid == target]
     assert all(s is not None for s, _ in scored)
     ranked = [row for _, row in sorted(scored)]
     assert set(ranked[:7]) == set(CLUSTER_A[3:]), "lookalikes of the confirmed picks must rank first"
@@ -103,7 +103,7 @@ def test_undo_redo(tomo, open_window):
     pdir = tomo["picks_dir"]
     before = particles(win)
     moved = indices(win, [0, 1])
-    uids = {win.boxes[i][6] for i in moved}
+    uids = {win.boxes[i].uid for i in moved}
 
     win.send_to_confirmed(moved)
     assert in_set(win, "Confirmed") == uids
@@ -115,7 +115,7 @@ def test_undo_redo(tomo, open_window):
     after_confirm = particles(win)
 
     gone = indices(win, [5])[0]
-    gone_uid = win.boxes[gone][6]
+    gone_uid = win.boxes[gone].uid
     win.del_box(gone)
     assert gone_uid not in particles(win) and len(win.boxes) == 19
     assert gone_uid not in {r["uid"] for r in metadata.load_class_records(pdir, "TS_A")}
@@ -155,8 +155,8 @@ def test_pick_and_erase_by_click(tomo, open_window, qapp):
     click(qapp, view, x, y)
     assert len(win.boxes) == 21
     new = win.boxes[-1]
-    assert abs(new[0] - x) < 1 and abs(new[1] - y) < 1 and new[2] == z
-    assert new[5] == win.currentset and new[7] is None, "a hand pick has no embedding"
+    assert abs(new.x - x) < 1 and abs(new.y - y) < 1 and new.z == z
+    assert new.classid == win.currentset and new.embedding_row is None, "a hand pick has no embedding"
     win.undo()
     assert len(win.boxes) == 20
     win.redo()
@@ -165,10 +165,11 @@ def test_pick_and_erase_by_click(tomo, open_window, qapp):
     win.tool_eraser_action.trigger()
     assert win.tool_eraser_action.isChecked()
     win.eraser_radius.setValue(8)
-    x, y, z = win.boxes[0][:3]
+    first = win.boxes[0]
+    x, y, z = first.x, first.y, first.z
     win.z_loc = z
     click(qapp, view, x, y)
-    binned = [tuple(b[:3]) for b in win.boxes if b[5] == categories.RECYCLE_BIN_ID]
+    binned = [(b.x, b.y, b.z) for b in win.boxes if b.classid == categories.RECYCLE_BIN_ID]
     assert binned == [(x, y, z)], binned
 
 

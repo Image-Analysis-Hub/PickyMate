@@ -484,12 +484,12 @@ class UmapWindow(QtWidgets.QWidget):
         rows, uids, classes = [], [], []
         missing = 0
         for b in target.boxes:
-            if b[7] is None or not (0 <= b[7] < len(array)):
+            if b.embedding_row is None or not (0 <= b.embedding_row < len(array)):
                 missing += 1
                 continue
-            rows.append(b[7])
-            uids.append(b[6])
-            classes.append(b[5])
+            rows.append(b.embedding_row)
+            uids.append(b.uid)
+            classes.append(b.classid)
         self._uids = np.asarray(uids, dtype=np.int64)
         classes = np.asarray(classes, dtype=np.int64)
         selection = target.umap_selection
@@ -541,11 +541,11 @@ class UmapWindow(QtWidgets.QWidget):
         for t, (name, n) in enumerate(m.layout):
             coords = m.coords_for(name)
             if name == here:
-                emb = [b for b in target.boxes if b[7] is not None]
-                rows = np.asarray([b[7] for b in emb], dtype=np.int64)
-                u = np.asarray([b[6] for b in emb], dtype=np.int64)
-                c = np.asarray([2 if b[5] == categories.CONFIRMED_ID else
-                                1 if b[5] == categories.RECYCLE_BIN_ID else 0 for b in emb],
+                emb = [b for b in target.boxes if b.embedding_row is not None]
+                rows = np.asarray([b.embedding_row for b in emb], dtype=np.int64)
+                u = np.asarray([b.uid for b in emb], dtype=np.int64)
+                c = np.asarray([2 if b.classid == categories.CONFIRMED_ID else
+                                1 if b.classid == categories.RECYCLE_BIN_ID else 0 for b in emb],
                                dtype=np.int8)
                 chosen = target.umap_selection
             else:

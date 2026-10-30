@@ -109,7 +109,7 @@ try:
 
     target = [cid for cid in win.sets if cid not in categories.FIXED_CLASS_IDS][0]
     res_own = win.compute_mahalanobis(categories.CONFIRMED_ID, target, "tomotwin")
-    own_scores = {b[6]: b[4] for b in win.boxes if b[5] == target and b[4] is not None}
+    own_scores = {b.uid: b.score for b in win.boxes if b.classid == target and b.score is not None}
     res_all = win.compute_mahalanobis(categories.CONFIRMED_ID, target, "tomotwin",
                                       reference_tomograms=session.names)
     assert res_all["other_tomograms_used"] == ["TS_037", MOVED], res_all
@@ -119,15 +119,15 @@ try:
 
     # recompute the pooled ranking independently and demand exact agreement
     arr = win.embedding_spaces["tomotwin"]["array"].astype(np.float64)
-    own_rows = [b[7] for b in win.boxes if b[5] == categories.CONFIRMED_ID and b[7] is not None]
+    own_rows = [b.embedding_row for b in win.boxes if b.classid == categories.CONFIRMED_ID and b.embedding_row is not None]
     other, _, _ = session.reference_vectors("tomotwin", "Confirmed", ["TS_037", MOVED], 32)
     ref = np.vstack([arr[own_rows], other])
     mu = ref.mean(0); cen = ref - mu
     ci = np.linalg.pinv(cen.T @ cen / (len(ref) - 1), hermitian=True)
-    tgt = [(b[6], b[7]) for b in win.boxes if b[5] == target and b[7] is not None]
+    tgt = [(b.uid, b.embedding_row) for b in win.boxes if b.classid == target and b.embedding_row is not None]
     d = arr[[r for _, r in tgt]] - mu
     mine = ((d @ ci) * d).sum(1)
-    theirs = np.array([next(b[4] for b in win.boxes if b[6] == u) for u, _ in tgt])
+    theirs = np.array([next(b.score for b in win.boxes if b.uid == u) for u, _ in tgt])
     assert np.allclose(mine, theirs, rtol=1e-9, atol=1e-9), np.abs(mine - theirs).max()
     assert any(abs(own_scores[u] - s) > 1e-9 for (u, _), s in zip(tgt, theirs)), \
         "pooling other tomograms should change the scores"
@@ -143,8 +143,8 @@ try:
           f"from the other tomograms")
 
     # an edit made before switching must be on disk afterwards
-    moved = [i for i, b in enumerate(win.boxes) if b[5] == target][:3]
-    moved_uids = {win.boxes[i][6] for i in moved}
+    moved = [i for i, b in enumerate(win.boxes) if b.classid == target][:3]
+    moved_uids = {win.boxes[i].uid for i in moved}
     win.currentset = target
     win._reassign_boxes(moved, categories.RECYCLE_BIN_ID)
     categories.set_manual_color(0, categories.QtGui.QColor("orange"))

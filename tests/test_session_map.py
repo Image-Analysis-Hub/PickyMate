@@ -117,7 +117,7 @@ try:
     assert status == "ok" and [n for n, _ in m.layout] == NAMES, (status, m and m.layout)
     assert any(t for _, t in progress) and progress[-1][0] == progress[-1][1]
     tables = {n: ctl.session.particle_table(n) for n in NAMES[1:]}
-    live = sum(1 for b in win.boxes if b[7] is not None)
+    live = sum(1 for b in win.boxes if b.embedding_row is not None)
     assert len(uw.canvas._xy) == live + sum(len(t["uids"]) for t in tables.values())
     assert uw.compute_button.text() == "Recompute" and not uw.progress_bar.isVisibleTo(uw)
     print(f"OK: computed in the background ({len(progress)} progress updates) -- "

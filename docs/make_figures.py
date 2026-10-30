@@ -195,7 +195,7 @@ def shot_particle_list(win, out):
     # is undone by the grouped view's own rebuild cycles, but centering on a
     # concrete item survives them, and the red/green group boundary is what
     # makes this screenshot informative
-    conf_uids = [b[6] for b in win.boxes if b[5] == categories.CONFIRMED_ID]
+    conf_uids = [b.uid for b in win.boxes if b.classid == categories.CONFIRMED_ID]
     item = grid._items.get(conf_uids[0]) if conf_uids else None
     if item is not None:
         grid.centerOn(item)
@@ -265,7 +265,7 @@ def shot_umap(win, out, tmp):
     grab(bv)   # let the freshly shown tab's deferred sync finish
     # centre the gallery on a Confirmed member of the selection, so the
     # frame shows the colour-bordered groups rather than one red block
-    cls = {b[6]: b[5] for b in win.boxes}
+    cls = {b.uid: b.classid for b in win.boxes}
     conf_sel = [u for u in uw._uids[inside].tolist()
                 if cls.get(u) == categories.CONFIRMED_ID]
     item = bv.umap_grid._items.get(conf_sel[0]) if conf_sel else None
@@ -301,10 +301,10 @@ def shot_tools(win, out, tmp):
     from boxer import categories
     cid = next(c for c in win.sets if c not in categories.FIXED_CLASS_IDS)
     # a crowded neighbourhood: the densest picked slice
-    zs = [b[2] for b in win.boxes if b[5] == cid]
+    zs = [b.z for b in win.boxes if b.classid == cid]
     z = int(np.bincount(zs).argmax())
-    near = [b for b in win.boxes if abs(b[2] - z) < 4 and b[5] == cid]
-    xs, ys = np.array([b[0] for b in near]), np.array([b[1] for b in near])
+    near = [b for b in win.boxes if abs(b.z - z) < 4 and b.classid == cid]
+    xs, ys = np.array([b.x for b in near]), np.array([b.y for b in near])
     # centre the demo on the pick with the most neighbours within the demo
     # radius (a histogram bin can be won by duplicates stacked on one gold
     # bead), and stay away from the volume edge so no black padding shows
@@ -330,20 +330,20 @@ def shot_tools(win, out, tmp):
 
     # erase: send everything within that radius (in view pixels ~ voxels here)
     victims = [i for i, b in enumerate(win.boxes)
-               if b[5] == cid and abs(b[2] - z) < win.get_boxsize(b[5]) // 2
-               and (b[0] - cx) ** 2 + (b[1] - cy) ** 2 < 80 ** 2]
+               if b.classid == cid and abs(b.z - z) < win.get_boxsize(b.classid) // 2
+               and (b.x - cx) ** 2 + (b.y - cy) ** 2 < 80 ** 2]
     if victims:
-        win.currentset = win.boxes[victims[0]][5]
+        win.currentset = win.boxes[victims[0]].classid
         win._reassign_boxes(victims, categories.RECYCLE_BIN_ID)
     crop_at(win.xyview, 420).save(os.path.join(tmp, "erase_after.png"))
     win.undo()
     QtWidgets.QApplication.processEvents()
 
     # select: highlight everything inside a circle, plus the shape outline
-    chosen = [b[6] for b in win.boxes
-              if abs(b[2] - z) < win.get_boxsize(b[5]) // 2
-              and (b[0] - cx) ** 2 + (b[1] - cy) ** 2 < 90 ** 2
-              and b[5] == cid]
+    chosen = [b.uid for b in win.boxes
+              if abs(b.z - z) < win.get_boxsize(b.classid) // 2
+              and (b.x - cx) ** 2 + (b.y - cy) ** 2 < 90 ** 2
+              and b.classid == cid]
     win.boxesviewer.replace_selection(chosen)
     win.update_all(reslice=False)
     QtWidgets.QApplication.processEvents()
@@ -396,12 +396,12 @@ def shot_ranking(data, out, tmp):
     real = metadata.load_class_records(
         os.path.join(data, "Ribosomes_PickyMate/TS_026_picks"), "Confirmed")
     rows = {r["embedding_row"] for r in real if r["embedding_row"] is not None}
-    idx = [i for i, b in enumerate(win.boxes) if b[7] in rows][:60]
+    idx = [i for i, b in enumerate(win.boxes) if b.embedding_row in rows][:60]
     cid = next(c for c in win.sets if c not in categories.FIXED_CLASS_IDS)
 
     # ground-truth colour-coding for the static panels
     is_particle = gt_matcher(data)
-    coords = {b[6]: (b[0], b[1], b[2]) for b in win.boxes}
+    coords = {b.uid: (b.x, b.y, b.z) for b in win.boxes}
     is_ok = lambda uid: is_particle(*coords[uid])
     bv = win.boxesviewer
     bv.activate_class_tab(cid)
@@ -429,7 +429,7 @@ def shot_ranking(data, out, tmp):
     pm.save(os.path.join(tmp, "gif_pick.png"))
     # ...and the same view with the picks about to be confirmed outlined:
     # the GIF must show where the confirmed particles come from
-    conf_uids = {win.boxes[i][6] for i in idx}
+    conf_uids = {win.boxes[i].uid for i in idx}
     p = QtGui.QPainter(pm)
     p.setPen(QtGui.QPen(QtGui.QColor("#2ecc71"), 5))
     shown = 0
@@ -488,7 +488,7 @@ def shot_ranking(data, out, tmp):
                 junk.append(uid)
         if not junk:
             break
-        win._reassign_boxes([i for i, b in enumerate(win.boxes) if b[6] in set(junk)],
+        win._reassign_boxes([i for i, b in enumerate(win.boxes) if b.uid in set(junk)],
                             categories.RECYCLE_BIN_ID)
         rank()
     head_marked("rank_after.png")
