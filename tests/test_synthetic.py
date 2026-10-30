@@ -7,11 +7,12 @@ and compared pixel for pixel afterwards; a pure restructuring of the window
 code must leave them identical. Set PICKYMATE_UPDATE_GOLDEN=1 to accept a
 deliberate change of appearance.
 """
+import json
 import os
 
 import numpy as np
 import pytest
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 
@@ -51,6 +52,22 @@ def click(qapp, view, x, y, modifier=Qt.NoModifier):
     pos = QtCore.QPoint(int(sx), int(sy))
     assert view.viewport().rect().contains(pos), (pos, view.viewport().rect())
     QTest.mouseClick(view.viewport(), Qt.LeftButton, modifier, pos)
+    qapp.processEvents()
+
+
+def drag(qapp, view, x0, y0, x1, y1):
+    """A left drag from image (x0, y0) to (x1, y1) in a slice view: press,
+    a move with the button held, release."""
+    def at(x, y):
+        sx, sy = view.img_to_scr(x, y)
+        return QtCore.QPoint(int(sx), int(sy))
+    QTest.mousePress(view.viewport(), Qt.LeftButton, Qt.NoModifier, at(x0, y0))
+    p = at(x1, y1)
+    ev = QtGui.QMouseEvent(QtCore.QEvent.MouseMove, QtCore.QPointF(p),
+                           QtCore.QPointF(view.viewport().mapToGlobal(p)),
+                           Qt.NoButton, Qt.LeftButton, Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(view.viewport(), ev)
+    QTest.mouseRelease(view.viewport(), Qt.LeftButton, Qt.NoModifier, p)
     qapp.processEvents()
 
 
@@ -171,6 +188,49 @@ def test_pick_and_erase_by_click(tomo, open_window, qapp):
     click(qapp, view, x, y)
     binned = [(b.x, b.y, b.z) for b in win.boxes if b.classid == categories.RECYCLE_BIN_ID]
     assert binned == [(x, y, z)], binned
+
+
+def test_side_views_pick_and_drag(tomo, open_window, qapp):
+    """The XZ and ZY views map the mouse onto their own two axes, the third
+    coming from the slice shown."""
+    win = open_window(tomo)
+    x, y, z = EMPTY_SPOT
+    win.y_loc = y
+    click(qapp, win.xzview, x, z)           # XZ view: (x, z) under the mouse
+    assert len(win.boxes) == 21
+    new = win.boxes[-1]
+    assert abs(new.x - x) < 1 and new.y == y and abs(new.z - z) < 1
+    win.undo()
+    win.x_loc = x
+    click(qapp, win.zyview, z, y)           # ZY view: (z, y) under the mouse
+    new = win.boxes[-1]
+    assert new.x == x and abs(new.y - y) < 1 and abs(new.z - z) < 1
+    # dragging it in the XZ view moves it in x and z, never in y
+    y_before = new.y
+    drag(qapp, win.xzview, x, z, x + 10, z - 5)
+    assert abs(new.x - (x + 10)) < 1 and new.y == y_before and abs(new.z - (z - 5)) < 1
+
+
+def test_golden_actions(tomo, open_window):
+    """Every action's text, tooltip, shortcuts and flags, as a golden: a
+    change to how actions are built must leave all of them the same."""
+    win = open_window(tomo)
+    found = {}
+    for owner in (win, win.boxesviewer, win.boxesviewer.ranking):
+        for a in owner.findChildren(QtGui.QAction):
+            found[f"{type(owner).__name__}/{a.text()}"] = {
+                "tooltip": a.toolTip(), "shortcuts": [s.toString() for s in a.shortcuts()],
+                "context": str(a.shortcutContext()), "checkable": a.isCheckable(),
+                "checked": a.isChecked(), "enabled": a.isEnabled(), "visible": a.isVisible()}
+    path = os.path.join(GOLDEN, "actions.json")
+    if os.environ.get("PICKYMATE_UPDATE_GOLDEN") or not os.path.isfile(path):
+        os.makedirs(GOLDEN, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(found, f, indent=1, sort_keys=True)
+        pytest.skip(f"golden written: {path}")
+    with open(path) as f:
+        golden = json.load(f)
+    assert found == golden
 
 
 @pytest.mark.parametrize("which", ["main", "particle_list"])

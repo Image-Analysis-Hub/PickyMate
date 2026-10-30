@@ -30,7 +30,7 @@ from .image_view import ImageView2D
 from .settings_dialog import KeyboardShortcutsDialog
 from .thumb_grid import ParticleListPanel
 from .umap_view import UmapWindow
-from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
+from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, make_action, space_key_state
 from . import categories
 from . import metadata
 from . import ranking
@@ -39,8 +39,8 @@ from .picks import Particle, Picks
 from .shapes import Shape
 from .volume import Volume
 
-# Shared by the shape-select tool (rectangle/circle/freeform) below: index
-# of each axis into a click's (x, y, z) tuple, and which two axes are
+# Shared by _view_point and the shape-select tool (rectangle/circle/freeform)
+# below: index of each axis into a click's (x, y, z) tuple, and which two axes are
 # "in-plane" for a given view's depth axis -- matching the exact (a1, a2)
 # order update_box_shape already uses when building each view's own Shape
 # geometry (xyview: x,y; xzview: x,z; zyview: z,y). A Particle's own
@@ -201,12 +201,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
             "same picks can be ranked by each method and compared.")
         self.mfile_save_boxloc = self.mfile.addAction("Export Particle Coordinates...")
         self.mfile.addSeparator()
-        self.load_companion_action = QtGui.QAction("Load Companion Volume...", self)
-        self.load_companion_action.setToolTip(
+        self.load_companion_action = make_action(
+            self, "Load Companion Volume...",
             "Load a second version of this same tomogram (e.g. denoised) to switch "
             "display between -- picks, sets, and box sizes are shared; only the pixel "
-            "data shown changes. Must match the primary tomogram's dimensions exactly.")
-        self.load_companion_action.triggered.connect(self.load_companion_volume_dialog)
+            "data shown changes. Must match the primary tomogram's dimensions exactly.",
+            self.load_companion_volume_dialog)
         self.mfile.addAction(self.load_companion_action)
 
         # Each of these is populated further down, once the actions/objects
@@ -241,6 +241,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xyview = ImageView2D(sizehint=(1024, 1024))
         self.xzview = ImageView2D(sizehint=(1024, 256))
         self.zyview = ImageView2D(sizehint=(256, 1024))
+        # the same three, keyed by the axis each one looks along
+        self._views = {"z": self.xyview, "y": self.xzview, "x": self.zyview}
 
         # Three slice sliders, one per view's own depth axis -- each
         # spatially next to the view it drives, rather than all three
@@ -347,39 +349,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wbautoc.toggled.connect(self.event_autocontrast)
         self.wcontrast.rangeChanged.connect(self.event_contrast_slider)
 
-        self.xyview.mousemove.connect(self.xy_move)
-        self.xyview.mousedown.connect(self.xy_down)
-        self.xyview.mousedrag.connect(self.xy_drag)
-        self.xyview.mouseup.connect(self.mouse_up)
+        for axis, view in self._views.items():
+            view.mousedown.connect(lambda e, a=axis: self._view_down(a, e))
+            view.mousedrag.connect(lambda e, a=axis: self._view_drag(a, e))
+            view.mouseup.connect(self.mouse_up)
+            view.mousemove.connect(lambda e, v=view: self.mouse_move(e, v))
+            view.mousedoubleclick.connect(lambda _e, v=view: self._select_doubleclick(v))
+            view.signal_set_scale.connect(self.event_scale)
+            # Freeform select's Enter/Escape/Backspace need to work no matter
+            # which of the 3 views the polygon is being drawn in, not just the
+            # main XY one.
+            view.keypress.connect(self.key_press)
+        # Panning and Shift+wheel are not the same in every view (see
+        # xy_origin and xy_wheel), so those stay wired one by one.
         self.xyview.mousewheel.connect(self.xy_wheel)
-        self.xyview.mousedoubleclick.connect(self.xy_doubleclick)
-        self.xyview.signal_set_scale.connect(self.event_scale)
         self.xyview.origin_update.connect(self.xy_origin)
-
-        self.xzview.mousedown.connect(self.xz_down)
-        self.xzview.mousedrag.connect(self.xz_drag)
-        self.xzview.mouseup.connect(self.mouse_up)
         self.xzview.mousewheel.connect(self.xz_wheel)
-        self.xzview.mousedoubleclick.connect(self.xz_doubleclick)
-        self.xzview.signal_set_scale.connect(self.event_scale)
         self.xzview.origin_update.connect(self.xz_origin)
-        self.xzview.mousemove.connect(self.xz_move)
-
-        self.zyview.mousedown.connect(self.zy_down)
-        self.zyview.mousedrag.connect(self.zy_drag)
-        self.zyview.mouseup.connect(self.mouse_up)
         self.zyview.mousewheel.connect(self.zy_wheel)
-        self.zyview.mousedoubleclick.connect(self.zy_doubleclick)
-        self.zyview.signal_set_scale.connect(self.event_scale)
         self.zyview.origin_update.connect(self.zy_origin)
-        self.zyview.mousemove.connect(self.zy_move)
-
-        self.xyview.keypress.connect(self.key_press)
-        # Freeform select's Enter/Escape/Backspace need to work no matter
-        # which of the 3 views the polygon is being drawn in, not just the
-        # main XY one.
-        self.xzview.keypress.connect(self.key_press)
-        self.zyview.keypress.connect(self.key_press)
 
     def _build_tools(self):
         """The Pick / Eraser / Select tools, their options and the Tools toolbar."""
@@ -389,27 +377,24 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # active one. QActionGroup gives the exclusivity for free (checking
         # one unchecks the others) instead of the manual cross-wiring a set
         # of independent checkboxes would need.
-        self.tool_pick_action = QtGui.QAction("Pick", self)
-        self.tool_pick_action.setCheckable(True)
-        self.tool_pick_action.setChecked(True)
-        self.tool_pick_action.setToolTip(
+        self.tool_pick_action = make_action(
+            self, "Pick",
             "Normal picking: click empty space to add, click + drag an "
             "existing particle to move it. Shift/Space/Ctrl+click still "
-            "work for Recycle Bin/Confirmed/multi-select.")
+            "work for Recycle Bin/Confirmed/multi-select.", checkable=True)
+        self.tool_pick_action.setChecked(True)
 
-        self.tool_eraser_action = QtGui.QAction("Eraser", self)
-        self.tool_eraser_action.setCheckable(True)
-        self.tool_eraser_action.setToolTip(
+        self.tool_eraser_action = make_action(
+            self, "Eraser",
             "Click-drag in a tomogram view to send every particle within "
-            "Radius of the cursor to the Recycle Bin.")
+            "Radius of the cursor to the Recycle Bin.", checkable=True)
 
-        self.tool_select_action = QtGui.QAction("Select", self)
-        self.tool_select_action.setCheckable(True)
-        self.tool_select_action.setToolTip(
+        self.tool_select_action = make_action(
+            self, "Select",
             "Draw a shape in a tomogram view to select every particle "
             "inside it (replacing the current selection), instead of "
             "picking/moving particles. Use Confirm/Recycle Selected or "
-            "Move Selected to act on the result.")
+            "Move Selected to act on the result.", checkable=True)
 
         self.tool_group = QtGui.QActionGroup(self)
         self.tool_group.setExclusive(True)
@@ -485,11 +470,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # a visible Edit-menu entry (with the shortcut shown alongside it
         # for free) and a toolbar button, in addition to still responding
         # to the keyboard shortcut -- one object serves all three.
-        self.undo_action = QtGui.QAction("Undo", self)
-        self.undo_action.setShortcut(QtGui.QKeySequence.Undo)
-        self.undo_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.undo_action.setToolTip("Undo (Ctrl+Z)")
-        self.undo_action.triggered.connect(self.undo)
+        self.undo_action = make_action(self, "Undo", "Undo (Ctrl+Z)", self.undo,
+                                       shortcut=QtGui.QKeySequence.Undo)
 
         # QKeySequence.Redo resolves to whatever the desktop theme defines
         # as "the" redo key -- on Linux (GNOME/KDE) that's normally
@@ -503,47 +485,38 @@ class TomoBoxer(QtWidgets.QMainWindow):
         ctrl_y = QtGui.QKeySequence("Ctrl+Y")
         if ctrl_y not in redo_keys:
             redo_keys.append(ctrl_y)
-        self.redo_action = QtGui.QAction("Redo", self)
-        self.redo_action.setShortcuts(redo_keys)
-        self.redo_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.redo_action.setToolTip("Redo (Ctrl+Y / Ctrl+Shift+Z)")
-        self.redo_action.triggered.connect(self.redo)
+        self.redo_action = make_action(self, "Redo", "Redo (Ctrl+Y / Ctrl+Shift+Z)", self.redo,
+                                       shortcut=redo_keys)
 
         self.medit.addAction(self.undo_action)
         self.medit.addAction(self.redo_action)
 
         self.medit.addSeparator()
-        self.refresh_action = QtGui.QAction("Refresh", self)
-        self.refresh_action.setShortcut(QtGui.QKeySequence(Qt.Key_F5))
-        self.refresh_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.refresh_action.setToolTip(
+        self.refresh_action = make_action(
+            self, "Refresh",
             "Force everything to fully re-derive and redraw -- regenerates every "
             "gallery thumbnail from the volume and fully re-slices the tomogram "
-            "views, in case rendering ever visibly gets stuck. (F5)")
-        self.refresh_action.triggered.connect(self.refresh_all)
+            "views, in case rendering ever visibly gets stuck. (F5)",
+            self.refresh_all, shortcut=QtGui.QKeySequence(Qt.Key_F5))
         self.medit.addAction(self.refresh_action)
 
-        self.confirm_selected_action = QtGui.QAction("Confirm Selected", self)
-        self.confirm_selected_action.setToolTip(
-            "Send every currently selected particle to Confirmed. (Insert key)")
         # Same idea as Recycle Selected's Delete key below: application-wide,
         # and naturally inert (via Qt's own disabled-action-shortcut
         # behavior) whenever nothing is selected.
-        self.confirm_selected_action.setShortcut(QtGui.QKeySequence(Qt.Key_Insert))
-        self.confirm_selected_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.confirm_selected_action.triggered.connect(lambda: self.confirm_particles_by_uid(self._selected_uids))
+        self.confirm_selected_action = make_action(
+            self, "Confirm Selected", "Send every currently selected particle to Confirmed. (Insert key)",
+            lambda: self.confirm_particles_by_uid(self._selected_uids),
+            shortcut=QtGui.QKeySequence(Qt.Key_Insert))
 
-        self.recycle_selected_action = QtGui.QAction("Recycle Selected", self)
-        self.recycle_selected_action.setToolTip(
-            "Send every currently selected particle to the Recycle Bin. (Delete key)")
-        self.recycle_selected_action.setShortcut(QtGui.QKeySequence(Qt.Key_Delete))
         # Application-wide, like Undo/Redo/the number keys, so the Delete
         # key reaches this from anywhere rather than only while some
         # specific widget happens to have focus. A disabled QAction's
         # shortcut is inert in Qt, so this is naturally a no-op whenever
         # nothing is selected -- no separate guard needed here.
-        self.recycle_selected_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.recycle_selected_action.triggered.connect(lambda: self.delete_particles_by_uid(self._selected_uids))
+        self.recycle_selected_action = make_action(
+            self, "Recycle Selected", "Send every currently selected particle to the Recycle Bin. (Delete key)",
+            lambda: self.delete_particles_by_uid(self._selected_uids),
+            shortcut=QtGui.QKeySequence(Qt.Key_Delete))
 
         # Editable so you can type a brand-new set name too, not just pick
         # an existing one (matches move_particles_by_uid, which creates the
@@ -558,19 +531,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # here at all, as opposed to just dead space next to the button.
         self.move_to_combo.lineEdit().setPlaceholderText("Type a set name…")
 
-        self.move_selected_action = QtGui.QAction("Move Selected To", self)
-        self.move_selected_action.setToolTip("Move every currently selected particle to the set named at right.")
-        self.move_selected_action.triggered.connect(self._move_selected_via_toolbar)
+        self.move_selected_action = make_action(
+            self, "Move Selected To", "Move every currently selected particle to the set named at right.",
+            self._move_selected_via_toolbar)
 
-        self.focus_selected_action = QtGui.QAction("Show Only Selected", self)
-        self.focus_selected_action.setCheckable(True)
-        self.focus_selected_action.setToolTip(
+        self.focus_selected_action = make_action(
+            self, "Show Only Selected",
             "While on, a particle only shows in the tomogram views if it's both "
             "currently selected AND still in whatever set it was in when it "
             "joined the selection -- moving it to another set (Space/Shift+click, "
             "drag, ...) hides it right away without deselecting it, even though "
-            "its new set is itself visible. Updates live as the selection changes.")
-        self.focus_selected_action.toggled.connect(self._toggle_focus_selected)
+            "its new set is itself visible. Updates live as the selection changes.",
+            checkable=True, toggled=self._toggle_focus_selected)
 
         self.medit.addSeparator()
         self.medit.addAction(self.confirm_selected_action)
@@ -583,12 +555,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # toolbar, not here -- see ParticleListPanel.__init__. A QAction
         # isn't tied to whichever toolbar displays it, so this is the exact
         # same object clicking that button triggers.
-        self.toggle_colors_action = QtGui.QAction("Toggle Colors", self)
-        self.toggle_colors_action.setToolTip(
+        self.toggle_colors_action = make_action(
+            self, "Toggle Colors",
             "Rotate every normal set to the next color at once. Recycle "
             "Bin (red), Confirmed (green), and the yellow selection "
-            "highlight never change.")
-        self.toggle_colors_action.triggered.connect(self.toggle_colors)
+            "highlight never change.", self.toggle_colors)
 
         self.edit_toolbar = self.addToolBar("Edit")
         self.edit_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -632,37 +603,33 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # (TomoBoxer owns sets_visible and the solo logic), but -- like
         # Toggle Colors above -- the buttons for them live in the particle
         # list's own toolbar, not here; see ParticleListPanel.__init__.
-        self.view_only_selected_action = QtGui.QAction("Show Active Set Only", self)
-        self.view_only_selected_action.setCheckable(True)
-        self.view_only_selected_action.setToolTip(
+        self.view_only_selected_action = make_action(
+            self, "Show Active Set Only",
             "While on, only the active tab's set is shown in the tomogram "
             "views -- switching tabs (including via number keys) updates "
             "this live. Turning it off restores whatever visibility you "
-            "had before.")
-        self.view_only_selected_action.toggled.connect(self.toggle_view_only_selected)
+            "had before.", checkable=True, toggled=self.toggle_view_only_selected)
         self._solo_saved_visible = None  # sets_visible snapshot from before solo turned on
 
-        self.show_all_sets_action = QtGui.QAction("Show All Sets", self)
-        self.show_all_sets_action.setToolTip("Make every set visible in the tomogram views.")
-        self.show_all_sets_action.triggered.connect(self.show_all_sets)
+        self.show_all_sets_action = make_action(
+            self, "Show All Sets", "Make every set visible in the tomogram views.", self.show_all_sets)
 
         # Disabled until a companion volume is actually loaded (see
         # load_companion_volume_dialog/_load_companion_volume below).
-        self.toggle_companion_action = QtGui.QAction("Show Companion Volume", self)
-        self.toggle_companion_action.setCheckable(True)
-        self.toggle_companion_action.setEnabled(False)
-        self.toggle_companion_action.setToolTip(
+        self.toggle_companion_action = make_action(
+            self, "Show Companion Volume",
             "Switch the tomogram views and gallery thumbnails between the primary "
             "volume and its loaded companion (e.g. denoised). Contrast and Avg "
-            "Slices are kept separate per volume; picks/sets are shared.")
-        self.toggle_companion_action.toggled.connect(self._on_toggle_companion)
+            "Slices are kept separate per volume; picks/sets are shared.",
+            checkable=True, toggled=self._on_toggle_companion)
+        self.toggle_companion_action.setEnabled(False)
 
         self.mview.addAction(self.toggle_companion_action)
-        self.umap_action = QtGui.QAction("UMAP Map...", self)
-        self.umap_action.setToolTip(
+        self.umap_action = make_action(
+            self, "UMAP Map...",
             "Open the UMAP map of this tomogram's particles, coloured by set, and "
-            "lasso-select particles on it into the \"UMAP Selection\" tab.")
-        self.umap_action.triggered.connect(self.open_umap_window)
+            "lasso-select particles on it into the \"UMAP Selection\" tab.",
+            self.open_umap_window)
         self.mview.addAction(self.umap_action)
         self.mview.addSeparator()
         self.mview.addAction(self.toggle_colors_action)
@@ -2672,17 +2639,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.zyview.scroll_to(z, y, True)
 
     # -- mouse click -----------------------------------------------------------
-    def xy_down(self, event):
-        x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, x, y, self.z_loc, "z")
+    def _view_point(self, axis, event):
+        """The volume coordinate under the mouse in the view that looks along
+        `axis`: its two in-plane coordinates from the mouse, the third from
+        the slice currently shown."""
+        a1, a2 = _VIEW_PLANE_AXES[axis]
+        p1, p2 = self._views[axis].scr_to_img((event.position().x(), event.position().y()))
+        at = {"x": self.x_loc, "y": self.y_loc, "z": self.z_loc}
+        at[a1], at[a2] = p1, p2
+        return at["x"], at["y"], at["z"]
 
-    def xz_down(self, event):
-        x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, x, self.y_loc, z, "y")
-
-    def zy_down(self, event):
-        z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, self.x_loc, y, z, "x")
+    def _view_down(self, axis, event):
+        self.mouse_down(event, *self._view_point(axis, event), axis)
 
     def mouse_down(self, event, x, y, z, axis):
         if self.tool_select_action.isChecked():
@@ -2764,15 +2732,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 self.dragging = len(self.boxes) - 1
 
     # -- eraser preview -----------------------------------------------------------
-    def xy_move(self, event):
-        self.mouse_move(event, self.xyview)
-
-    def xz_move(self, event):
-        self.mouse_move(event, self.xzview)
-
-    def zy_move(self, event):
-        self.mouse_move(event, self.zyview)
-
     def mouse_move(self, event, view):
         if self.tool_eraser_action.isChecked():
             self.xyview.eraser_shape = self.xzview.eraser_shape = self.zyview.eraser_shape = None
@@ -2798,29 +2757,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         axis = tuple(a for a in ("x", "y", "z") if a != skip_axis)
         self.update_box(self.dragging, True, axis=axis)
 
-    def xy_drag(self, event):
+    def _view_drag(self, axis, event):
         if self.dragging >= 0:
-            x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, y, self.z_loc, skip_axis="z")
+            self.mouse_drag(*self._view_point(axis, event), skip_axis=axis)
         elif self._select_drawing is not None:
-            x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.xyview, "z", x, y, self.z_loc)
-
-    def xz_drag(self, event):
-        if self.dragging >= 0:
-            x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, self.y_loc, z, skip_axis="y")
-        elif self._select_drawing is not None:
-            x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.xzview, "y", x, self.y_loc, z)
-
-    def zy_drag(self, event):
-        if self.dragging >= 0:
-            z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(self.x_loc, y, z, skip_axis="x")
-        elif self._select_drawing is not None:
-            z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.zyview, "x", self.x_loc, y, z)
+            self._select_mouse_drag(self._views[axis], axis, *self._view_point(axis, event))
 
     def mouse_up(self, event):
         if self.dragging >= 0:
@@ -2829,15 +2770,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
             return
         if self._select_drawing is not None:
             self._select_mouse_up()
-
-    def xy_doubleclick(self, event):
-        self._select_doubleclick(self.xyview)
-
-    def xz_doubleclick(self, event):
-        self._select_doubleclick(self.xzview)
-
-    def zy_doubleclick(self, event):
-        self._select_doubleclick(self.zyview)
 
     def _select_doubleclick(self, view):
         drawing = self._select_drawing

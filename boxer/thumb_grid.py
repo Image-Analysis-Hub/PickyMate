@@ -38,7 +38,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import categories
 from .ranking_panel import RankingPanel
-from .widgets import TOOLBAR_BUTTON_STYLE, mark_destructive, space_key_state
+from .widgets import TOOLBAR_BUTTON_STYLE, make_action, mark_destructive, space_key_state
 
 THUMB_SIZE = 96
 MIN_THUMB = 24
@@ -916,13 +916,10 @@ class ParticleListPanel(QtWidgets.QWidget):
         # Menu-only equivalents of the "+" tab and double-clicking a tab
         # (TomoBoxer's Set menu) -- both gestures already exist and work
         # fine, these just make them reachable without knowing that.
-        self.new_set_action = QtGui.QAction("New Set...", self)
-        self.new_set_action.setToolTip("Create a new set.")
-        self.new_set_action.triggered.connect(self._prompt_new_set)
+        self.new_set_action = make_action(self, "New Set...", "Create a new set.", self._prompt_new_set)
 
-        self.rename_set_action = QtGui.QAction("Rename Set...", self)
-        self.rename_set_action.setToolTip("Rename the current tab's set.")
-        self.rename_set_action.triggered.connect(self._prompt_rename_current_set)
+        self.rename_set_action = make_action(self, "Rename Set...", "Rename the current tab's set.",
+                                             self._prompt_rename_current_set)
 
         # The Rank panel operates on "whatever tab is currently on screen,"
         # same as every action in the toolbar just below it -- keeping them
@@ -1021,15 +1018,15 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.gallery_toolbar = QtWidgets.QToolBar()
         self.gallery_toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
 
-        self.organize_action = QtGui.QAction("Organize Grid", self)
-        self.organize_action.setToolTip("Compact the grid, removing gaps left by deleted particles.")
-        self.organize_action.triggered.connect(lambda: self._active_grid().reorganize())
+        self.organize_action = make_action(
+            self, "Organize Grid", "Compact the grid, removing gaps left by deleted particles.",
+            lambda: self._active_grid().reorganize())
         self.gallery_toolbar.addAction(self.organize_action)
 
-        self.detach_action = QtGui.QAction("Detach Tab", self)
-        self.detach_action.setToolTip("Pop the current tab's grid into its own floating window.")
+        self.detach_action = make_action(
+            self, "Detach Tab", "Pop the current tab's grid into its own floating window.",
+            self._detach_current_tab)
         self.detach_action.setEnabled(False)  # starts on "All", which can't be detached
-        self.detach_action.triggered.connect(self._detach_current_tab)
         self.gallery_toolbar.addAction(self.detach_action)
 
         self.gallery_toolbar.addSeparator()
@@ -1041,39 +1038,37 @@ class ParticleListPanel(QtWidgets.QWidget):
         # undoing whatever "By Rank" last did (including its dimming); "By
         # Rank" reads whatever was last computed via the "Rank by Embedding
         # Distance" button above, it doesn't compute anything itself.
-        self.sort_by_id_action = QtGui.QAction("Sort by Original ID", self)
-        self.sort_by_id_action.setToolTip(
-            "One-time re-layout of this set's particles by their original ID.")
+        self.sort_by_id_action = make_action(
+            self, "Sort by Original ID", "One-time re-layout of this set's particles by their original ID.",
+            self._sort_current_by_id)
         self.sort_by_id_action.setEnabled(False)  # starts on "All", not a real set
-        self.sort_by_id_action.triggered.connect(self._sort_current_by_id)
         self.gallery_toolbar.addAction(self.sort_by_id_action)
 
-        self.sort_by_rank_action = QtGui.QAction("Sort by Rank", self)
-        self.sort_by_rank_action.setToolTip(
+        self.sort_by_rank_action = make_action(
+            self, "Sort by Rank",
             "One-time re-layout of this set's particles by their rank -- the "
             "distance last computed by \"Rank by Embedding Distance\" above "
             "(closest first; particles never ranked come first of all). "
-            "Doesn't compute anything itself, only re-displays the last result.")
+            "Doesn't compute anything itself, only re-displays the last result.",
+            self._sort_current_by_score)
         self.sort_by_rank_action.setEnabled(False)  # starts on "All", not a real set
-        self.sort_by_rank_action.triggered.connect(self._sort_current_by_score)
         self.gallery_toolbar.addAction(self.sort_by_rank_action)
 
         self.gallery_toolbar.addSeparator()
 
-        self.delete_set_action = QtGui.QAction("Delete Set", self)
-        self.delete_set_action.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
+        self.delete_set_action = make_action(
+            self, "Delete Set", "Delete this set, sending every particle in it to the Recycle Bin.",
+            self._delete_current_set)
         self.delete_set_action.setEnabled(False)
-        self.delete_set_action.triggered.connect(self._delete_current_set)
         self.gallery_toolbar.addAction(self.delete_set_action)
         mark_destructive(self.gallery_toolbar.widgetForAction(self.delete_set_action))
 
-        self.empty_recycle_action = QtGui.QAction("Empty Recycle Bin", self)
-        self.empty_recycle_action.setToolTip(
+        self.empty_recycle_action = make_action(
+            self, "Empty Recycle Bin",
             "Clear everything currently in the Recycle Bin -- archived to a "
             "hidden backup file first (not loaded again), and still undoable "
-            "with Ctrl+Z right after.")
+            "with Ctrl+Z right after.", self._empty_recycle_bin)
         self.empty_recycle_action.setVisible(False)  # only shown while viewing the Recycle Bin tab
-        self.empty_recycle_action.triggered.connect(self._empty_recycle_bin)
         self.gallery_toolbar.addAction(self.empty_recycle_action)
         mark_destructive(self.gallery_toolbar.widgetForAction(self.empty_recycle_action))
 

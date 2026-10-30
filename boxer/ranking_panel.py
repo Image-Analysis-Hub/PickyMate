@@ -11,6 +11,7 @@ import weakref
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import categories
+from .widgets import make_action
 
 _LEAVE_ONE_OUT_HELP = (
     "Leave-one-out excludes each particle's own contribution from the reference "
@@ -162,9 +163,8 @@ class RankingPanel(QtWidgets.QWidget):
         # update_state -- there is deliberately no
         # separate toolbar button for it, since the big green one already
         # serves that role.
-        self.rank_action = QtGui.QAction("Rank by Embedding Distance", self)
-        self.rank_action.setToolTip(self.compute_distance_button.toolTip())
-        self.rank_action.triggered.connect(self._run_compute_distance)
+        self.rank_action = make_action(self, "Rank by Embedding Distance",
+                                       self.compute_distance_button.toolTip(), self._run_compute_distance)
 
         self.setEnabled(False)  # no embeddings loaded yet
         # The particle list adds this panel to its layout right below the
