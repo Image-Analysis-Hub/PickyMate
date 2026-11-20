@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 
 from . import categories
 from .session_browser import OtherTomogramsWindow
-from .session_map import MAPPABLE
+from .session_map import MAPPABLE, PCA_DIMS
 
 BACKGROUND = (30, 30, 30)
 HALO = (255, 255, 0)        # the app's selection colour (categories.SELECTED_COLOR)
@@ -361,6 +361,17 @@ class UmapWindow(QtWidgets.QWidget):
             "land in the same places.")
         self.colour_combo.currentIndexChanged.connect(lambda _i: self.refresh())
         row.addWidget(self.colour_combo)
+        row.addWidget(QtWidgets.QLabel("PCA dims:"))
+        self.pca_spin = QtWidgets.QSpinBox()
+        self.pca_spin.setRange(0, 4096)
+        self.pca_spin.setSpecialValueText("off")
+        self.pca_spin.setValue(PCA_DIMS)
+        self.pca_spin.setToolTip(
+            "Before the UMAP, embeddings with more dimensions than this are reduced to it by "
+            "PCA (CryoSIAM's 1024; TomoTwin's 32 are below the default and stay as they are). "
+            "Fewer is faster; the status line reports how much variance was kept. 0 = no PCA. "
+            "Takes effect on the next Compute / Recompute.")
+        row.addWidget(self.pca_spin)
         self.compute_button = QtWidgets.QPushButton("Compute")
         self.compute_button.setToolTip("Fit one UMAP on the full embeddings of every tomogram in "
                                        "the session. Runs in the background.")
@@ -615,7 +626,7 @@ class UmapWindow(QtWidgets.QWidget):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
         self.cancel_button.setVisible(True)
-        ctl.session_map_job.start(space)
+        ctl.session_map_job.start(space, self.pca_spin.value())
 
     def _cancel(self):
         ctl = self._controller() if self._controller else None
