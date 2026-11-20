@@ -23,6 +23,7 @@ from PySide6.QtCore import Qt
 from . import categories, metadata
 from .session import CAT_CONFIRMED, CAT_RECYCLE
 from .thumb_grid import ParticleGrid
+from .volume import Volume
 
 MAX_THUMBNAILS = 3000   # per tomogram; beyond this the tab says how many it left out
 _CATEGORY_CLASS = {CAT_CONFIRMED: categories.CONFIRMED_ID, CAT_RECYCLE: categories.RECYCLE_BIN_ID}
@@ -113,7 +114,6 @@ def thumbnails(session, name, uids, nlayers):
     tomogram that is not open, cut from its file through a memory map at
     that tomogram's own box sizes, averaged over the same number of slices
     as the open tomogram's thumbnails. Returns (entries, skipped)."""
-    from .volume import Volume
     e = session.entry(name)
     table = session.particle_table(name)
     settings = metadata.load_class_settings(e.working_dir)

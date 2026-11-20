@@ -32,6 +32,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from . import categories
+from .session_browser import OtherTomogramsWindow
+from .session_map import MAPPABLE, PCA_DIMS
 
 BACKGROUND = (30, 30, 30)
 HALO = (255, 255, 0)        # the app's selection colour (categories.SELECTED_COLOR)
@@ -359,6 +361,17 @@ class UmapWindow(QtWidgets.QWidget):
             "land in the same places.")
         self.colour_combo.currentIndexChanged.connect(lambda _i: self.refresh())
         row.addWidget(self.colour_combo)
+        row.addWidget(QtWidgets.QLabel("PCA dims:"))
+        self.pca_spin = QtWidgets.QSpinBox()
+        self.pca_spin.setRange(0, 4096)
+        self.pca_spin.setSpecialValueText("off")
+        self.pca_spin.setValue(PCA_DIMS)
+        self.pca_spin.setToolTip(
+            "Before the UMAP, embeddings with more dimensions than this are reduced to it by "
+            "PCA (CryoSIAM's 1024; TomoTwin's 32 are below the default and stay as they are). "
+            "Fewer is faster; the status line reports how much variance was kept. 0 = no PCA. "
+            "Takes effect on the next Compute / Recompute.")
+        row.addWidget(self.pca_spin)
         self.compute_button = QtWidgets.QPushButton("Compute")
         self.compute_button.setToolTip("Fit one UMAP on the full embeddings of every tomogram in "
                                        "the session. Runs in the background.")
@@ -425,7 +438,6 @@ class UmapWindow(QtWidgets.QWidget):
                    and target.embedding_spaces[n]["array"].shape[1] == 2]
         ctl = self._controller() if self._controller else None
         if ctl is not None:
-            from .session_map import MAPPABLE
             n = len(ctl.session.names)
             for space, label in MAPPABLE.items():
                 if space in target.embedding_spaces:
@@ -484,12 +496,12 @@ class UmapWindow(QtWidgets.QWidget):
         rows, uids, classes = [], [], []
         missing = 0
         for b in target.boxes:
-            if b[7] is None or not (0 <= b[7] < len(array)):
+            if b.embedding_row is None or not (0 <= b.embedding_row < len(array)):
                 missing += 1
                 continue
-            rows.append(b[7])
-            uids.append(b[6])
-            classes.append(b[5])
+            rows.append(b.embedding_row)
+            uids.append(b.uid)
+            classes.append(b.classid)
         self._uids = np.asarray(uids, dtype=np.int64)
         classes = np.asarray(classes, dtype=np.int64)
         selection = target.umap_selection
@@ -541,11 +553,11 @@ class UmapWindow(QtWidgets.QWidget):
         for t, (name, n) in enumerate(m.layout):
             coords = m.coords_for(name)
             if name == here:
-                emb = [b for b in target.boxes if b[7] is not None]
-                rows = np.asarray([b[7] for b in emb], dtype=np.int64)
-                u = np.asarray([b[6] for b in emb], dtype=np.int64)
-                c = np.asarray([2 if b[5] == categories.CONFIRMED_ID else
-                                1 if b[5] == categories.RECYCLE_BIN_ID else 0 for b in emb],
+                emb = [b for b in target.boxes if b.embedding_row is not None]
+                rows = np.asarray([b.embedding_row for b in emb], dtype=np.int64)
+                u = np.asarray([b.uid for b in emb], dtype=np.int64)
+                c = np.asarray([2 if b.classid == categories.CONFIRMED_ID else
+                                1 if b.classid == categories.RECYCLE_BIN_ID else 0 for b in emb],
                                dtype=np.int8)
                 chosen = target.umap_selection
             else:
@@ -614,7 +626,7 @@ class UmapWindow(QtWidgets.QWidget):
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(True)
         self.cancel_button.setVisible(True)
-        ctl.session_map_job.start(space)
+        ctl.session_map_job.start(space, self.pca_spin.value())
 
     def _cancel(self):
         ctl = self._controller() if self._controller else None
@@ -669,7 +681,6 @@ class UmapWindow(QtWidgets.QWidget):
             target.clear_umap_selection()
 
     def open_browser(self):
-        from .session_browser import OtherTomogramsWindow
         target = self._target()
         if target is None or self._controller is None:
             return

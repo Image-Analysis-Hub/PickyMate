@@ -83,6 +83,14 @@ dataset. Press **Compute** the first time: it runs in the background with
 progress and a Cancel button (about a minute for ~100k picks with TomoTwin),
 and the result is cached next to the manifest until the embeddings change.
 
+Embeddings with many dimensions are first reduced by PCA, which makes the
+UMAP much faster. **PCA dims** (default 50) sets how many components are
+kept: CryoSIAM's 1024 dimensions are reduced to that number, TomoTwin's 32
+are already below it and are used as they are. Set it to **0 (off)** to run
+the UMAP on the full embeddings. The line under the controls reports what a
+computed map used and the share of variance the PCA kept; press
+**Recompute** after changing the value.
+
 - Color by **set** or by **tomogram** (well-mixed tomogram colors mean the
   tomograms share one embedding space).
 - A lasso selects in *every* tomogram: the open one's particles land in its

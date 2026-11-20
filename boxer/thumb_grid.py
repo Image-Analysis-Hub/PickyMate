@@ -37,25 +37,8 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import categories
-from .widgets import TOOLBAR_BUTTON_STYLE, mark_destructive, space_key_state
-
-_LEAVE_ONE_OUT_HELP = (
-    "Leave-one-out excludes each particle's own contribution from the reference "
-    "distribution before scoring it against the rest of the set -- more correct "
-    "for finding outliers (a particle can't be an outlier relative to a "
-    "distribution that includes itself), but it means recomputing the whole "
-    "distribution once per particle instead of once for the whole set.\n\n"
-    "Real measured cost (independent of embedding dimensionality):\n"
-    "    50 particles      ~10 seconds\n"
-    "    200 particles     ~45 seconds\n"
-    "    1,000 particles   ~4-5 minutes\n"
-    "    3,000 particles   ~15 minutes\n\n"
-    "Only available when the reference and target set are the same (reviewing a "
-    "set against itself) -- comparing one set against a different one always "
-    "uses the whole reference distribution, since a particle that isn't a "
-    "member of the reference set was never part of the distribution it's being "
-    "compared to in the first place."
-)
+from .ranking_panel import RankingPanel
+from .widgets import TOOLBAR_BUTTON_STYLE, make_action, mark_destructive, space_key_state
 
 THUMB_SIZE = 96
 MIN_THUMB = 24
@@ -926,6 +909,32 @@ class ParticleListPanel(QtWidgets.QWidget):
         # cascade from that one.
         self.setStyleSheet(self.styleSheet() + TOOLBAR_BUTTON_STYLE)
 
+        self._build_view_toolbar(target, layout)
+        self.ranking = RankingPanel(target, self._active_classid, self)
+        self._build_tabs(layout)
+
+        # Menu-only equivalents of the "+" tab and double-clicking a tab
+        # (TomoBoxer's Set menu) -- both gestures already exist and work
+        # fine, these just make them reachable without knowing that.
+        self.new_set_action = make_action(self, "New Set...", "Create a new set.", self._prompt_new_set)
+
+        self.rename_set_action = make_action(self, "Rename Set...", "Rename the current tab's set.",
+                                             self._prompt_rename_current_set)
+
+        # The Rank panel operates on "whatever tab is currently on screen,"
+        # same as every action in the toolbar just below it -- keeping them
+        # adjacent (rather than the Rank panel sitting above the tabs
+        # entirely, as it used to) makes that relationship visible instead
+        # of implied.
+        layout.addWidget(self.ranking)
+
+        self._build_gallery_toolbar(layout)
+
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
+
+    def _build_view_toolbar(self, target, layout):
+        """Buttons for the view actions TomoBoxer owns."""
         # Toggle Colors / Show Active Set Only / Show All Sets: the
         # QActions themselves live on TomoBoxer (it owns sets_visible and
         # the color rotation), but the buttons for them live here instead
@@ -944,142 +953,8 @@ class ParticleListPanel(QtWidgets.QWidget):
                 self.view_toolbar.addAction(target.umap_action)
             layout.addWidget(self.view_toolbar)
 
-        # Deliberately the loudest thing in this window: computing/sorting
-        # by Mahalanobis distance used to live as a File menu item (then a
-        # popup dialog triggered from a button), which made it easy to miss
-        # or fiddly to reach. Now it's its own group, inline, right here --
-        # the reference set/embedding space/leave-one-out controls plus the
-        # big green "go" button all live together with nothing modal in
-        # between, so the whole feature reads and edits in place.
-        self.compute_distance_group = QtWidgets.QWidget()
-        group_layout = QtWidgets.QVBoxLayout(self.compute_distance_group)
-        group_layout.setContentsMargins(0, 0, 0, 0)
-        group_layout.setSpacing(3)
-
-        # One row for everything: which set gets ranked (the current tab,
-        # kept live-updated by _update_compute_distance_state as you switch
-        # tabs, rather than leaving it implicit), what it's ranked close to,
-        # optionally what it's ranked far from (the "double distance"/
-        # contrastive score -- see TomoBoxer.compute_mahalanobis), which
-        # embedding space, and leave-one-out -- all one coherent
-        # sentence-like control instead of splitting it across rows.
-        controls_row = QtWidgets.QHBoxLayout()
-        controls_row.addWidget(QtWidgets.QLabel("Rank:"))
-        self.compute_distance_target_label = QtWidgets.QLabel()
-        self.compute_distance_target_label.setStyleSheet("font-weight: bold;")
-        controls_row.addWidget(self.compute_distance_target_label)
-        controls_row.addWidget(QtWidgets.QLabel("close to"))
-        self.compute_distance_reference_combo = QtWidgets.QComboBox()
-        self.compute_distance_reference_combo.setToolTip(
-            "The set whose embedding distribution the current tab's particles "
-            "are compared to (e.g. Confirmed) -- can be the current tab itself, "
-            "to spot outliers within it.")
-        self.compute_distance_reference_combo.currentIndexChanged.connect(
-            self._update_compute_distance_state)
-        controls_row.addWidget(self.compute_distance_reference_combo)
-        controls_row.addWidget(QtWidgets.QLabel("far from"))
-        self.compute_distance_negative_combo = QtWidgets.QComboBox()
-        self.compute_distance_negative_combo.addItem("(none)", None)
-        self.compute_distance_negative_combo.setToolTip(
-            "Optional: also rank away from this set's own embedding distribution "
-            "(e.g. Recycle Bin) -- the rank becomes distance-to-\"close to\" minus "
-            "distance-to-\"far from\", so particles near the first and away from "
-            "the second sort first. Leave at \"(none)\" for a plain single-distance "
-            "rank, same as before.")
-        self.compute_distance_negative_combo.currentIndexChanged.connect(
-            self._update_compute_distance_state)
-        controls_row.addWidget(self.compute_distance_negative_combo)
-        # Populated from whatever embedding spaces are actually attached
-        # (see _refresh_compute_distance_controls) rather than hardcoded --
-        # several methods can be attached at once and each contributes its
-        # full embedding and its UMAP as separately rankable spaces.
-        self.compute_distance_space_combo = QtWidgets.QComboBox()
-        self.compute_distance_space_combo.setToolTip(
-            "Which embedding to measure distances in. Every attached method "
-            "contributes its full embedding and, when one was given, its UMAP.")
-        controls_row.addWidget(self.compute_distance_space_combo)
-        self.compute_distance_loo_check = QtWidgets.QCheckBox("Leave-One-Out")
-        controls_row.addWidget(self.compute_distance_loo_check)
-        loo_help_button = QtWidgets.QToolButton()
-        loo_help_button.setText("?")
-        loo_help_button.setToolTip("What does leave-one-out mean, and how slow is it?")
-        loo_help_button.clicked.connect(self._show_leave_one_out_help)
-        controls_row.addWidget(loo_help_button)
-        controls_row.addStretch(1)
-        group_layout.addLayout(controls_row)
-
-        # Multi-tomogram sessions only: which tomograms' particles make up
-        # the "close to" / "far from" references. The same set name is
-        # looked up in each -- Confirmed pools every chosen tomogram's
-        # Confirmed, Recycle Bin every Recycle Bin. "This tomogram" is the
-        # default, and is exactly what ranking did before sessions existed.
-        self.compute_distance_scope_row = QtWidgets.QWidget()
-        scope_layout = QtWidgets.QHBoxLayout(self.compute_distance_scope_row)
-        scope_layout.setContentsMargins(0, 0, 0, 0)
-        scope_layout.addWidget(QtWidgets.QLabel("References from:"))
-        self.compute_distance_scope_combo = QtWidgets.QComboBox()
-        self.compute_distance_scope_combo.addItem("this tomogram", "this")
-        self.compute_distance_scope_combo.addItem("all tomograms in the session", "all")
-        self.compute_distance_scope_combo.addItem("chosen tomograms...", "choose")
-        self.compute_distance_scope_combo.setToolTip(
-            "Which tomograms' particles form the \"close to\" and \"far from\" references. "
-            "Each chosen tomogram contributes its own set of the same name, read from its "
-            "working directory, pooled with this tomogram's.")
-        self.compute_distance_scope_combo.activated.connect(self._on_scope_activated)
-        scope_layout.addWidget(self.compute_distance_scope_combo)
-        scope_layout.addStretch(1)
-        group_layout.addWidget(self.compute_distance_scope_row)
-        in_session = target is not None and getattr(target, "session", None) is not None
-        self.compute_distance_scope_row.setVisible(in_session)
-        if in_session:
-            self._restore_scope(target.session_controller)
-
-        self.compute_distance_button = QtWidgets.QPushButton("▶  Rank by Embedding Distance")
-        # Saved so _update_compute_distance_state can restore it after
-        # temporarily swapping in a "why is this disabled" tooltip (for a
-        # same-set conflict) -- see there.
-        self._compute_distance_button_tip = (
-            "Ranks the current tab's particles by their Mahalanobis distance to "
-            "the \"close to\" set's embedding distribution, then lays them out "
-            "closest-first. Set a \"far from\" set too for a contrastive rank: "
-            "distance-to-\"close to\" minus distance-to-\"far from\", favoring "
-            "particles near the first and away from the second. \"Sort by Rank\" "
-            "(below) re-displays this same result later without recomputing it.")
-        self.compute_distance_button.setToolTip(self._compute_distance_button_tip)
-        self.compute_distance_button.setCursor(QtCore.Qt.PointingHandCursor)
-        self.compute_distance_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2e7d32;
-                color: white;
-                font-weight: bold;
-                font-size: 13px;
-                padding: 8px 14px;
-                border: none;
-                border-radius: 6px;
-            }
-            QPushButton:hover { background-color: #388e3c; }
-            QPushButton:pressed { background-color: #1b5e20; }
-            QPushButton:disabled { background-color: #9e9e9e; }
-        """)
-        self.compute_distance_button.clicked.connect(self._run_compute_distance)
-        group_layout.addWidget(self.compute_distance_button)
-
-        # Menu-only equivalent of the button above (TomoBoxer's Set menu),
-        # kept in sync with compute_distance_group's own enabled state by
-        # _update_compute_distance_state -- there is deliberately no
-        # separate toolbar button for it, since the big green one already
-        # serves that role.
-        self.rank_action = QtGui.QAction("Rank by Embedding Distance", self)
-        self.rank_action.setToolTip(self.compute_distance_button.toolTip())
-        self.rank_action.triggered.connect(self._run_compute_distance)
-
-        self.compute_distance_group.setEnabled(False)  # no embeddings loaded yet
-        # Added to the layout further down, right below the tab grid --
-        # see the trailing layout.addWidget(self.compute_distance_group)
-        # call -- so it sits next to Sort by Original ID/Sort by Rank
-        # rather than above the tabs entirely: all three act on "whatever
-        # tab you're currently looking at," so they read as one group.
-
+    def _build_tabs(self, layout):
+        """The tab widget with "All", the UMAP Selection grid and the "+" tab, and the per-tab state."""
         self.tabs = QtWidgets.QTabWidget()
         # setTabBar must happen before any tabs are added (Qt requirement).
         # setMovable(True) plus _ConstrainedTabBar is what lets normal sets
@@ -1130,24 +1005,8 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.tabs.setTabToolTip(self.tabs.indexOf(self._plus_placeholder), "Create a new set")
         self._last_tab_index = 0
 
-        # Menu-only equivalents of the "+" tab and double-clicking a tab
-        # (TomoBoxer's Set menu) -- both gestures already exist and work
-        # fine, these just make them reachable without knowing that.
-        self.new_set_action = QtGui.QAction("New Set...", self)
-        self.new_set_action.setToolTip("Create a new set.")
-        self.new_set_action.triggered.connect(self._prompt_new_set)
-
-        self.rename_set_action = QtGui.QAction("Rename Set...", self)
-        self.rename_set_action.setToolTip("Rename the current tab's set.")
-        self.rename_set_action.triggered.connect(self._prompt_rename_current_set)
-
-        # The Rank panel operates on "whatever tab is currently on screen,"
-        # same as every action in the toolbar just below it -- keeping them
-        # adjacent (rather than the Rank panel sitting above the tabs
-        # entirely, as it used to) makes that relationship visible instead
-        # of implied.
-        layout.addWidget(self.compute_distance_group)
-
+    def _build_gallery_toolbar(self, layout):
+        """The toolbar below the tabs: Organize, Detach, the two sorts, Delete Set and Empty Recycle Bin."""
         # A real QToolBar (not a bare row of QPushButtons) so these pick up
         # the exact same flat "chip" look as every other toolbar in the
         # app, rather than looking like a different, unstyled widget glued
@@ -1159,15 +1018,15 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.gallery_toolbar = QtWidgets.QToolBar()
         self.gallery_toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonTextOnly)
 
-        self.organize_action = QtGui.QAction("Organize Grid", self)
-        self.organize_action.setToolTip("Compact the grid, removing gaps left by deleted particles.")
-        self.organize_action.triggered.connect(lambda: self._active_grid().reorganize())
+        self.organize_action = make_action(
+            self, "Organize Grid", "Compact the grid, removing gaps left by deleted particles.",
+            lambda: self._active_grid().reorganize())
         self.gallery_toolbar.addAction(self.organize_action)
 
-        self.detach_action = QtGui.QAction("Detach Tab", self)
-        self.detach_action.setToolTip("Pop the current tab's grid into its own floating window.")
+        self.detach_action = make_action(
+            self, "Detach Tab", "Pop the current tab's grid into its own floating window.",
+            self._detach_current_tab)
         self.detach_action.setEnabled(False)  # starts on "All", which can't be detached
-        self.detach_action.triggered.connect(self._detach_current_tab)
         self.gallery_toolbar.addAction(self.detach_action)
 
         self.gallery_toolbar.addSeparator()
@@ -1179,39 +1038,37 @@ class ParticleListPanel(QtWidgets.QWidget):
         # undoing whatever "By Rank" last did (including its dimming); "By
         # Rank" reads whatever was last computed via the "Rank by Embedding
         # Distance" button above, it doesn't compute anything itself.
-        self.sort_by_id_action = QtGui.QAction("Sort by Original ID", self)
-        self.sort_by_id_action.setToolTip(
-            "One-time re-layout of this set's particles by their original ID.")
+        self.sort_by_id_action = make_action(
+            self, "Sort by Original ID", "One-time re-layout of this set's particles by their original ID.",
+            self._sort_current_by_id)
         self.sort_by_id_action.setEnabled(False)  # starts on "All", not a real set
-        self.sort_by_id_action.triggered.connect(self._sort_current_by_id)
         self.gallery_toolbar.addAction(self.sort_by_id_action)
 
-        self.sort_by_rank_action = QtGui.QAction("Sort by Rank", self)
-        self.sort_by_rank_action.setToolTip(
+        self.sort_by_rank_action = make_action(
+            self, "Sort by Rank",
             "One-time re-layout of this set's particles by their rank -- the "
             "distance last computed by \"Rank by Embedding Distance\" above "
             "(closest first; particles never ranked come first of all). "
-            "Doesn't compute anything itself, only re-displays the last result.")
+            "Doesn't compute anything itself, only re-displays the last result.",
+            self._sort_current_by_score)
         self.sort_by_rank_action.setEnabled(False)  # starts on "All", not a real set
-        self.sort_by_rank_action.triggered.connect(self._sort_current_by_score)
         self.gallery_toolbar.addAction(self.sort_by_rank_action)
 
         self.gallery_toolbar.addSeparator()
 
-        self.delete_set_action = QtGui.QAction("Delete Set", self)
-        self.delete_set_action.setToolTip("Delete this set, sending every particle in it to the Recycle Bin.")
+        self.delete_set_action = make_action(
+            self, "Delete Set", "Delete this set, sending every particle in it to the Recycle Bin.",
+            self._delete_current_set)
         self.delete_set_action.setEnabled(False)
-        self.delete_set_action.triggered.connect(self._delete_current_set)
         self.gallery_toolbar.addAction(self.delete_set_action)
         mark_destructive(self.gallery_toolbar.widgetForAction(self.delete_set_action))
 
-        self.empty_recycle_action = QtGui.QAction("Empty Recycle Bin", self)
-        self.empty_recycle_action.setToolTip(
+        self.empty_recycle_action = make_action(
+            self, "Empty Recycle Bin",
             "Clear everything currently in the Recycle Bin -- archived to a "
             "hidden backup file first (not loaded again), and still undoable "
-            "with Ctrl+Z right after.")
+            "with Ctrl+Z right after.", self._empty_recycle_bin)
         self.empty_recycle_action.setVisible(False)  # only shown while viewing the Recycle Bin tab
-        self.empty_recycle_action.triggered.connect(self._empty_recycle_bin)
         self.gallery_toolbar.addAction(self.empty_recycle_action)
         mark_destructive(self.gallery_toolbar.widgetForAction(self.empty_recycle_action))
 
@@ -1228,8 +1085,6 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.sort_by_id_button = self.gallery_toolbar.widgetForAction(self.sort_by_id_action)
         self.sort_by_score_button = self.gallery_toolbar.widgetForAction(self.sort_by_rank_action)
         self.empty_recycle_button = self.gallery_toolbar.widgetForAction(self.empty_recycle_action)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.tabs.tabBar().tabBarDoubleClicked.connect(self._on_tab_double_clicked)
 
     def _target_or_none(self):
         return self._target() if self._target is not None else None
@@ -1266,7 +1121,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         self.empty_recycle_action.setVisible(cid == categories.RECYCLE_BIN_ID)
         self.sort_by_id_action.setEnabled(cid is not None)
         self.sort_by_rank_action.setEnabled(cid is not None)
-        self._update_compute_distance_state()
+        self.ranking.update_state()
         if cid is not None and not is_fixed:
             self.class_activated.emit(cid)
         # Unlike class_activated (only normal/pickable classes), this
@@ -1372,120 +1227,6 @@ class ParticleListPanel(QtWidgets.QWidget):
             target.delete_set(f"{cid}::{name}")
             self.rebuild_tabs(target.sets)
 
-    def _refresh_compute_distance_controls(self):
-        """Keeps the reference-set combos in sync with whatever sets exist
-        (called from rebuild_tabs, so on every set add/rename/delete),
-        preserving the current selection where possible, and refreshes the
-        UMAP item's presence/availability. Actual enabled-state (whether
-        embeddings are loaded, and whether leave-one-out applies) is
-        _update_compute_distance_state's job, called at the end of this."""
-        target = self._target_or_none()
-        if target is None:
-            return
-        combo = self.compute_distance_reference_combo
-        previous = combo.currentData()
-        combo.blockSignals(True)
-        combo.clear()
-        for cid in categories.category_order(target.sets):
-            combo.addItem(target.sets[cid], cid)
-        idx = combo.findData(previous) if previous is not None else -1
-        if idx < 0:
-            idx = combo.findData(categories.CONFIRMED_ID)
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        combo.blockSignals(False)
-
-        # Same set list as the reference combo, plus a leading "(none)"
-        # (data=None) that keeps the plain, single-distance rank -- the
-        # default, and the only option before this control existed.
-        negative_combo = self.compute_distance_negative_combo
-        previous_negative = negative_combo.currentData()
-        negative_combo.blockSignals(True)
-        negative_combo.clear()
-        negative_combo.addItem("(none)", None)
-        for cid in categories.category_order(target.sets):
-            negative_combo.addItem(target.sets[cid], cid)
-        idx = negative_combo.findData(previous_negative) if previous_negative is not None else 0
-        negative_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        negative_combo.blockSignals(False)
-
-        # One entry per attached space, so several methods can be compared
-        # from the same dropdown ("CryoSIAM - full (1024-d)", "TomoTwin -
-        # UMAP (2-d)", ...). Rebuilt wholesale rather than patched item by
-        # item, since attaching a method adds two at once; the current
-        # choice is preserved when it's still available.
-        space_combo = self.compute_distance_space_combo
-        previous_space = space_combo.currentData()
-        space_combo.blockSignals(True)
-        space_combo.clear()
-        for name in target.ordered_space_names():
-            space_combo.addItem(target.embedding_spaces[name]["label"], name)
-        idx = space_combo.findData(previous_space) if previous_space else -1
-        space_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        space_combo.blockSignals(False)
-
-        self._update_compute_distance_state()
-
-    def _update_compute_distance_state(self):
-        target = self._target_or_none()
-        cid = self._active_classid()
-        self.compute_distance_target_label.setText(
-            target.sets[cid] if target is not None and cid is not None else "—")
-        has_embeddings = target is not None and bool(target.embedding_spaces)
-        reference_cid = self.compute_distance_reference_combo.currentData()
-        negative_cid = self.compute_distance_negative_combo.currentData()
-        conflict = negative_cid is not None and negative_cid == reference_cid
-
-        # No embeddings at all isn't fixable from anything in this group
-        # (you'd need to import some elsewhere first), so graying out the
-        # whole thing -- combos included -- is fine there. A same-set
-        # conflict is different: it's fixable right here, by changing
-        # either combo, so disabling the *group* (which contains those
-        # very combos) would trap the user with no way to undo their own
-        # choice. Only the actual "go" button (and its menu equivalent)
-        # get disabled for a conflict, with a tooltip explaining why;
-        # every combo stays live regardless.
-        group_enabled = has_embeddings and cid is not None
-        self.compute_distance_group.setEnabled(group_enabled)
-        self.compute_distance_group.setToolTip(
-            "" if has_embeddings else
-            "No embeddings are loaded -- import a particle list with an embeddings "
-            "bundle attached first (File > Import Particle List with Embeddings...).")
-
-        can_run = group_enabled and not conflict
-        self.compute_distance_button.setEnabled(can_run)
-        self.rank_action.setEnabled(can_run)
-        self.compute_distance_button.setToolTip(
-            "\"close to\" and \"far from\" can't be the same set." if conflict
-            else self._compute_distance_button_tip)
-
-        # Leave-one-out is relevant (and only ever applied) to whichever
-        # term -- "close to", "far from", or both -- actually equals the
-        # current tab; see TomoBoxer.compute_mahalanobis.
-        same = group_enabled and (reference_cid == cid or negative_cid == cid)
-        self.compute_distance_loo_check.setEnabled(same)
-        if not same:
-            self.compute_distance_loo_check.setChecked(False)
-        self.compute_distance_loo_check.setToolTip(
-            "" if same else "Only available when \"close to\" and/or \"far from\" is the current tab itself.")
-
-    def _show_leave_one_out_help(self):
-        QtWidgets.QMessageBox.information(self, "Leave-One-Out", _LEAVE_ONE_OUT_HELP)
-
-    def _run_compute_distance(self):
-        target = self._target_or_none()
-        cid = self._active_classid()
-        if target is None or cid is None:
-            return
-        target.run_compute_distance(
-            target_classid=cid,
-            reference_classid=self.compute_distance_reference_combo.currentData(),
-            space=self.compute_distance_space_combo.currentData(),
-            leave_one_out=(self.compute_distance_loo_check.isEnabled()
-                            and self.compute_distance_loo_check.isChecked()),
-            negative_classid=self.compute_distance_negative_combo.currentData(),
-            reference_tomograms=self.reference_tomograms())
-
     # -- UMAP selection tab ------------------------------------------------------
     def _umap_selection(self):
         target = self._target_or_none()
@@ -1526,60 +1267,11 @@ class ParticleListPanel(QtWidgets.QWidget):
         if self.tabs.indexOf(self.umap_grid) >= 0:
             self.tabs.setCurrentWidget(self.umap_grid)
 
-    # -- reference scope (multi-tomogram sessions) ------------------------------
-    def reference_tomograms(self):
-        """None for "this tomogram"; otherwise every tomogram whose
-        references are pooled, this one included."""
-        target = self._target_or_none()
-        if target is None or getattr(target, "session", None) is None:
-            return None
-        scope, chosen = target.session_controller.reference_scope
-        if scope == "all":
-            return list(target.session.names)
-        if scope == "choose":
-            return [target.session_name] + [t for t in chosen if t != target.session_name]
-        return None
-
-    def _restore_scope(self, controller):
-        """The scope is a session-wide choice, kept on the controller, so it
-        survives switching tomograms rather than resetting with each one."""
-        scope, chosen = controller.reference_scope
-        combo = self.compute_distance_scope_combo
-        combo.setCurrentIndex(max(combo.findData(scope), 0))
-        self._label_chosen(chosen)
-
-    def _label_chosen(self, chosen):
-        combo = self.compute_distance_scope_combo
-        idx = combo.findData("choose")
-        combo.setItemText(idx, f"chosen tomograms ({len(chosen)})..." if chosen
-                          else "chosen tomograms...")
-
-    def _on_scope_activated(self, index):
-        target = self._target_or_none()
-        if target is None or getattr(target, "session", None) is None:
-            return
-        controller = target.session_controller
-        scope = self.compute_distance_scope_combo.itemData(index)
-        previous_scope, chosen = controller.reference_scope
-        if scope == "choose":
-            from .session_window import ChooseTomogramsDialog
-            dlg = ChooseTomogramsDialog(
-                [t for t in target.session.names if t != target.session_name], chosen, self)
-            if dlg.exec() == QtWidgets.QDialog.Accepted and dlg.chosen():
-                chosen = dlg.chosen()
-            elif not chosen:
-                # nothing chosen, ever: fall back to what was selected before
-                self.compute_distance_scope_combo.setCurrentIndex(
-                    max(self.compute_distance_scope_combo.findData(previous_scope), 0))
-                return
-        controller.reference_scope = (scope, chosen)
-        self._label_chosen(chosen)
-
     def _empty_recycle_bin(self):
         target = self._target_or_none()
         if target is None:
             return
-        count = sum(1 for b in target.boxes if b[5] == categories.RECYCLE_BIN_ID)
+        count = sum(1 for b in target.boxes if b.classid == categories.RECYCLE_BIN_ID)
         if count == 0:
             return
         reply = QtWidgets.QMessageBox.question(
@@ -1916,7 +1608,7 @@ class ParticleListPanel(QtWidgets.QWidget):
         # call, keeps them always correct rather than tracking each
         # possible trigger individually. Cheap: just a handful of classes.
         self._refresh_all_color_swatches()
-        self._refresh_compute_distance_controls()
+        self.ranking.refresh()
 
     def _is_tab_locked(self, index):
         """"All", "+", and the fixed categories can't be dragged -- only
@@ -2221,7 +1913,7 @@ class ParticleListPanel(QtWidgets.QWidget):
 
     def closeEvent(self, event):
         target = self._target() if self._target is not None else None
-        if target is not None and not getattr(target, "_closing", False):
+        if target is not None and not target.closing:
             event.ignore()
             target.request_close_all()
             return

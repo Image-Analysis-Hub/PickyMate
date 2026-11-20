@@ -73,7 +73,7 @@ def main():
     ap.add_argument("input")
     ap.add_argument("output")
     ap.add_argument("--pca", type=int, default=50,
-                    help="reduce to this many dimensions first when there are more")
+                    help="reduce to this many dimensions first when there are more; 0 = no PCA")
     ap.add_argument("--neighbors", type=int, default=15)
     ap.add_argument("--min_dist", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=None,
@@ -86,7 +86,7 @@ def main():
         say("STAGE", "Loading the embeddings")
         X = np.load(a.input).astype(np.float32)
         say("STAGE", f"{X.shape[0]} particles x {X.shape[1]} dimensions")
-        if X.shape[1] > a.pca:
+        if 0 < a.pca < X.shape[1]:
             say("STAGE", f"Reducing {X.shape[1]} dimensions to {a.pca} by PCA")
             X, kept = pca(X, a.pca)
             say("STAGE", f"PCA kept {kept * 100:.4f}% of the variance")

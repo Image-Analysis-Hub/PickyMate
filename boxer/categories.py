@@ -4,8 +4,8 @@ present alongside the user's own picking classes, so a cleanup workflow
 put a particle.
 
 Negative ids keep them from colliding with the auto-incrementing user
-class ids (0, 1, 2, ...) or with the -1 sentinel `parse_setname` (in
-main_window.py) returns when it can't parse a class id at all.
+class ids (0, 1, 2, ...) or with the -1 sentinel `parse_setname` returns
+when it can't parse a class id at all.
 """
 from __future__ import annotations
 
@@ -17,6 +17,18 @@ RECYCLE_BIN_NAME = "Recycle Bin"
 CONFIRMED_NAME = "Confirmed"
 FIXED_CLASS_IDS = (RECYCLE_BIN_ID, CONFIRMED_ID)
 FIXED_CLASS_NAMES = {RECYCLE_BIN_NAME: RECYCLE_BIN_ID, CONFIRMED_NAME: CONFIRMED_ID}
+
+
+def parse_setname(name):
+    """The class id in a "<id>::<name>" label (the form the particle list's
+    tabs hand back for a set), or -1 if it has none."""
+    p0 = name.find("::")
+    if p0 > 0:
+        try:
+            return int(name[:p0])
+        except ValueError:
+            pass
+    return -1
 
 # Red/green/yellow are reserved for Recycle Bin/Confirmed/selection (see
 # below) and deliberately excluded here so a normal class's color can never

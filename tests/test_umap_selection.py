@@ -85,11 +85,11 @@ try:
     uw, canvas = win.umap_window, win.umap_window.canvas
     spaces = [uw.space_combo.itemData(i) for i in range(uw.space_combo.count())]
     assert spaces == ["tomotwin_umap", "cryosiam_umap"], spaces
-    embedded = [b for b in win.boxes if b[7] is not None]
+    embedded = [b for b in win.boxes if b.embedding_row is not None]
     assert len(canvas._xy) == len(embedded) > 0
     print(f"OK: map shows all {len(embedded)} embedded particles; TomoTwin UMAP is offered first")
 
-    sets_before = {cid: sum(1 for b in win.boxes if b[5] == cid) for cid in win.sets}
+    sets_before = {cid: sum(1 for b in win.boxes if b.classid == cid) for cid in win.sets}
 
     # -- 3. a real lasso -------------------------------------------------------
     w, h = canvas.width(), canvas.height()
@@ -116,7 +116,7 @@ try:
     assert bv.is_umap_selection_active(), "a lasso should bring its tab to the front"
     assert bv._is_tab_locked(idx), "the selection tab must not be draggable"
     assert set(bv.umap_grid._images) == expect
-    sets_after = {cid: sum(1 for b in win.boxes if b[5] == cid) for cid in win.sets}
+    sets_after = {cid: sum(1 for b in win.boxes if b.classid == cid) for cid in win.sets}
     assert sets_after == sets_before, "selecting must not move particles between sets"
     assert metadata.discover_classes(WD) == sorted(metadata.discover_classes(WD))
     assert "UMAP Selection" not in metadata.discover_classes(WD), "the selection became a set"
@@ -163,8 +163,8 @@ try:
     drag(canvas, box)
     sel = set(win.umap_selection)
     moved_uid = next(iter(sel))
-    moved = [j for j, b in enumerate(win.boxes) if b[6] == moved_uid]
-    win.currentset = win.boxes[moved[0]][5]
+    moved = [j for j, b in enumerate(win.boxes) if b.uid == moved_uid]
+    win.currentset = win.boxes[moved[0]].classid
     win._reassign_boxes(moved, categories.RECYCLE_BIN_ID)
     app.processEvents()
     assert win.umap_selection == sel, "an edit changed the selection"
@@ -177,13 +177,13 @@ try:
     bv.activate_umap_tab()
     win.view_only_selected_action.setChecked(True)
     app.processEvents()
-    shown = {b[6] for b in win.boxes if win._is_visible_particle(b)}
+    shown = {b.uid for b in win.boxes if win._is_visible_particle(b)}
     assert shown == sel, (len(shown), len(sel))
-    recycled = next(b for b in win.boxes if b[6] == moved_uid)
+    recycled = next(b for b in win.boxes if b.uid == moved_uid)
     assert win._is_visible_particle(recycled), "a selected particle in the Recycle Bin must still show"
     bv.tabs.setCurrentWidget(bv.grid)          # to "All", solo still on
     app.processEvents()
-    shown_all = {b[6] for b in win.boxes if win._is_visible_particle(b)}
+    shown_all = {b.uid for b in win.boxes if win._is_visible_particle(b)}
     assert shown_all > sel, "back on All, every set should show again"
     win.view_only_selected_action.setChecked(False)
     app.processEvents()
@@ -192,7 +192,7 @@ try:
 
     # -- 7. a deleted particle leaves the saved file; undo brings it back ---------
     gone = next(u for u in sel if u != moved_uid)
-    win.del_box([j for j, b in enumerate(win.boxes) if b[6] == gone])
+    win.del_box([j for j, b in enumerate(win.boxes) if b.uid == gone])
     app.processEvents()
     on_disk = {r["uid"] for r in metadata.load_umap_selection(WD)}
     assert gone not in on_disk and len(on_disk) == len(sel) - 1

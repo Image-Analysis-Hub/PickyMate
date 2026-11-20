@@ -9,7 +9,7 @@ code, since one only displays fixed text and the other edits live state.
 """
 from __future__ import annotations
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 
 class KeyboardShortcutsDialog(QtWidgets.QDialog):

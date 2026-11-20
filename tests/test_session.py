@@ -36,6 +36,13 @@ FRESH = "TS_043"                      # never opened: exercises the first-open i
 MOVED = "TS_045"                      # initialised on another machine: its recorded paths are stale
 for t in OPENED + [MOVED]:
     shutil.copytree(f"{DATA}/Ribosomes_PickyMate/{t}_picks", f"{TMP}/{t}_picks")
+# MOVED must look like it was initialised elsewhere whatever state the
+# dataset's own copy is in (opening it once repairs the paths for good):
+# point every recorded embedding file at a folder that doesn't exist here
+moved_dir = f"{TMP}/{MOVED}_picks"
+metadata.save_embeddings_settings(moved_dir, [
+    dict(sp, path=f"/another/machine/{os.path.basename(sp['path'])}")
+    for sp in metadata.load_embeddings_settings(moved_dir, include_missing=True)])
 
 manifest = os.path.join(TMP, "session.csv")
 with open(manifest, "w", newline="") as f:
@@ -75,7 +82,9 @@ try:
 
     # -- 2. references from other tomograms --------------------------------------
     vec, used, skipped = session.reference_vectors("tomotwin", "Confirmed", ["TS_037"], 32)
-    rows = [r["embedding_row"] for r in metadata.load_class_records(f"{TMP}/TS_037_picks", "Confirmed")]
+    # only embedded particles can be references: a hand pick in Confirmed has no row
+    rows = [r["embedding_row"] for r in metadata.load_class_records(f"{TMP}/TS_037_picks", "Confirmed")
+            if r["embedding_row"] is not None]
     assert used == ["TS_037"] and vec.shape == (len(rows), 32), (used, vec.shape)
     _, used, skipped = session.reference_vectors("tomotwin", "Confirmed", [FRESH], 32)
     assert used == [] and skipped and skipped[0][0] == FRESH, skipped
@@ -90,17 +99,17 @@ try:
     win = ctl.current
     assert win is not None and win.session_name == "TS_026"
     assert win.ordered_space_names()[0] == "tomotwin", win.ordered_space_names()
-    combo = win.boxesviewer.compute_distance_space_combo
+    combo = win.boxesviewer.ranking.compute_distance_space_combo
     shown = [combo.itemData(i) for i in range(combo.count())]
     assert shown == ["tomotwin", "tomotwin_umap", "cryosiam", "cryosiam_umap"], shown
-    assert win.boxesviewer.compute_distance_scope_row.isVisibleTo(win.boxesviewer)
-    assert win.boxesviewer.reference_tomograms() is None, "default must be this tomogram only"
+    assert win.boxesviewer.ranking.compute_distance_scope_row.isVisibleTo(win.boxesviewer)
+    assert win.boxesviewer.ranking.reference_tomograms() is None, "default must be this tomogram only"
     print("OK: space dropdown is TomoTwin full, TomoTwin UMAP, CryoSIAM full, CryoSIAM UMAP; "
           "references default to this tomogram")
 
     target = [cid for cid in win.sets if cid not in categories.FIXED_CLASS_IDS][0]
     res_own = win.compute_mahalanobis(categories.CONFIRMED_ID, target, "tomotwin")
-    own_scores = {b[6]: b[4] for b in win.boxes if b[5] == target and b[4] is not None}
+    own_scores = {b.uid: b.score for b in win.boxes if b.classid == target and b.score is not None}
     res_all = win.compute_mahalanobis(categories.CONFIRMED_ID, target, "tomotwin",
                                       reference_tomograms=session.names)
     assert res_all["other_tomograms_used"] == ["TS_037", MOVED], res_all
@@ -110,15 +119,15 @@ try:
 
     # recompute the pooled ranking independently and demand exact agreement
     arr = win.embedding_spaces["tomotwin"]["array"].astype(np.float64)
-    own_rows = [b[7] for b in win.boxes if b[5] == categories.CONFIRMED_ID and b[7] is not None]
+    own_rows = [b.embedding_row for b in win.boxes if b.classid == categories.CONFIRMED_ID and b.embedding_row is not None]
     other, _, _ = session.reference_vectors("tomotwin", "Confirmed", ["TS_037", MOVED], 32)
     ref = np.vstack([arr[own_rows], other])
     mu = ref.mean(0); cen = ref - mu
     ci = np.linalg.pinv(cen.T @ cen / (len(ref) - 1), hermitian=True)
-    tgt = [(b[6], b[7]) for b in win.boxes if b[5] == target and b[7] is not None]
+    tgt = [(b.uid, b.embedding_row) for b in win.boxes if b.classid == target and b.embedding_row is not None]
     d = arr[[r for _, r in tgt]] - mu
     mine = ((d @ ci) * d).sum(1)
-    theirs = np.array([next(b[4] for b in win.boxes if b[6] == u) for u, _ in tgt])
+    theirs = np.array([next(b.score for b in win.boxes if b.uid == u) for u, _ in tgt])
     assert np.allclose(mine, theirs, rtol=1e-9, atol=1e-9), np.abs(mine - theirs).max()
     assert any(abs(own_scores[u] - s) > 1e-9 for (u, _), s in zip(tgt, theirs)), \
         "pooling other tomograms should change the scores"
@@ -134,8 +143,8 @@ try:
           f"from the other tomograms")
 
     # an edit made before switching must be on disk afterwards
-    moved = [i for i, b in enumerate(win.boxes) if b[5] == target][:3]
-    moved_uids = {win.boxes[i][6] for i in moved}
+    moved = [i for i, b in enumerate(win.boxes) if b.classid == target][:3]
+    moved_uids = {win.boxes[i].uid for i in moved}
     win.currentset = target
     win._reassign_boxes(moved, categories.RECYCLE_BIN_ID)
     categories.set_manual_color(0, categories.QtGui.QColor("orange"))
@@ -202,7 +211,7 @@ try:
     # the navigator shows the new state, and the scope survives the switch
     ctl.reference_scope = ("all", [])
     ctl.open("TS_026")
-    assert ctl.current.boxesviewer.reference_tomograms() == session.names
+    assert ctl.current.boxesviewer.ranking.reference_tomograms() == session.names
     ctl.navigator.refresh()
     assert ctl.navigator.table.item(0, 0).text().strip().startswith("▶")
     print("OK: navigator marks the open tomogram; the references choice survives switching")
@@ -240,8 +249,8 @@ try:
     rewritten = [r for r in rewritten if r["name"] != "extra_space"]
     assert all(r["exists"] and r["path"].startswith(DATA) for r in rewritten), rewritten
     assert session.entry(MOVED).embedding_path_fixes() == {}
-    print(f"OK: stale embedding paths from another machine are replaced by the manifest's, "
-          f"the tomogram opens with all 4 spaces, and the corrected paths are saved")
+    print("OK: stale embedding paths from another machine are replaced by the manifest's, "
+          "the tomogram opens with all 4 spaces, and the corrected paths are saved")
 
     # never substitute a file with a different name: it could be other data
     e = session.entry(MOVED)

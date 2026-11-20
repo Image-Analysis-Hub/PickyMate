@@ -37,6 +37,7 @@ import threading
 import numpy as np
 
 from . import categories, embeddings_io, metadata
+from .volume import Volume
 
 IMPORT_COLUMNS = ("embedded_particle_list", "cryosiam_embeddings", "cryosiam_umap",
                   "tomotwin_embeddings", "tomotwin_umap")
@@ -185,7 +186,6 @@ class Session:
         switch to it doesn't wait on the disk -- reading the volume is
         about half the time a switch takes. Only one prefetched volume is
         kept; asking for another drops the previous one."""
-        from .volume import Volume
         path = self.entry(name).tomogram
         key = (path, bool(native_memmap))
         with self._prefetch_lock:

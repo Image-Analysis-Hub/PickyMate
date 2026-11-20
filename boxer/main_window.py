@@ -17,8 +17,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import weakref
-
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -29,43 +27,65 @@ from .help_dialog import ShortcutsDialog
 from .image_view import ImageView2D
 from .settings_dialog import KeyboardShortcutsDialog
 from .thumb_grid import ParticleListPanel
-from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, space_key_state
+from .umap_view import UmapWindow
+from .widgets import LabeledSpinBox, RangeSlider, TOOLBAR_BUTTON_STYLE, make_action, space_key_state
 from . import categories
 from . import metadata
+from . import ranking
 from . import shortcuts
+from .picks import Particle, Picks
 from .shapes import Shape
 from .volume import Volume
 
-# Shared by the shape-select tool (rectangle/circle/freeform) below: index
-# of each axis into a box's [x, y, z, ...] entry, and which two axes are
+# Shared by _view_point and the shape-select tool (rectangle/circle/freeform)
+# below: index of each axis into a click's (x, y, z) tuple, and which two axes are
 # "in-plane" for a given view's depth axis -- matching the exact (a1, a2)
 # order update_box_shape already uses when building each view's own Shape
-# geometry (xyview: x,y; xzview: x,z; zyview: z,y).
+# geometry (xyview: x,y; xzview: x,z; zyview: z,y). A Particle's own
+# coordinate along an axis is getattr(particle, axis).
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 _VIEW_PLANE_AXES = {"z": ("x", "y"), "y": ("x", "z"), "x": ("z", "y")}
 _SELECT_PREVIEW_COLOR = (1.0, 1.0, 1.0)  # white -- distinct from every reserved/class color
 _SELECT_CLOSE_PIXELS = 8  # screen-pixel radius for "clicked near the first freeform point"
 
 
-def parse_setname(name):
-    p0 = name.find("::")
-    if p0 > 0:
-        try:
-            return int(name[:p0])
-        except ValueError:
-            pass
-    return -1
-
-
 class TomoBoxer(QtWidgets.QMainWindow):
-    """Main window: orthogonal slice views + picking controls."""
+    """Main window: orthogonal slice views + picking controls.
+
+    The particle list (thumb_grid) and its ranking panel (ranking_panel),
+    the map (umap_view), the browser of other tomograms (session_browser)
+    and the session controller (session_window) hold a weak reference to
+    this window and use only
+    what is listed here -- nothing else of it is theirs to touch, and
+    tests/test_interface.py checks that:
+
+        state    boxes sets sets_visible embedding_spaces umap_selection
+                 umap_window session_name session session_controller
+                 closing
+        verbs    new_set rename_set delete_set show_set hide_set
+                 empty_recycle_bin set_class_color reset_class_color
+                 is_solo_active nlayers ordered_space_names
+                 run_compute_distance set_umap_selection
+                 clear_umap_selection request_close_all
+                 session_windows session_layout restore_session_layout
+                 close_for_switch
+        actions  view_only_selected_action umap_action
+                 toggle_colors_action show_all_sets_action
+    """
 
     keyPress = QtCore.Signal(QtGui.QKeyEvent)
+
+    # The particles, their sets and box sizes belong to self.picks; these
+    # read through to it so the gallery, the map and the tests need not
+    # care where they live. Every change to them goes through Picks.
+    boxes = property(lambda self: self.picks.boxes)
+    sets = property(lambda self: self.picks.sets)
+    boxsize = property(lambda self: self.picks.boxsize)
 
     def __init__(self, options, datafile):
         super().__init__()
         self.initialized = False
-        self._closing = False
+        self.closing = False
         self.options = options
         # Set when this window is one tomogram of a multi-tomogram session
         # (tomo_boxer.py --session): the controller owns the navigator and
@@ -92,7 +112,82 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # keypress of the session.
         space_key_state()
 
-        # -- menu ---------------------------------------------------------
+        self._build_menus()
+        self._build_views()
+        self._build_control_panel()
+
+        self.curbox = -1
+        self.picks = Picks()  # the particles, their sets and box sizes -- see picks.py
+        self.boxesimgs = []
+        self.dragging = -1
+        self._select_drawing = None  # in-progress shape-select gesture, or None
+        self._undo_stack = []
+        self._redo_stack = []
+
+        self._wire_views()
+        self._build_tools()
+        self._build_edit_actions()
+        self._build_view_actions()
+        self._register_shortcuts()
+
+        # -- load data ---------------------------------------------------------
+        self.datafilename = datafile
+        self._load_volume(options, datafile)
+
+        # Per-class plain-text pick files live in "<basename>_picks/" next
+        # to the tomogram by default, or wherever --working_dir points
+        # (resolved relative to the current working directory) instead.
+        self.picksdir = (
+            os.path.abspath(options.working_dir) if getattr(options, "working_dir", None)
+            else metadata.picks_dir(datafile))
+        self._load_embedding_spaces(options)
+        self._build_particle_list(datafile)
+        self._load_picks()
+        self._import_from_options(options)
+
+        if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
+            self.new_set("particles_00")
+
+        self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
+        if getattr(options, "label", None):
+            sid = [i for i in self.sets if self.sets[i] == options.label]
+            if sid:
+                self.currentset = sid[0]
+            else:
+                print("cannot find specified label")
+
+        # All classes are visible by default when the tomogram is opened,
+        # except the Recycle Bin -- rejected particles are more useful
+        # tucked out of the way until you deliberately want to review them.
+        self.sets_visible.update(self.sets.keys())
+        self.sets_visible.discard(categories.RECYCLE_BIN_ID)
+        self.wboxsize.setValue(self.get_boxsize())
+
+        if getattr(options, "clean", False):
+            self.tool_eraser_action.setChecked(True)
+            self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
+
+        self._load_umap_selection()
+
+        for i in range(len(self.boxes)):
+            self.update_box(i)
+
+        self.update_all()
+        self.initialized = True
+
+        # Land on the first real set's own tab, not "All" -- grouping
+        # every particle across every class (ParticleGrid.
+        # sync_particles_grouped) is the single most expensive gallery
+        # view to build, and isn't what you want staring back at you the
+        # moment a large tomogram finishes opening anyway. Whatever's
+        # first in the gallery's own tab order (after Recycle Bin/
+        # Confirmed), matching what the tab bar actually shows.
+        first_normal = self.boxesviewer.normal_class_order()
+        if first_normal:
+            self.boxesviewer.activate_class_tab(first_normal[0])
+
+    def _build_menus(self):
+        """The menu bar."""
         self.mfile = self.menuBar().addMenu("File")
         self.mfile_save_all = self.mfile.addAction("Save")
         self.mfile.addSeparator()
@@ -104,12 +199,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
             "same picks can be ranked by each method and compared.")
         self.mfile_save_boxloc = self.mfile.addAction("Export Particle Coordinates...")
         self.mfile.addSeparator()
-        self.load_companion_action = QtGui.QAction("Load Companion Volume...", self)
-        self.load_companion_action.setToolTip(
+        self.load_companion_action = make_action(
+            self, "Load Companion Volume...",
             "Load a second version of this same tomogram (e.g. denoised) to switch "
             "display between -- picks, sets, and box sizes are shared; only the pixel "
-            "data shown changes. Must match the primary tomogram's dimensions exactly.")
-        self.load_companion_action.triggered.connect(self.load_companion_volume_dialog)
+            "data shown changes. Must match the primary tomogram's dimensions exactly.",
+            self.load_companion_volume_dialog)
         self.mfile.addAction(self.load_companion_action)
 
         # Each of these is populated further down, once the actions/objects
@@ -130,7 +225,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mhelp_shortcuts_action.setShortcutContext(Qt.ApplicationShortcut)
         self.mhelp_shortcuts_action.triggered.connect(self.show_shortcuts_dialog)
 
-        # -- central layout: 3 orthogonal views + control panel ------------
+    def _build_views(self):
+        """The three slice views, their depth sliders and the splitters that hold them."""
         self.setCentralWidget(QtWidgets.QWidget())
         self.gbl = QtWidgets.QGridLayout(self.centralWidget())
         gblh = QtWidgets.QHBoxLayout()
@@ -143,6 +239,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.xyview = ImageView2D(sizehint=(1024, 1024))
         self.xzview = ImageView2D(sizehint=(1024, 256))
         self.zyview = ImageView2D(sizehint=(256, 1024))
+        # the same three, keyed by the axis each one looks along
+        self._views = {"z": self.xyview, "y": self.xzview, "x": self.zyview}
 
         # Three slice sliders, one per view's own depth axis -- each
         # spatially next to the view it drives, rather than all three
@@ -182,7 +280,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.splitter_top.splitterMoved.connect(self._on_top_splitter_moved)
         self.splitter_bottom.splitterMoved.connect(self._on_bottom_splitter_moved)
 
-        # -- control panel --------------------------------------------------
+    def _build_control_panel(self):
+        """Coordinates, contrast, box size and Avg Slices, below the XZ view."""
         gbl3 = QtWidgets.QHBoxLayout()
         self.gbl2.addLayout(gbl3, 0, 0, 1, 2)
 
@@ -231,22 +330,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wnlayers.setToolTip(label0.toolTip())
         self.gbl2.addWidget(self.wnlayers, 3, 1)
 
-        self.curbox = -1
-        self.boxes = []       # [x, y, z, method, score, class_id, uid]
-        self.boxesimgs = []
-        self._indices_by_class = {}  # classid -> {index: None} (ordered set of
-                                 # self.boxes indices in that class) -- lets
-                                 # mouse_down's click hit-test skip particles in
-                                 # a hidden class outright instead of visiting
-                                 # and then rejecting each one; see
-                                 # _visible_candidate_indices/_rebuild_indices_by_class.
-        self.dragging = -1
-        self._select_drawing = None  # in-progress shape-select gesture, or None
-        self._next_uid = 0
-        self._undo_stack = []
-        self._redo_stack = []
-
-        # -- wiring -----------------------------------------------------------
+    def _wire_views(self):
+        """Connect the menu, the controls and the slice views to their handlers."""
         self.mfile_save_all.triggered.connect(self.menu_file_save_all)
         self.mfile_read_boxloc.triggered.connect(self.menu_file_read_boxloc)
         self.mfile_import_with_embeddings.triggered.connect(self.menu_file_import_with_embeddings)
@@ -262,68 +347,52 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wbautoc.toggled.connect(self.event_autocontrast)
         self.wcontrast.rangeChanged.connect(self.event_contrast_slider)
 
-        self.xyview.mousemove.connect(self.xy_move)
-        self.xyview.mousedown.connect(self.xy_down)
-        self.xyview.mousedrag.connect(self.xy_drag)
-        self.xyview.mouseup.connect(self.mouse_up)
+        for axis, view in self._views.items():
+            view.mousedown.connect(lambda e, a=axis: self._view_down(a, e))
+            view.mousedrag.connect(lambda e, a=axis: self._view_drag(a, e))
+            view.mouseup.connect(self.mouse_up)
+            view.mousemove.connect(lambda e, v=view: self.mouse_move(e, v))
+            view.mousedoubleclick.connect(lambda _e, v=view: self._select_doubleclick(v))
+            view.signal_set_scale.connect(self.event_scale)
+            # Freeform select's Enter/Escape/Backspace need to work no matter
+            # which of the 3 views the polygon is being drawn in, not just the
+            # main XY one.
+            view.keypress.connect(self.key_press)
+        # Panning and Shift+wheel are not the same in every view (see
+        # xy_origin and xy_wheel), so those stay wired one by one.
         self.xyview.mousewheel.connect(self.xy_wheel)
-        self.xyview.mousedoubleclick.connect(self.xy_doubleclick)
-        self.xyview.signal_set_scale.connect(self.event_scale)
         self.xyview.origin_update.connect(self.xy_origin)
-
-        self.xzview.mousedown.connect(self.xz_down)
-        self.xzview.mousedrag.connect(self.xz_drag)
-        self.xzview.mouseup.connect(self.mouse_up)
         self.xzview.mousewheel.connect(self.xz_wheel)
-        self.xzview.mousedoubleclick.connect(self.xz_doubleclick)
-        self.xzview.signal_set_scale.connect(self.event_scale)
         self.xzview.origin_update.connect(self.xz_origin)
-        self.xzview.mousemove.connect(self.xz_move)
-
-        self.zyview.mousedown.connect(self.zy_down)
-        self.zyview.mousedrag.connect(self.zy_drag)
-        self.zyview.mouseup.connect(self.mouse_up)
         self.zyview.mousewheel.connect(self.zy_wheel)
-        self.zyview.mousedoubleclick.connect(self.zy_doubleclick)
-        self.zyview.signal_set_scale.connect(self.event_scale)
         self.zyview.origin_update.connect(self.zy_origin)
-        self.zyview.mousemove.connect(self.zy_move)
 
-        self.xyview.keypress.connect(self.key_press)
-        # Freeform select's Enter/Escape/Backspace need to work no matter
-        # which of the 3 views the polygon is being drawn in, not just the
-        # main XY one.
-        self.xzview.keypress.connect(self.key_press)
-        self.zyview.keypress.connect(self.key_press)
-
-        # -- tool selector: Pick / Eraser / Select ---------------------------
+    def _build_tools(self):
+        """The Pick / Eraser / Select tools, their options and the Tools toolbar."""
         # These are mutually exclusive *tools* (Photoshop/GIMP-style), not
         # independent settings -- exactly one is ever active, and each has
         # its own small set of options that only matter while it's the
         # active one. QActionGroup gives the exclusivity for free (checking
         # one unchecks the others) instead of the manual cross-wiring a set
         # of independent checkboxes would need.
-        self.tool_pick_action = QtGui.QAction("Pick", self)
-        self.tool_pick_action.setCheckable(True)
-        self.tool_pick_action.setChecked(True)
-        self.tool_pick_action.setToolTip(
+        self.tool_pick_action = make_action(
+            self, "Pick",
             "Normal picking: click empty space to add, click + drag an "
             "existing particle to move it. Shift/Space/Ctrl+click still "
-            "work for Recycle Bin/Confirmed/multi-select.")
+            "work for Recycle Bin/Confirmed/multi-select.", checkable=True)
+        self.tool_pick_action.setChecked(True)
 
-        self.tool_eraser_action = QtGui.QAction("Eraser", self)
-        self.tool_eraser_action.setCheckable(True)
-        self.tool_eraser_action.setToolTip(
+        self.tool_eraser_action = make_action(
+            self, "Eraser",
             "Click-drag in a tomogram view to send every particle within "
-            "Radius of the cursor to the Recycle Bin.")
+            "Radius of the cursor to the Recycle Bin.", checkable=True)
 
-        self.tool_select_action = QtGui.QAction("Select", self)
-        self.tool_select_action.setCheckable(True)
-        self.tool_select_action.setToolTip(
+        self.tool_select_action = make_action(
+            self, "Select",
             "Draw a shape in a tomogram view to select every particle "
             "inside it (replacing the current selection), instead of "
             "picking/moving particles. Use Confirm/Recycle Selected or "
-            "Move Selected to act on the result.")
+            "Move Selected to act on the result.", checkable=True)
 
         self.tool_group = QtGui.QActionGroup(self)
         self.tool_group.setExclusive(True)
@@ -393,15 +462,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.tools_toolbar.addWidget(self.select_shape_freeform)
         self.tools_toolbar.addWidget(self.tool_3d_checkbox)
 
+    def _build_edit_actions(self):
+        """Undo/Redo, Refresh, the actions on the selection, and the Edit and Selection toolbars."""
         # QAction rather than a bare QShortcut for both: it gives Undo/Redo
         # a visible Edit-menu entry (with the shortcut shown alongside it
         # for free) and a toolbar button, in addition to still responding
         # to the keyboard shortcut -- one object serves all three.
-        self.undo_action = QtGui.QAction("Undo", self)
-        self.undo_action.setShortcut(QtGui.QKeySequence.Undo)
-        self.undo_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.undo_action.setToolTip("Undo (Ctrl+Z)")
-        self.undo_action.triggered.connect(self.undo)
+        self.undo_action = make_action(self, "Undo", "Undo (Ctrl+Z)", self.undo,
+                                       shortcut=QtGui.QKeySequence.Undo)
 
         # QKeySequence.Redo resolves to whatever the desktop theme defines
         # as "the" redo key -- on Linux (GNOME/KDE) that's normally
@@ -415,47 +483,38 @@ class TomoBoxer(QtWidgets.QMainWindow):
         ctrl_y = QtGui.QKeySequence("Ctrl+Y")
         if ctrl_y not in redo_keys:
             redo_keys.append(ctrl_y)
-        self.redo_action = QtGui.QAction("Redo", self)
-        self.redo_action.setShortcuts(redo_keys)
-        self.redo_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.redo_action.setToolTip("Redo (Ctrl+Y / Ctrl+Shift+Z)")
-        self.redo_action.triggered.connect(self.redo)
+        self.redo_action = make_action(self, "Redo", "Redo (Ctrl+Y / Ctrl+Shift+Z)", self.redo,
+                                       shortcut=redo_keys)
 
         self.medit.addAction(self.undo_action)
         self.medit.addAction(self.redo_action)
 
         self.medit.addSeparator()
-        self.refresh_action = QtGui.QAction("Refresh", self)
-        self.refresh_action.setShortcut(QtGui.QKeySequence(Qt.Key_F5))
-        self.refresh_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.refresh_action.setToolTip(
+        self.refresh_action = make_action(
+            self, "Refresh",
             "Force everything to fully re-derive and redraw -- regenerates every "
             "gallery thumbnail from the volume and fully re-slices the tomogram "
-            "views, in case rendering ever visibly gets stuck. (F5)")
-        self.refresh_action.triggered.connect(self.refresh_all)
+            "views, in case rendering ever visibly gets stuck. (F5)",
+            self.refresh_all, shortcut=QtGui.QKeySequence(Qt.Key_F5))
         self.medit.addAction(self.refresh_action)
 
-        self.confirm_selected_action = QtGui.QAction("Confirm Selected", self)
-        self.confirm_selected_action.setToolTip(
-            "Send every currently selected particle to Confirmed. (Insert key)")
         # Same idea as Recycle Selected's Delete key below: application-wide,
         # and naturally inert (via Qt's own disabled-action-shortcut
         # behavior) whenever nothing is selected.
-        self.confirm_selected_action.setShortcut(QtGui.QKeySequence(Qt.Key_Insert))
-        self.confirm_selected_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.confirm_selected_action.triggered.connect(lambda: self.confirm_particles_by_uid(self._selected_uids))
+        self.confirm_selected_action = make_action(
+            self, "Confirm Selected", "Send every currently selected particle to Confirmed. (Insert key)",
+            lambda: self.confirm_particles_by_uid(self._selected_uids),
+            shortcut=QtGui.QKeySequence(Qt.Key_Insert))
 
-        self.recycle_selected_action = QtGui.QAction("Recycle Selected", self)
-        self.recycle_selected_action.setToolTip(
-            "Send every currently selected particle to the Recycle Bin. (Delete key)")
-        self.recycle_selected_action.setShortcut(QtGui.QKeySequence(Qt.Key_Delete))
         # Application-wide, like Undo/Redo/the number keys, so the Delete
         # key reaches this from anywhere rather than only while some
         # specific widget happens to have focus. A disabled QAction's
         # shortcut is inert in Qt, so this is naturally a no-op whenever
         # nothing is selected -- no separate guard needed here.
-        self.recycle_selected_action.setShortcutContext(Qt.ApplicationShortcut)
-        self.recycle_selected_action.triggered.connect(lambda: self.delete_particles_by_uid(self._selected_uids))
+        self.recycle_selected_action = make_action(
+            self, "Recycle Selected", "Send every currently selected particle to the Recycle Bin. (Delete key)",
+            lambda: self.delete_particles_by_uid(self._selected_uids),
+            shortcut=QtGui.QKeySequence(Qt.Key_Delete))
 
         # Editable so you can type a brand-new set name too, not just pick
         # an existing one (matches move_particles_by_uid, which creates the
@@ -470,19 +529,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # here at all, as opposed to just dead space next to the button.
         self.move_to_combo.lineEdit().setPlaceholderText("Type a set name…")
 
-        self.move_selected_action = QtGui.QAction("Move Selected To", self)
-        self.move_selected_action.setToolTip("Move every currently selected particle to the set named at right.")
-        self.move_selected_action.triggered.connect(self._move_selected_via_toolbar)
+        self.move_selected_action = make_action(
+            self, "Move Selected To", "Move every currently selected particle to the set named at right.",
+            self._move_selected_via_toolbar)
 
-        self.focus_selected_action = QtGui.QAction("Show Only Selected", self)
-        self.focus_selected_action.setCheckable(True)
-        self.focus_selected_action.setToolTip(
+        self.focus_selected_action = make_action(
+            self, "Show Only Selected",
             "While on, a particle only shows in the tomogram views if it's both "
             "currently selected AND still in whatever set it was in when it "
             "joined the selection -- moving it to another set (Space/Shift+click, "
             "drag, ...) hides it right away without deselecting it, even though "
-            "its new set is itself visible. Updates live as the selection changes.")
-        self.focus_selected_action.toggled.connect(self._toggle_focus_selected)
+            "its new set is itself visible. Updates live as the selection changes.",
+            checkable=True, toggled=self._toggle_focus_selected)
 
         self.medit.addSeparator()
         self.medit.addAction(self.confirm_selected_action)
@@ -495,12 +553,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # toolbar, not here -- see ParticleListPanel.__init__. A QAction
         # isn't tied to whichever toolbar displays it, so this is the exact
         # same object clicking that button triggers.
-        self.toggle_colors_action = QtGui.QAction("Toggle Colors", self)
-        self.toggle_colors_action.setToolTip(
+        self.toggle_colors_action = make_action(
+            self, "Toggle Colors",
             "Rotate every normal set to the next color at once. Recycle "
             "Bin (red), Confirmed (green), and the yellow selection "
-            "highlight never change.")
-        self.toggle_colors_action.triggered.connect(self.toggle_colors)
+            "highlight never change.", self.toggle_colors)
 
         self.edit_toolbar = self.addToolBar("Edit")
         self.edit_toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly)
@@ -538,41 +595,39 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._focus_pulse_on = False
         self.focus_selected_action.toggled.connect(self._update_focus_pulse)
 
+    def _build_view_actions(self):
+        """The View menu's actions, the Volume toolbar, the status bar, and the application-wide number-key and Escape shortcuts."""
         # Show Active Set Only / Show All Sets' QActions are created here
         # (TomoBoxer owns sets_visible and the solo logic), but -- like
         # Toggle Colors above -- the buttons for them live in the particle
         # list's own toolbar, not here; see ParticleListPanel.__init__.
-        self.view_only_selected_action = QtGui.QAction("Show Active Set Only", self)
-        self.view_only_selected_action.setCheckable(True)
-        self.view_only_selected_action.setToolTip(
+        self.view_only_selected_action = make_action(
+            self, "Show Active Set Only",
             "While on, only the active tab's set is shown in the tomogram "
             "views -- switching tabs (including via number keys) updates "
             "this live. Turning it off restores whatever visibility you "
-            "had before.")
-        self.view_only_selected_action.toggled.connect(self.toggle_view_only_selected)
+            "had before.", checkable=True, toggled=self.toggle_view_only_selected)
         self._solo_saved_visible = None  # sets_visible snapshot from before solo turned on
 
-        self.show_all_sets_action = QtGui.QAction("Show All Sets", self)
-        self.show_all_sets_action.setToolTip("Make every set visible in the tomogram views.")
-        self.show_all_sets_action.triggered.connect(self.show_all_sets)
+        self.show_all_sets_action = make_action(
+            self, "Show All Sets", "Make every set visible in the tomogram views.", self.show_all_sets)
 
         # Disabled until a companion volume is actually loaded (see
         # load_companion_volume_dialog/_load_companion_volume below).
-        self.toggle_companion_action = QtGui.QAction("Show Companion Volume", self)
-        self.toggle_companion_action.setCheckable(True)
-        self.toggle_companion_action.setEnabled(False)
-        self.toggle_companion_action.setToolTip(
+        self.toggle_companion_action = make_action(
+            self, "Show Companion Volume",
             "Switch the tomogram views and gallery thumbnails between the primary "
             "volume and its loaded companion (e.g. denoised). Contrast and Avg "
-            "Slices are kept separate per volume; picks/sets are shared.")
-        self.toggle_companion_action.toggled.connect(self._on_toggle_companion)
+            "Slices are kept separate per volume; picks/sets are shared.",
+            checkable=True, toggled=self._on_toggle_companion)
+        self.toggle_companion_action.setEnabled(False)
 
         self.mview.addAction(self.toggle_companion_action)
-        self.umap_action = QtGui.QAction("UMAP Map...", self)
-        self.umap_action.setToolTip(
+        self.umap_action = make_action(
+            self, "UMAP Map...",
             "Open the UMAP map of this tomogram's particles, coloured by set, and "
-            "lasso-select particles on it into the \"UMAP Selection\" tab.")
-        self.umap_action.triggered.connect(self.open_umap_window)
+            "lasso-select particles on it into the \"UMAP Selection\" tab.",
+            self.open_umap_window)
         self.mview.addAction(self.umap_action)
         self.mview.addSeparator()
         self.mview.addAction(self.toggle_colors_action)
@@ -627,10 +682,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._escape_shortcut.setContext(Qt.ApplicationShortcut)
         self._escape_shortcut.activated.connect(self._global_escape)
 
-        # -- customizable keyboard shortcuts (Settings > Customize Keyboard
-        # Shortcuts...) -- registered here, now that every action/shortcut
-        # below has its own built-in default already set, so that default
-        # can just be read back rather than duplicated a second time.
+    def _register_shortcuts(self):
+        """Customizable keyboard shortcuts (Settings > Customize Keyboard Shortcuts...) -- registered now that every action and shortcut has its built-in default set, so that default can be read back rather than duplicated."""
         self._shortcut_registry = []
         self._register_shortcut("undo", "Undo", self.undo_action)
         self._register_shortcut("redo", "Redo", self.redo_action, multi=True)
@@ -648,9 +701,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.msettings_shortcuts_action = self.msettings.addAction("Customize Keyboard Shortcuts...")
         self.msettings_shortcuts_action.triggered.connect(self.open_shortcuts_settings)
 
-        # -- load data ---------------------------------------------------------
-        self.datafilename = datafile
-
+    def _load_volume(self, options, datafile):
+        """Read the tomogram (or take the one the session prefetched) and note the companion, if any."""
         # Companion-volume support (e.g. denoised vs. non-denoised display of
         # the exact same tomogram): _volume_slots holds the two possible
         # Volume objects, _active_volume_key says which one self.data
@@ -680,13 +732,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.companion_path:
             self.toggle_companion_action.setEnabled(True)
 
-        # Per-class plain-text pick files live in "<basename>_picks/" next
-        # to the tomogram by default, or wherever --working_dir points
-        # (resolved relative to the current working directory) instead.
-        self.picksdir = (
-            os.path.abspath(options.working_dir) if getattr(options, "working_dir", None)
-            else metadata.picks_dir(datafile))
-
+    def _load_embedding_spaces(self, options):
+        """Reload every embedding space a previous launch attached to this working directory."""
         # Mahalanobis-distance feature: at most one embeddings bundle is
         # attached at a time (see import_particle_list_with_embeddings).
         # Auto-reload whichever one a previous session attached, so it
@@ -741,6 +788,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 print(f"note: {name!r} embeddings were recorded at {old_path}, which no longer "
                       f"exists; now using {new_path} from the session manifest")
 
+    def _build_particle_list(self, datafile):
+        """The particle list window, its signals, and the Set menu."""
         self.boxesviewer = ParticleListPanel(self)
         self.boxesviewer.setWindowTitle(f"PickyMate — Particle List — {metadata.base_name(datafile)}")
         self.boxesviewer.set_mouse_mode("App")
@@ -775,18 +824,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.mset.addAction(self.boxesviewer.sort_by_id_action)
         self.mset.addAction(self.boxesviewer.sort_by_rank_action)
         self.mset.addSeparator()
-        self.mset.addAction(self.boxesviewer.rank_action)
+        self.mset.addAction(self.boxesviewer.ranking.rank_action)
         self.mset.addSeparator()
         self.mset.addAction(self.boxesviewer.empty_recycle_action)
 
         self._arrange_windows()
 
-        # -- metadata (picks + classes) ------------------------------------------
-        # self.sets: class_id (int) -> class name (str), the name doubling
-        # as the "<name>.txt" filename inside self.picksdir.
-        self.sets = {}
-        self.boxsize = {}
-
+    def _load_picks(self):
+        """Every set's particles from the working directory, with uids made unique and coordinates clamped to the volume."""
         class_settings = metadata.load_class_settings(self.picksdir)
         classnames = metadata.discover_classes(self.picksdir)
         normal_names = [n for n in classnames if n not in categories.FIXED_CLASS_NAMES]
@@ -794,7 +839,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.sets_visible = set()
 
         # Two passes: first load every class's records and find the highest
-        # explicit uid among them, so self._next_uid can start safely above
+        # explicit uid among them, so new uids can start safely above
         # it -- otherwise a legacy (uid-less) entry loaded earlier in the
         # population loop below could auto-assign a uid that collides with
         # an explicit one belonging to a different class's file, loaded
@@ -806,7 +851,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for rec in records:
                 if rec["uid"] is not None and rec["uid"] > max_uid:
                     max_uid = rec["uid"]
-        self._next_uid = max(self._next_uid, max_uid + 1)
+        self.picks.reserve_uids(max_uid)
 
         for i, name in enumerate(normal_names):
             self.sets[i] = name
@@ -815,8 +860,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if s.get("color"):
                 categories.set_manual_color(i, QtGui.QColor(s["color"]))
             for rec in normal_records[name]:
-                uid = rec["uid"] if rec["uid"] is not None else self._new_uid()
-                self.boxes.append([rec["x"], rec["y"], rec["z"], "manual", rec["score"], i, uid, rec["embedding_row"]])
+                uid = rec["uid"] if rec["uid"] is not None else self.picks.new_uid()
+                self.picks.add(Particle(rec["x"], rec["y"], rec["z"], i, uid, rec["embedding_row"], rec["score"]))
 
         # The Recycle Bin and Confirmed categories always exist, whether or
         # not their pick files were present on disk yet.
@@ -827,8 +872,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if s.get("color"):
                 categories.set_manual_color(cid, QtGui.QColor(s["color"]))
             for rec in fixed_records[name]:
-                uid = rec["uid"] if rec["uid"] is not None else self._new_uid()
-                self.boxes.append([rec["x"], rec["y"], rec["z"], "manual", rec["score"], cid, uid, rec["embedding_row"]])
+                uid = rec["uid"] if rec["uid"] is not None else self.picks.new_uid()
+                self.picks.add(Particle(rec["x"], rec["y"], rec["z"], cid, uid, rec["embedding_row"], rec["score"]))
 
         # Repair duplicate uids found on disk: the prescan above only
         # protects a freshly *auto-assigned* uid from colliding with an
@@ -838,9 +883,9 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # persistence scheme, where separate sessions independently
         # assigned uids without seeing each other's files). A duplicate
         # uid is silently dangerous, not just cosmetic: every gesture
-        # that resolves "the particle with uid X" by scanning self.boxes
-        # for the first match (_index_for_uid, used by Shift/Space-click)
-        # would then act on whichever copy happens to come first, which
+        # that resolves "the particle with uid X" (Picks.index_for_uid, used
+        # by Shift/Space-click) would then act on whichever copy the index
+        # happens to hold, which
         # can be a completely different particle than the one actually
         # clicked -- if that first copy already belongs to the gesture's
         # target class, the reassignment silently no-ops, making the
@@ -850,20 +895,23 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # persists the fix.
         seen_uids = set()
         for b in self.boxes:
-            if b[6] in seen_uids:
-                print(f"warning: duplicate uid {b[6]} found on disk (class "
-                      f"{self.sets.get(b[5], b[5])!r}) -- reassigned to keep every "
+            if b.uid in seen_uids:
+                print(f"warning: duplicate uid {b.uid} found on disk (class "
+                      f"{self.sets.get(b.classid, b.classid)!r}) -- reassigned to keep every "
                       f"particle uniquely identifiable")
-                b[6] = self._new_uid()
-            seen_uids.add(b[6])
+                b.uid = self.picks.new_uid()
+            seen_uids.add(b.uid)
 
         shape = [self.data.nx, self.data.ny, self.data.nz]
         for b in self.boxes:
-            for i in range(3):
-                b[i] = int(np.clip(round(b[i]), 1, shape[i] - 1))
+            b.x = int(np.clip(round(b.x), 1, shape[0] - 1))
+            b.y = int(np.clip(round(b.y), 1, shape[1] - 1))
+            b.z = int(np.clip(round(b.z), 1, shape[2] - 1))
 
-        self._rebuild_indices_by_class()
+        self.picks.rebuild_indices()  # the uid repair above changed uids after they were indexed
 
+    def _import_from_options(self, options):
+        """--particle_lists, and the embedded particle list with its embeddings, as given on the command line."""
         # --particle_lists: each path becomes its own brand-new set, copied
         # (written) into self.picksdir immediately, same as File > Read Box
         # Coord -- see import_particle_list. live=False since the boxes
@@ -903,47 +951,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     print(f"note: {note}")
             except (ValueError, OSError) as e:
                 print(f"warning: could not load {method} embeddings from {emb_path!r}: {e}")
-
-        if not any(cid not in categories.FIXED_CLASS_IDS for cid in self.sets):
-            self.new_set("particles_00")
-
-        self.currentset = sorted(cid for cid in self.sets if cid not in categories.FIXED_CLASS_IDS)[0]
-        if getattr(options, "label", None):
-            sid = [i for i in self.sets if self.sets[i] == options.label]
-            if sid:
-                self.currentset = sid[0]
-            else:
-                print("cannot find specified label")
-
-        # All classes are visible by default when the tomogram is opened,
-        # except the Recycle Bin -- rejected particles are more useful
-        # tucked out of the way until you deliberately want to review them.
-        self.sets_visible.update(self.sets.keys())
-        self.sets_visible.discard(categories.RECYCLE_BIN_ID)
-        self.wboxsize.setValue(self.get_boxsize())
-
-        if getattr(options, "clean", False):
-            self.tool_eraser_action.setChecked(True)
-            self._on_tool_changed(self.tool_eraser_action)  # setChecked() alone doesn't emit triggered
-
-        self._load_umap_selection()
-
-        for i in range(len(self.boxes)):
-            self.update_box(i)
-
-        self.update_all()
-        self.initialized = True
-
-        # Land on the first real set's own tab, not "All" -- grouping
-        # every particle across every class (ParticleGrid.
-        # sync_particles_grouped) is the single most expensive gallery
-        # view to build, and isn't what you want staring back at you the
-        # moment a large tomogram finishes opening anyway. Whatever's
-        # first in the gallery's own tab order (after Recycle Bin/
-        # Confirmed), matching what the tab bar actually shows.
-        first_normal = self.boxesviewer.normal_class_order()
-        if first_normal:
-            self.boxesviewer.activate_class_tab(first_normal[0])
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1001,10 +1008,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.wdepth_y.setValue(data.ny // 2)
         self.wdepth_x.setRange(0, data.nx - 1)
         self.wdepth_x.setValue(data.nx // 2)
-        self.boxes = []
-        self._indices_by_class = {}
+        self.picks.clear()
         self.curbox = -1
-        self._next_uid = 0
         self._undo_stack = []
         self._redo_stack = []
         self._selected_uids = set()
@@ -1074,7 +1079,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         thumb_grid._thumbnail_pixmap and ParticleGrid.set_levels), so it
         needs to be on the same intensity scale as them to actually look
         like a matching crop."""
-        proj = self.get_cube(box[0], box[1], box[2], centerslice=True, boxsz=self.get_boxsize(box[5]))
+        proj = self.get_cube(box.x, box.y, box.z, centerslice=True, boxsz=self.get_boxsize(box.classid))
         return proj[0]
 
     def _refresh_thumbnail(self, i):
@@ -1104,7 +1109,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if self.get_boxsize() == new_size:
                 return
             self.boxsize[self.currentset] = new_size
-            self._resize_boxes(lambda b: b[5] == self.currentset)
+            self._resize_boxes(lambda b: b.classid == self.currentset)
 
     def event_boxsize_allsets_toggled(self, checked):
         # Checking the box is itself an action ("make everything match the
@@ -1120,7 +1125,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             return
         for cid in changed_classes:
             self.boxsize[cid] = new_size
-        self._resize_boxes(lambda b: b[5] in changed_classes)
+        self._resize_boxes(lambda b: b.classid in changed_classes)
 
     def _resize_boxes(self, affects):
         self.initialized = False
@@ -1388,8 +1393,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             x = int(np.clip(round(x), 1, shape[0] - 1))
             y = int(np.clip(round(y), 1, shape[1] - 1))
             z = int(np.clip(round(z), 1, shape[2] - 1))
-            self.boxes.append([x, y, z, "manual", None, clsid, self._new_uid(), embedding_row])
-        self._indices_by_class[clsid] = {i: None for i in range(start, len(self.boxes))}
+            self.picks.add(Particle(x, y, z, clsid, self.picks.new_uid(), embedding_row))
 
         if live:
             self.initialized = False
@@ -1450,13 +1454,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         across every attached space, so a second method's file has to
         describe the same particles, in the same row order, as the first
         one did."""
-        embedded = [(b[7], b) for b in self.boxes if b[7] is not None]
+        embedded = [(b.embedding_row, b) for b in self.boxes if b.embedding_row is not None]
         if not embedded:
             return 0, None
         n = max(row for row, _ in embedded) + 1
         coords = np.full((n, 3), np.nan, dtype=np.float64)
         for row, box in embedded:
-            coords[row] = (box[0], box[1], box[2])
+            coords[row] = (box.x, box.y, box.z)
         return n, coords
 
     def attach_embeddings(self, method, embeddings_path, umap_path=None):
@@ -1652,7 +1656,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         determinant) is a per-particle constant, so it could never change
         the resulting *order* anyway, and it's undefined here besides --
         these embeddings' covariance is severely rank-deficient (see
-        _mahalanobis_distribution), so a real determinant is zero. Both
+        ranking.distribution), so a real determinant is zero. Both
         terms use the same space and leave_one_out setting.
 
         space: the name of one attached embedding space (see
@@ -1691,8 +1695,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
             raise ValueError(f"unrecognized embedding space {space!r} (have: {known})")
         array = entry["array"]
 
-        target_rows = self._mahalanobis_rows_of(target_classid)
-        target_total = sum(1 for b in self.boxes if b[5] == target_classid)
+        target_rows = self.picks.embedded_rows(target_classid)
+        target_total = sum(1 for b in self.boxes if b.classid == target_classid)
         skipped = target_total - len(target_rows)
 
         # Other tomograms of a session contribute the particles of their
@@ -1712,19 +1716,23 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     space, self.sets[negative_classid], others, dims)
                 notes += [f"{t}: {why} (far from)" for t, why in not_used]
 
-        positive, ref_size = self._mahalanobis_distances(
-            reference_classid, target_classid, target_rows, array, leave_one_out, extra=extra_pos)
+        positive, ref_size = ranking.scores(
+            target_rows, self.picks.embedded_rows(reference_classid), array,
+            leave_one_out and reference_classid == target_classid, extra_pos,
+            self.sets.get(reference_classid, reference_classid))
 
         if negative_classid is not None:
-            negative, _ = self._mahalanobis_distances(
-                negative_classid, target_classid, target_rows, array, leave_one_out, extra=extra_neg)
+            negative, _ = ranking.scores(
+                target_rows, self.picks.embedded_rows(negative_classid), array,
+                leave_one_out and negative_classid == target_classid, extra_neg,
+                self.sets.get(negative_classid, negative_classid))
             combined = {i: positive[i] - negative[i] for i in positive if i in negative}
             skipped += len(positive) - len(combined)
         else:
             combined = positive
 
         for i, d in combined.items():
-            self.boxes[i][4] = float(d)
+            self.boxes[i].score = float(d)
 
         self.save_json(only={target_classid})
         self.update_all(reslice=False, only_indices=[])
@@ -1733,82 +1741,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 "extra_reference_size": 0 if extra_pos is None else len(extra_pos),
                 "extra_negative_size": 0 if extra_neg is None else len(extra_neg),
                 "notes": notes}
-
-    def _mahalanobis_rows_of(self, classid):
-        return [(i, b[7]) for i, b in enumerate(self.boxes) if b[5] == classid and b[7] is not None]
-
-    def _mahalanobis_distances(self, reference_classid, target_classid, target_rows, array,
-                               leave_one_out, extra=None):
-        """{box_index: squared Mahalanobis distance} for every (index,
-        embedding_row) pair in target_rows, relative to reference_classid's
-        own embedding distribution in `array`. target_rows is computed
-        once by the caller (shared across both terms of a double-distance
-        call) so "does this particle have an embedding at all" is only
-        ever decided from the target set itself, not re-derived per
-        reference. Raises ValueError if the reference set has fewer than
-        2 embedded particles. Returns (distances, reference_size).
-
-        `extra`: an (M, D) array of further reference vectors -- the same
-        set's particles in other tomograms of a session -- pooled with this
-        tomogram's own. They are never among the particles being scored,
-        so leave-one-out only ever removes this tomogram's own."""
-        ref_rows = self._mahalanobis_rows_of(reference_classid)
-        n_extra = 0 if extra is None else len(extra)
-        if len(ref_rows) + n_extra < 2:
-            name = self.sets.get(reference_classid, reference_classid)
-            raise ValueError(
-                f"\"{name}\" has only {len(ref_rows) + n_extra} particle(s) with an embedding -- "
-                f"need at least 2 to build a distribution.")
-
-        def pooled(rows):
-            own = array[rows] if len(rows) else np.empty((0, array.shape[1]))
-            return own if extra is None else np.vstack([own, extra])
-
-        distances = {}
-        if leave_one_out and reference_classid == target_classid:
-            for i, row in target_rows:
-                others = [r for idx2, r in ref_rows if idx2 != i]
-                if len(others) + n_extra < 2:
-                    continue
-                mu, covinv = self._mahalanobis_distribution(pooled(others))
-                distances[i] = float(self._mahalanobis_scores(mu, covinv, array[[row]])[0])
-        else:
-            mu, covinv = self._mahalanobis_distribution(pooled([row for _, row in ref_rows]))
-            idx_list = [i for i, _ in target_rows]
-            rows_list = [row for _, row in target_rows]
-            d2 = self._mahalanobis_scores(mu, covinv, array[rows_list])
-            for i, d in zip(idx_list, d2):
-                distances[i] = float(d)
-        return distances, len(ref_rows) + n_extra
-
-    @staticmethod
-    def _mahalanobis_distribution(vectors):
-        """mean + pseudo-inverse covariance of a (N, D) reference array --
-        pinv rather than a true inverse since these embeddings are
-        typically rank-deficient well before N reaches D (verified
-        empirically against real data: covariance rank plateaus far
-        below D even with every available particle as reference), so a
-        true inverse would simply fail. Building the D x D covariance
-        directly (rather than the N x N Gram-matrix/dual approach) is
-        deliberate: at D=1024 it's sub-second regardless of N, and the
-        dual approach is only cheaper when N << D, which isn't the
-        regime this tool runs in."""
-        vectors = np.asarray(vectors, dtype=np.float64)
-        mu = vectors.mean(axis=0)
-        centered = vectors - mu
-        cov = (centered.T @ centered) / (len(vectors) - 1)
-        covinv = np.linalg.pinv(cov, hermitian=True)
-        return mu, covinv
-
-    @staticmethod
-    def _mahalanobis_scores(mu, covinv, targets):
-        """Squared Mahalanobis distance of each row in targets to (mu,
-        covinv). The matmul-based formulation, not einsum -- verified
-        the "obvious" einsum('ij,jk,ik->i', ...) version is over 20x
-        slower than this at realistic sizes, a difference real enough
-        to matter at a few thousand particles."""
-        centered = np.asarray(targets, dtype=np.float64) - mu
-        return ((centered @ covinv) * centered).sum(axis=1)
 
     def menu_file_read_boxloc(self):
         fsp, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1994,10 +1926,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         classids = self.sets.keys() if only is None else (cid for cid in only if cid in self.sets)
         for clsid in classids:
             name = self.sets[clsid]
-            records = [
-                {"x": b[0], "y": b[1], "z": b[2], "uid": b[6], "embedding_row": b[7], "score": b[4]}
-                for b in self.boxes if b[5] == clsid
-            ]
+            records = [b.record() for b in self.boxes if b.classid == clsid]
             metadata.save_class_records(self.picksdir, name, records)
         # A deleted particle must drop out of the selection file (its uid
         # stays in umap_selection, so undoing the delete brings it back).
@@ -2005,7 +1934,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # a particle between sets -- most edits -- leaves it as it is, and
         # rewriting a large selection on every click cost ~60 ms each.
         if self.umap_selection or self._umap_saved:
-            present = frozenset(b[6] for b in self.boxes if b[6] in self.umap_selection)
+            present = frozenset(b.uid for b in self.boxes if b.uid in self.umap_selection)
             if present != self._umap_saved:
                 self._save_umap_selection()
         if only is None:
@@ -2044,12 +1973,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         boxes = self.boxes
 
         pms = {
-            "z": (2, self.xyview, self.z_loc),
-            "y": (1, self.xzview, self.y_loc),
-            "x": (0, self.zyview, self.x_loc),
+            "z": (self.xyview, self.z_loc),
+            "y": (self.xzview, self.y_loc),
+            "x": (self.zyview, self.x_loc),
         }
-
-        lwi = 2 if self.boxshape == "circle" else 3  # index into geom for linewidth handled separately
 
         for v in (self.xyview, self.xzview, self.zyview):
             v.del_shape("xline")
@@ -2081,10 +2008,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         umap_selection = self.umap_selection
 
         for ax in axis:
-            ia, view, loc = pms[ax]
+            view, loc = pms[ax]
             for i, b in items:
-                bs = self.get_boxsize(b[5])
-                dst = abs(b[ia] - loc)
+                bs = self.get_boxsize(b.classid)
+                dst = abs(getattr(b, ax) - loc)
                 inplane = dst < bs // 2
                 rad = bs // 2 - dst
 
@@ -2095,12 +2022,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 if shp is None:
                     continue
                 if focus_active:
-                    class_visible = (b[6] in self._selected_uids
-                                      and self._focus_home_class.get(b[6], b[5]) == b[5])
+                    class_visible = (b.uid in self._selected_uids
+                                      and self._focus_home_class.get(b.uid, b.classid) == b.classid)
                 elif umap_solo:
-                    class_visible = b[6] in umap_selection
+                    class_visible = b.uid in umap_selection
                 else:
-                    class_visible = b[5] in self.sets_visible
+                    class_visible = b.classid in self.sets_visible
                 if inplane and class_visible:
                     shp.linewidth = 3 if self.curbox == i else 2
                     if self.options.mode == "3D":
@@ -2147,29 +2074,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 slider.setValue(value)
                 slider.blockSignals(False)
 
-    # -- per-class index bookkeeping (mouse_down's click hit-test) ----------
-    # self._indices_by_class lets that hit-test skip every particle in a
-    # currently-hidden class outright, rather than visiting each one just to
-    # reject it -- at the scale this app targets, a class sitting in the
-    # (hidden-by-default) Recycle Bin alone can be tens of thousands of
-    # particles. Kept incrementally in O(1) per particle for add/reassign
-    # (the common case), and rebuilt in one O(N) pass for del_box/
-    # _reinsert_boxes, which already shift every later particle's index
-    # anyway and so are no cheaper to patch up individually.
-    def _rebuild_indices_by_class(self):
-        d = {}
-        for i, b in enumerate(self.boxes):
-            d.setdefault(b[5], {})[i] = None
-        self._indices_by_class = d
-
-    def _index_class_add(self, i, classid):
-        self._indices_by_class.setdefault(classid, {})[i] = None
-
-    def _index_class_remove(self, i, classid):
-        bucket = self._indices_by_class.get(classid)
-        if bucket is not None:
-            bucket.pop(i, None)
-
     def _visible_candidate_indices(self):
         """Box indices belonging to a currently-visible set -- what
         mouse_down's click hit-test actually needs to scan, instead of
@@ -2181,7 +2085,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         about at all)."""
         candidates = []
         for cid in self.sets_visible:
-            candidates.extend(self._indices_by_class.get(cid, ()))
+            candidates.extend(self.picks.indices_of(cid))
         return candidates
 
     def _is_visible_particle(self, box):
@@ -2198,21 +2102,21 @@ class TomoBoxer(QtWidgets.QMainWindow):
         (plain-click hit-testing, the Eraser, and the Select tool's shape
         hit-test), so they can't disagree about what "on screen" means."""
         if self.focus_selected_action.isChecked():
-            return (box[6] in self._selected_uids
-                    and self._focus_home_class.get(box[6], box[5]) == box[5])
+            return (box.uid in self._selected_uids
+                    and self._focus_home_class.get(box.uid, box.classid) == box.classid)
         if self._umap_solo_active():
-            return box[6] in self.umap_selection
-        return box[5] in self.sets_visible
+            return box.uid in self.umap_selection
+        return box.classid in self.sets_visible
 
     def inside_box(self, n, x=-1, y=-1, z=-1):
         box = self.boxes[n]
         if not self._is_visible_particle(box):
             return False
-        bs = self.get_boxsize(box[5]) / 2
+        bs = self.get_boxsize(box.classid) / 2
         if self.options.mode == "3D":
-            rr = (x >= 0) * (box[0] - x) ** 2 + (y >= 0) * (box[1] - y) ** 2 + (z >= 0) * (box[2] - z) ** 2
+            rr = (x >= 0) * (box.x - x) ** 2 + (y >= 0) * (box.y - y) ** 2 + (z >= 0) * (box.z - z) ** 2
         else:
-            rr = (x >= 0) * (box[0] - x) ** 2 + (y >= 0) * (box[1] - y) ** 2 + (z >= 0) * (box[2] != z) * (1e3 * bs ** 2)
+            rr = (x >= 0) * (box.x - x) ** 2 + (y >= 0) * (box.y - y) ** 2 + (z >= 0) * (box.z != z) * (1e3 * bs ** 2)
         return rr <= bs ** 2
 
     def _clamp_to_volume(self, x, y, z):
@@ -2232,14 +2136,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
         delids = sorted({i for i in delids if 0 <= i < len(self.boxes)})
         if not delids:
             return
-        affected_classes = {self.boxes[i][5] for i in delids}
+        affected_classes = {self.boxes[i].classid for i in delids}
         if record_undo:
-            removed = [(i, list(self.boxes[i]), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in delids]
+            removed = [(i, self.boxes[i], self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in delids]
             self._push_undo({"type": "delete", "removed": removed})
-        kpids = [i for i in range(len(self.boxes)) if i not in delids]
-        self.boxes = [self.boxes[i] for i in kpids]
+        kpids = self.picks.remove(delids)
         self.boxesimgs = [self.boxesimgs[i] for i in kpids if i < len(self.boxesimgs)]
-        self._rebuild_indices_by_class()  # removal shifts every later index
         for view in (self.xyview, self.xzview, self.zyview):
             view.remap_shape_keys(kpids)
         self.curbox = -1
@@ -2260,8 +2162,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if not isinstance(indices, list):
             indices = [indices]
         idx = sorted({i for i in indices if 0 <= i < len(self.boxes)})
-        already_binned = [i for i in idx if self.boxes[i][5] == categories.RECYCLE_BIN_ID]
-        rest = [i for i in idx if self.boxes[i][5] != categories.RECYCLE_BIN_ID]
+        already_binned = [i for i in idx if self.boxes[i].classid == categories.RECYCLE_BIN_ID]
+        rest = [i for i in idx if self.boxes[i].classid != categories.RECYCLE_BIN_ID]
         if rest:
             self._reassign_boxes(rest, categories.RECYCLE_BIN_ID)
         if already_binned:
@@ -2275,21 +2177,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if not isinstance(indices, list):
             indices = [indices]
         idx = sorted({i for i in indices if 0 <= i < len(self.boxes)})
-        changed = [(i, self.boxes[i][5]) for i in idx if self.boxes[i][5] != target_id]
+        changed = self.picks.reassign(idx, target_id)
         if not changed:
             return
-        for i, prev_class in changed:
-            self.boxes[i][5] = target_id
-            self._index_class_remove(i, prev_class)
-            self._index_class_add(i, target_id)
-            # A Mahalanobis score is only meaningful relative to whichever
-            # set it was computed against -- moving a particle to a
-            # different class makes the old score stale, so it resets
-            # rather than silently carrying over a number that no longer
-            # means what it looks like it means. It shows up first (not
-            # last) in "Sort by Rank" until recomputed -- see
-            # ParticleGrid.apply_score_order.
-            self.boxes[i][4] = None
+        for i, _prev_class in changed:
             self.update_box_shape(i, self.boxes[i])
             self._refresh_thumbnail(i)
         self._push_undo({"type": "reassign", "changes": changed, "new_class": target_id})
@@ -2312,29 +2203,14 @@ class TomoBoxer(QtWidgets.QMainWindow):
         directory (see metadata.archive_recycle_bin), which discover_classes
         never loads back as a set. Still undo-able with Ctrl+Z right
         after, same as any other delete, independent of that backup."""
-        delids = [i for i, b in enumerate(self.boxes) if b[5] == categories.RECYCLE_BIN_ID]
+        delids = [i for i, b in enumerate(self.boxes) if b.classid == categories.RECYCLE_BIN_ID]
         if not delids:
             return
-        records = [
-            {"x": self.boxes[i][0], "y": self.boxes[i][1], "z": self.boxes[i][2],
-             "uid": self.boxes[i][6], "embedding_row": self.boxes[i][7], "score": self.boxes[i][4]}
-            for i in delids
-        ]
+        records = [self.boxes[i].record() for i in delids]
         metadata.archive_recycle_bin(self.picksdir, records)
         self.del_box(delids)
 
     # -- particle uids / undo -----------------------------------------------
-    def _new_uid(self):
-        uid = self._next_uid
-        self._next_uid += 1
-        return uid
-
-    def _index_for_uid(self, uid):
-        for i, b in enumerate(self.boxes):
-            if b[6] == uid:
-                return i
-        return None
-
     def _push_undo(self, action):
         self._undo_stack.append(action)
         # Any genuinely new action invalidates whatever "future" redo would
@@ -2420,16 +2296,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._refresh_undo_redo_actions()
 
     def _undo_add(self, action):
-        idx = self._index_for_uid(action["uid"])
+        idx = self.picks.index_for_uid(action["uid"])
         if idx is None:
             return
-        box_copy = list(self.boxes[idx])
+        box = self.boxes[idx]
         img = self.boxesimgs[idx] if idx < len(self.boxesimgs) else None
         self.del_box(idx, record_undo=False)
         # Redoing an "add" is exactly "undoing a delete" of this one
         # particle -- reuse that same (index, box, image) shape so
         # _redo_add can just replay it with _undo_delete's own logic.
-        self._redo_stack.append({"type": "add", "uid": action["uid"], "removed": [(idx, box_copy, img)]})
+        self._redo_stack.append({"type": "add", "uid": action["uid"], "removed": [(idx, box, img)]})
 
     def _redo_add(self, action):
         self._reinsert_boxes(action["removed"])
@@ -2440,27 +2316,27 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # Redo re-deletes the same particles, resolved by uid at redo time
         # rather than by the original index, so it stays correct even if
         # something else happens to shift positions in between.
-        self._redo_stack.append({"type": "delete", "uids": [box_copy[6] for _, box_copy, _ in action["removed"]]})
+        self._redo_stack.append({"type": "delete", "uids": [box.uid for _, box, _ in action["removed"]]})
 
     def _redo_delete(self, action):
-        idx = sorted(i for i in (self._index_for_uid(u) for u in action["uids"]) if i is not None)
+        idx = sorted(i for i in (self.picks.index_for_uid(u) for u in action["uids"]) if i is not None)
         if not idx:
             return
-        removed = [(i, list(self.boxes[i]), self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in idx]
+        removed = [(i, self.boxes[i], self.boxesimgs[i] if i < len(self.boxesimgs) else None) for i in idx]
         self.del_box(idx, record_undo=False)
         self._undo_stack.append({"type": "delete", "removed": removed})
 
     def _reinsert_boxes(self, removed):
         """Shared by _undo_delete and _redo_add: reinsert a (orig_index,
-        box_copy, img) list (ascending orig_index) back into self.boxes at
+        box, img) list (ascending orig_index) back into self.boxes at
         those same positions, and rebuild every shape from scratch, since
         insertion shifts every later box's index."""
-        affected_classes = {box_copy[5] for _, box_copy, _ in removed}
-        for orig_index, box_copy, img in removed:
+        affected_classes = {box.classid for _, box, _ in removed}
+        for orig_index, box, img in removed:
             idx = min(orig_index, len(self.boxes))
-            self.boxes.insert(idx, list(box_copy))
+            self.picks.insert(idx, box)
             self.boxesimgs.insert(idx, img)
-        self._rebuild_indices_by_class()  # insertion shifts every later index
+        self.picks.rebuild_indices()  # insertion shifts every later index
         for i in range(len(self.boxes)):
             self.update_box_shape(i, self.boxes[i])
         if self.initialized:
@@ -2472,16 +2348,16 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # fired for unrelated reasons like a set's visibility being
         # toggled back on, since that removes and re-adds gallery items
         # the same way a real delete/restore does).
-        self.boxesviewer.replace_selection([box_copy[6] for _, box_copy, _ in removed])
+        self.boxesviewer.replace_selection([box.uid for _, box, _ in removed])
 
     def _undo_reassign(self, action):
-        uids = [self.boxes[i][6] for i, _ in action["changes"] if 0 <= i < len(self.boxes)]
+        uids = [self.boxes[i].uid for i, _ in action["changes"] if 0 <= i < len(self.boxes)]
         self._apply_reassign(action["changes"])
         self._redo_stack.append({"type": "reassign", "uids": uids, "new_class": action["new_class"]})
 
     def _redo_reassign(self, action):
-        idx = [i for i in (self._index_for_uid(u) for u in action["uids"]) if i is not None]
-        changes = [(i, self.boxes[i][5]) for i in idx if self.boxes[i][5] != action["new_class"]]
+        idx = [i for i in (self.picks.index_for_uid(u) for u in action["uids"]) if i is not None]
+        changes = [(i, self.boxes[i].classid) for i in idx if self.boxes[i].classid != action["new_class"]]
         if not changes:
             return
         self._apply_reassign(changes, target_id=action["new_class"])
@@ -2494,18 +2370,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         affected_classes = {prev for _, prev in changes}
         for i, prev_class in changes:
             if 0 <= i < len(self.boxes):
-                # The class to remove the index from is whatever it
-                # currently, actually is right now -- not necessarily
-                # prev_class: for an undo, prev_class is what the particle
-                # should revert *to*, while its current class (what this
-                # is about to overwrite) is the *other* end of the
-                # original reassignment.
-                old_class = self.boxes[i][5]
-                new_class = target_id if target_id is not None else prev_class
-                self.boxes[i][5] = new_class
-                self._index_class_remove(i, old_class)
-                self._index_class_add(i, new_class)
-                self.boxes[i][4] = None  # stale relative to the new class -- see _reassign_boxes
+                # for an undo, prev_class is what the particle reverts *to*
+                self.picks.set_class(i, target_id if target_id is not None else prev_class)
                 self.update_box_shape(i, self.boxes[i])
                 self._refresh_thumbnail(i)
         if target_id is not None:
@@ -2515,25 +2381,25 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.update_all(reslice=False, only_indices=[i for i, _ in changes])
 
     def update_box_shape(self, n, box):
-        bs2 = self.get_boxsize(box[5]) // 2
+        bs2 = self.get_boxsize(box.classid) // 2
         lw = 3 if n == self.curbox else 2
         # Gallery selection (yellow, same as the gallery's own highlight)
         # takes priority over the class color -- but only for a particle
         # actually selected in the list, never just because it's the one
         # currently being picked/dragged (curbox/dragging never touch
         # _selected_uids).
-        if box[6] in self._selected_uids:
+        if box.uid in self._selected_uids:
             color = categories.SELECTED_COLOR.getRgbF()[:3]
         else:
-            color = categories.class_color(box[5]).getRgbF()[:3]
+            color = categories.class_color(box.classid).getRgbF()[:3]
         if self.options.mode == "3D":
-            self.xyview.add_shape(n, Shape("circle", color, [box[0], box[1], bs2], lw))
-            self.xzview.add_shape(n, Shape("circle", color, [box[0], box[2], bs2], lw))
-            self.zyview.add_shape(n, Shape("circle", color, [box[2], box[1], bs2], lw))
+            self.xyview.add_shape(n, Shape("circle", color, [box.x, box.y, bs2], lw))
+            self.xzview.add_shape(n, Shape("circle", color, [box.x, box.z, bs2], lw))
+            self.zyview.add_shape(n, Shape("circle", color, [box.z, box.y, bs2], lw))
         else:
-            self.xyview.add_shape(n, Shape("rect", color, [box[0] - bs2, box[1] - bs2, box[0] + bs2, box[1] + bs2], 2))
-            self.xzview.add_shape(n, Shape("rect", color, [box[0] - bs2, box[2] - 1, box[0] + bs2, box[2] + 1], 2))
-            self.zyview.add_shape(n, Shape("rect", color, [box[2] - 1, box[1] - bs2, box[2] + 1, box[1] + bs2], 2))
+            self.xyview.add_shape(n, Shape("rect", color, [box.x - bs2, box.y - bs2, box.x + bs2, box.y + bs2], 2))
+            self.xzview.add_shape(n, Shape("rect", color, [box.x - bs2, box.z - 1, box.x + bs2, box.z + 1], 2))
+            self.zyview.add_shape(n, Shape("rect", color, [box.z - 1, box.y - bs2, box.z + 1, box.y + bs2], 2))
 
     def set_selected_uids(self, uids):
         """Mirror the gallery's multi-selection as a yellow outline on the
@@ -2551,7 +2417,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # reassignment-free round trip first.
         if self.focus_selected_action.isChecked() and added_uids:
             self._focus_home_class.update(
-                (b[6], b[5]) for b in self.boxes if b[6] in added_uids)
+                (b.uid, b.classid) for b in self.boxes if b.uid in added_uids)
         has_selection = bool(self._selected_uids)
         self.confirm_selected_action.setEnabled(has_selection)
         self.recycle_selected_action.setEnabled(has_selection)
@@ -2563,7 +2429,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.selection_status_label.setText(f"{n} particle(s) selected" if n else "")
         if not changed_uids:
             return
-        changed_indices = [i for i, b in enumerate(self.boxes) if b[6] in changed_uids]
+        changed_indices = [i for i, b in enumerate(self.boxes) if b.uid in changed_uids]
         for i in changed_indices:
             self.update_box_shape(i, self.boxes[i])
         self.update_all(reslice=False, only_indices=changed_indices)
@@ -2585,7 +2451,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         particles whose selection actually changed can have a different
         outcome."""
         if checked:
-            self._focus_home_class = {b[6]: b[5] for b in self.boxes if b[6] in self._selected_uids}
+            self._focus_home_class = {b.uid: b.classid for b in self.boxes if b.uid in self._selected_uids}
         self.update_all(reslice=False, only_indices=None)
 
     def _update_focus_pulse(self, checked):
@@ -2644,7 +2510,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 # class's pick file too (a full self.boxes scan per class)
                 # was pure waste, at scale enough to make each pick or
                 # drag-release synchronously stall on disk I/O.
-                self.save_json(only={box[5]})
+                self.save_json(only={box.classid})
                 # The gallery thumbnail only needs refreshing when the
                 # particle's own snapshot image changes (just above), which
                 # only happens here in the non-quiet path -- doing this on
@@ -2664,10 +2530,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
         # the moment it was hidden from the tomogram views, then rebuild
         # every one of its thumbnails from scratch when shown again.
         self.boxids = list(range(len(self.boxesimgs)))
-        triples = [(self.boxes[i][6], self.boxesimgs[i], self.boxes[i][5]) for i in self.boxids]
+        triples = [(self.boxes[i].uid, self.boxesimgs[i], self.boxes[i].classid) for i in self.boxids]
         # (score, has_embedding) per uid -- feeds the gallery's "Sort by
         # Score" display (see ParticleGrid.apply_score_order).
-        scores = {self.boxes[i][6]: (self.boxes[i][4], self.boxes[i][7] is not None) for i in self.boxids}
+        scores = {self.boxes[i].uid: (self.boxes[i].score, self.boxes[i].embedding_row is not None) for i in self.boxids}
         self.boxesviewer.rebuild_tabs(self.sets)
         self.boxesviewer.sync_particles(triples, scores)
         if self.umap_window is not None and self.umap_window.isVisible():
@@ -2690,7 +2556,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxesviewer.force_refresh()
 
     def img_selected(self, event, lc):
-        lci = self._index_for_uid(lc[0])
+        lci = self.picks.index_for_uid(lc[0])
         if lci is None:
             return
         # Quick gestures in the particle list: Shift+click sends this one
@@ -2709,7 +2575,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 # together. active_uids_from asks the grid actually being
                 # looked at for its own current visual order instead.
                 rest_uids = set(self.boxesviewer.active_uids_from(lc[0]))
-                idx = [i for i, b in enumerate(self.boxes) if b[6] in rest_uids]
+                idx = [i for i, b in enumerate(self.boxes) if b.uid in rest_uids]
                 self.send_to_recycle_bin(idx)
             else:
                 self.send_to_recycle_bin(lci)
@@ -2718,7 +2584,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         else:
             self.curbox = lci
             box = self.boxes[lci]
-            self.x_loc, self.y_loc, self.z_loc = box[0], box[1], box[2]
+            self.x_loc, self.y_loc, self.z_loc = box.x, box.y, box.z
             self.scroll_to(self.x_loc, self.y_loc, self.z_loc)
             self.update_sliceview()
 
@@ -2742,7 +2608,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for i, b in enumerate(self.boxes):
                 if not self._is_visible_particle(b):
                     continue
-                if (x >= 0) * (b[0] - x) ** 2 + (y >= 0) * (b[1] - y) ** 2 + (z >= 0) * (b[2] - z) ** 2 < rad ** 2:
+                if (x >= 0) * (b.x - x) ** 2 + (y >= 0) * (b.y - y) ** 2 + (z >= 0) * (b.z - z) ** 2 < rad ** 2:
                     delids.append(i)
         else:
             a1, a2 = _VIEW_PLANE_AXES[axis]
@@ -2753,10 +2619,10 @@ class TomoBoxer(QtWidgets.QMainWindow):
             for i, b in enumerate(self.boxes):
                 if not self._is_visible_particle(b):
                     continue
-                bs = self.get_boxsize(b[5])
-                if abs(b[depth_idx] - depth_click) >= bs / 2:
+                bs = self.get_boxsize(b.classid)
+                if abs(getattr(b, axis) - depth_click) >= bs / 2:
                     continue
-                if (b[i1] - p1_click) ** 2 + (b[i2] - p2_click) ** 2 < rad ** 2:
+                if (getattr(b, a1) - p1_click) ** 2 + (getattr(b, a2) - p2_click) ** 2 < rad ** 2:
                     delids.append(i)
         self.send_to_recycle_bin(delids)
 
@@ -2769,17 +2635,18 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self.zyview.scroll_to(z, y, True)
 
     # -- mouse click -----------------------------------------------------------
-    def xy_down(self, event):
-        x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, x, y, self.z_loc, "z")
+    def _view_point(self, axis, event):
+        """The volume coordinate under the mouse in the view that looks along
+        `axis`: its two in-plane coordinates from the mouse, the third from
+        the slice currently shown."""
+        a1, a2 = _VIEW_PLANE_AXES[axis]
+        p1, p2 = self._views[axis].scr_to_img((event.position().x(), event.position().y()))
+        at = {"x": self.x_loc, "y": self.y_loc, "z": self.z_loc}
+        at[a1], at[a2] = p1, p2
+        return at["x"], at["y"], at["z"]
 
-    def xz_down(self, event):
-        x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, x, self.y_loc, z, "y")
-
-    def zy_down(self, event):
-        z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-        self.mouse_down(event, self.x_loc, y, z, "x")
+    def _view_down(self, axis, event):
+        self.mouse_down(event, *self._view_point(axis, event), axis)
 
     def mouse_down(self, event, x, y, z, axis):
         if self.tool_select_action.isChecked():
@@ -2809,7 +2676,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     # Toggle-select, exactly like Ctrl+click in the gallery --
                     # writes into the same selection list the gallery owns,
                     # so both windows and the Selection panel always agree.
-                    self.boxesviewer.toggle_uid(self.boxes[i][6])
+                    self.boxesviewer.toggle_uid(self.boxes[i].uid)
                 else:
                     # A plain click on some other particle is "start doing
                     # something else" -- clear whatever multi-selection was
@@ -2819,7 +2686,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     # it's the sole selected particle and the user is about
                     # to drag it), leave the selection alone -- dragging a
                     # selected particle shouldn't unselect it.
-                    if self.boxes[i][6] not in self._selected_uids:
+                    if self.boxes[i].uid not in self._selected_uids:
                         self.boxesviewer.clear_selection()
                     self.dragging = i
                     self.curbox = i
@@ -2839,12 +2706,12 @@ class TomoBoxer(QtWidgets.QMainWindow):
                     # as scroll_to's own axis exclusion.
                     box = self.boxes[i]
                     if axis != "x":
-                        self.x_loc = box[0]
+                        self.x_loc = box.x
                     if axis != "y":
-                        self.y_loc = box[1]
+                        self.y_loc = box.y
                     if axis != "z":
-                        self.z_loc = box[2]
-                    self.scroll_to(box[0], box[1], box[2], axis)
+                        self.z_loc = box.z
+                    self.scroll_to(box.x, box.y, box.z, axis)
                     other_axes = tuple(a for a in ("x", "y", "z") if a != axis)
                     self.update_sliceview(axis=other_axes)
                 break
@@ -2854,23 +2721,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 self.x_loc, self.y_loc, self.z_loc = x, y, z
                 self.scroll_to(x, y, z, axis)
                 self.curbox = len(self.boxes)
-                uid = self._new_uid()
-                self.boxes.append([x, y, z, "manual", None, self.currentset, uid, None])
-                self._index_class_add(len(self.boxes) - 1, self.currentset)
+                uid = self.picks.new_uid()
+                self.picks.add(Particle(x, y, z, self.currentset, uid))
                 self._push_undo({"type": "add", "uid": uid})
                 self.update_box(len(self.boxes) - 1)
                 self.dragging = len(self.boxes) - 1
 
     # -- eraser preview -----------------------------------------------------------
-    def xy_move(self, event):
-        self.mouse_move(event, self.xyview)
-
-    def xz_move(self, event):
-        self.mouse_move(event, self.xzview)
-
-    def zy_move(self, event):
-        self.mouse_move(event, self.zyview)
-
     def mouse_move(self, event, view):
         if self.tool_eraser_action.isChecked():
             self.xyview.eraser_shape = self.xzview.eraser_shape = self.zyview.eraser_shape = None
@@ -2885,7 +2742,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if self.dragging < 0 or min(x, y, z) < 0:
             return
         self.x_loc, self.y_loc, self.z_loc = x, y, z
-        self.boxes[self.dragging][:3] = [x, y, z]
+        box = self.boxes[self.dragging]
+        box.x, box.y, box.z = x, y, z
         # Whichever view is being dragged in passes its own loc back
         # unchanged (see the three callers below), so that view's own
         # background slice can't have changed -- only its box overlay has.
@@ -2895,29 +2753,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         axis = tuple(a for a in ("x", "y", "z") if a != skip_axis)
         self.update_box(self.dragging, True, axis=axis)
 
-    def xy_drag(self, event):
+    def _view_drag(self, axis, event):
         if self.dragging >= 0:
-            x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, y, self.z_loc, skip_axis="z")
+            self.mouse_drag(*self._view_point(axis, event), skip_axis=axis)
         elif self._select_drawing is not None:
-            x, y = self.xyview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.xyview, "z", x, y, self.z_loc)
-
-    def xz_drag(self, event):
-        if self.dragging >= 0:
-            x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(x, self.y_loc, z, skip_axis="y")
-        elif self._select_drawing is not None:
-            x, z = self.xzview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.xzview, "y", x, self.y_loc, z)
-
-    def zy_drag(self, event):
-        if self.dragging >= 0:
-            z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-            self.mouse_drag(self.x_loc, y, z, skip_axis="x")
-        elif self._select_drawing is not None:
-            z, y = self.zyview.scr_to_img((event.position().x(), event.position().y()))
-            self._select_mouse_drag(self.zyview, "x", self.x_loc, y, z)
+            self._select_mouse_drag(self._views[axis], axis, *self._view_point(axis, event))
 
     def mouse_up(self, event):
         if self.dragging >= 0:
@@ -2926,15 +2766,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
             return
         if self._select_drawing is not None:
             self._select_mouse_up()
-
-    def xy_doubleclick(self, event):
-        self._select_doubleclick(self.xyview)
-
-    def xz_doubleclick(self, event):
-        self._select_doubleclick(self.xzview)
-
-    def zy_doubleclick(self, event):
-        self._select_doubleclick(self.zyview)
 
     def _select_doubleclick(self, view):
         drawing = self._select_drawing
@@ -3102,11 +2933,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
             if not self._is_visible_particle(b):
                 continue
             if not is_3d:
-                bs = self.get_boxsize(b[5])
-                if abs(b[_AXIS_INDEX[axis]] - current_depth) >= bs / 2:
+                bs = self.get_boxsize(b.classid)
+                if abs(getattr(b, axis) - current_depth) >= bs / 2:
                     continue
-            if contains(b[i1], b[i2]):
-                uids.append(b[6])
+            if contains(getattr(b, a1), getattr(b, a2)):
+                uids.append(b.uid)
         return uids
 
     # -- keep the same origin across the 3 views ---------------------------------
@@ -3144,7 +2975,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     # -- sets / classes -----------------------------------------------------------
     def set_current_set(self, name):
-        self.currentset = parse_setname(name)
+        self.currentset = categories.parse_setname(name)
         self.wboxsize.setValue(self.get_boxsize())
         self._sync_solo_visibility()
         self.update_all()
@@ -3202,22 +3033,22 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.update_all()
 
     def hide_set(self, name):
-        name = parse_setname(name)
+        name = categories.parse_setname(name)
         self.sets_visible.discard(name)
         if self.initialized:
             self.update_all()
 
     def show_set(self, name):
-        name = parse_setname(name)
+        name = categories.parse_setname(name)
         self.sets_visible.add(name)
         if self.initialized:
             self.update_all()
 
     def delete_set(self, name):
-        name = parse_setname(name)
+        name = categories.parse_setname(name)
         if name in categories.FIXED_CLASS_IDS:
             return  # Recycle Bin / Confirmed are fixed and can't be deleted
-        delids = [i for i, b in enumerate(self.boxes) if b[5] == int(name)]
+        delids = [i for i, b in enumerate(self.boxes) if b.classid == int(name)]
         if delids:
             # Move to the Recycle Bin rather than destroying them outright --
             # deleting a whole set shouldn't be more permanent than deleting
@@ -3228,9 +3059,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
             # exists in self.sets.
             self._apply_reassign([(i, name) for i in delids], target_id=categories.RECYCLE_BIN_ID)
         self.sets_visible.discard(name)
-        classname = self.sets.pop(name, None)
-        self.boxsize.pop(name, None)
-        self._indices_by_class.pop(name, None)  # already emptied by the reassign above
+        classname = self.picks.delete_set(name)
         if classname is not None:
             metadata.delete_class_file(self.picksdir, classname)
         if self.currentset == name:
@@ -3284,7 +3113,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.update_all(reslice=False)
 
     def rename_set(self, oldname, newname):
-        name = parse_setname(oldname)
+        name = categories.parse_setname(oldname)
         if name in categories.FIXED_CLASS_IDS:
             return  # Recycle Bin / Confirmed are fixed and can't be renamed
         if name in self.sets:
@@ -3295,20 +3124,17 @@ class TomoBoxer(QtWidgets.QMainWindow):
             self._refresh_move_to_combo()
 
     def new_set(self, name):
-        i = 0
-        while i in self.sets:
-            i += 1
-        self.sets[i] = name
-        self.sets_visible.add(i)
         # With "Apply to All Sets" on, every set is kept at the same box
         # size, so a brand-new one should join at that size too rather than
         # reverting to the generic default and breaking that invariant.
         # (hasattr guard: new_set() can be called during __init__'s initial
         # bootstrap, before self.currentset exists yet.)
         if self.wboxsize_allsets.isChecked() and hasattr(self, "currentset"):
-            self.boxsize[i] = self.get_boxsize()
+            boxsize = self.get_boxsize()
         else:
-            self.boxsize[i] = metadata.DEFAULT_BOXSIZE
+            boxsize = metadata.DEFAULT_BOXSIZE
+        i = self.picks.new_set(name, boxsize)
+        self.sets_visible.add(i)
         # Otherwise a set created while a selection was already active (so
         # set_selected_uids' own refresh already fired earlier and won't
         # fire again) never showed up in "Move Selected to" until you
@@ -3318,7 +3144,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     # -- multi-selection actions (used by the Options window's Selection panel) --
     def delete_particles_by_uid(self, uids):
-        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        idx = [i for i, b in enumerate(self.boxes) if b.uid in uids]
         self.send_to_recycle_bin(idx)
         # The selection has been acted on and is "done" -- carrying it
         # forward would just leave these particles looking selected
@@ -3327,7 +3153,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.boxesviewer.clear_selection()
 
     def confirm_particles_by_uid(self, uids):
-        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        idx = [i for i, b in enumerate(self.boxes) if b.uid in uids]
         self.send_to_confirmed(idx)
         self.boxesviewer.clear_selection()
 
@@ -3342,15 +3168,11 @@ class TomoBoxer(QtWidgets.QMainWindow):
         if target_id is None:
             target_id = self.new_set(target_classname)
 
-        idx = [i for i, b in enumerate(self.boxes) if b[6] in uids]
+        idx = [i for i, b in enumerate(self.boxes) if b.uid in uids]
         if not idx:
             return
-        prev = [(i, self.boxes[i][5]) for i in idx]
-        for i, prev_class in prev:
-            self.boxes[i][5] = target_id
-            self._index_class_remove(i, prev_class)
-            self._index_class_add(i, target_id)
-            self.boxes[i][4] = None  # stale relative to the new class -- see _reassign_boxes
+        prev = [(i, self.picks.set_class(i, target_id)) for i in idx]
+        for i, _ in prev:
             self.update_box_shape(i, self.boxes[i])
             self._refresh_thumbnail(i)
         self._push_undo({"type": "reassign", "changes": prev, "new_class": target_id})
@@ -3511,7 +3333,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self.save_picks(only=only)
 
     def closeEvent(self, event):
-        if self._closing:
+        if self.closing:
             event.accept()
             return
         if not self._confirm_close():
@@ -3527,7 +3349,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
         return reply == QtWidgets.QMessageBox.Yes
 
     def _do_close_all(self):
-        self._closing = True
+        self.closing = True
         if not self._switching:
             print("Exiting")
         self.save_picks()
@@ -3548,7 +3370,6 @@ class TomoBoxer(QtWidgets.QMainWindow):
 
     # -- UMAP map and its selection ----------------------------------------------
     def open_umap_window(self):
-        from .umap_view import UmapWindow
         if self.umap_window is None:
             self.umap_window = UmapWindow(self)
         self.umap_window.show()
@@ -3590,8 +3411,7 @@ class TomoBoxer(QtWidgets.QMainWindow):
                 and viewer.is_umap_selection_active())
 
     def _save_umap_selection(self):
-        records = [{"x": b[0], "y": b[1], "z": b[2], "uid": b[6], "embedding_row": b[7], "score": b[4]}
-                   for b in self.boxes if b[6] in self.umap_selection]
+        records = [b.record() for b in self.boxes if b.uid in self.umap_selection]
         metadata.save_umap_selection(self.picksdir, records)
         self._umap_saved = frozenset(r["uid"] for r in records)
 
@@ -3603,8 +3423,8 @@ class TomoBoxer(QtWidgets.QMainWindow):
         records = metadata.load_umap_selection(self.picksdir)
         if not records:
             return
-        uids = {b[6] for b in self.boxes}
-        by_row = {b[7]: b[6] for b in self.boxes if b[7] is not None}
+        uids = {b.uid for b in self.boxes}
+        by_row = {b.embedding_row: b.uid for b in self.boxes if b.embedding_row is not None}
         selection = set()
         for r in records:
             if r["uid"] is not None and r["uid"] in uids:
@@ -3661,13 +3481,13 @@ class TomoBoxer(QtWidgets.QMainWindow):
         self._volume_slots = {"primary": None, "companion": None}
         self.embedding_spaces = {}
         self.boxesimgs = []
-        self.boxes = []
+        self.picks.clear()
 
     def request_close_all(self):
         """Called by the particle list / options windows when the user
         tries to close them directly: confirms once, then closes every
         window in the app, including this one."""
-        if self._closing:
+        if self.closing:
             return
         if not self._confirm_close():
             return

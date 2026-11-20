@@ -4,6 +4,29 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+
+def make_action(parent, text, tip=None, triggered=None, *, shortcut=None, checkable=False, toggled=None):
+    """A QAction with its tooltip, handler and shortcut in one call. A
+    shortcut is application-wide -- every one in the app must work
+    whichever window has focus; a list sets several (Redo has two)."""
+    a = QtGui.QAction(text, parent)
+    if tip is not None:
+        a.setToolTip(tip)
+    if checkable:
+        a.setCheckable(True)
+    if shortcut is not None:
+        if isinstance(shortcut, list):
+            a.setShortcuts(shortcut)
+        else:
+            a.setShortcut(shortcut)
+        a.setShortcutContext(QtCore.Qt.ApplicationShortcut)
+    if triggered is not None:
+        a.triggered.connect(triggered)
+    if toggled is not None:
+        a.toggled.connect(toggled)
+    return a
+
+
 # A QAction-based toolbar button (QToolButton, auto-raise) is flat and
 # borderless until hovered by default -- that's the standard toolbar
 # convention, but next to a real QPushButton like AutoContrast it can read

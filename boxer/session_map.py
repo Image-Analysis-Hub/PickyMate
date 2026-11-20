@@ -3,8 +3,8 @@
 Each tomogram's own UMAP (Task 2's map) is fitted on that tomogram alone,
 so its coordinates mean nothing next to another tomogram's. This fits a
 single UMAP on the full embeddings of all of them stacked together --
-TomoTwin's 32 dimensions as they are, CryoSIAM's 1024 reduced to 50 by PCA
-first (on EMPIAR-10988 those 50 keep all of its variance: its embeddings
+TomoTwin's 32 dimensions as they are, CryoSIAM's 1024 reduced by PCA first,
+to 50 unless the user sets another number or 0 for no PCA (on EMPIAR-10988 those 50 keep all of its variance: its embeddings
 have numerical rank ~150 and 10 components already hold 99.99%) -- so a
 position on the map means the same thing whichever tomogram a particle
 came from, and one lasso can select across all of them.
@@ -35,14 +35,16 @@ import time
 import numpy as np
 from PySide6 import QtCore
 
+from .umap_worker import pca
+
 MAPPABLE = {"tomotwin": "TomoTwin full", "cryosiam": "CryoSIAM full"}
 CACHE_DIRNAME = ".pickymate_session"
-PCA_DIMS = 50
+PCA_DIMS = 50   # default; the map window's "PCA dims" box overrides it per computation
 UMAP_PARAMS = {"neighbors": 15, "min_dist": 0.1}
 WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "umap_worker.py")
 MISSING_UMAP = ("umap-learn is not installed in this environment, and the session map needs "
-                "it. Install PickyMate's requirements (pip install -r requirements.txt), or run "
-                "PickyMate from its conda environment (conda env create -f environment.yml).")
+                "it: pip install umap-learn, or reinstall PickyMate with its dependencies "
+                "(pip install -e . from the clone).")
 
 
 class SessionMap:
@@ -155,10 +157,12 @@ class SessionMapJob(QtCore.QObject):
     def running(self):
         return self.space is not None
 
-    def start(self, space):
+    def start(self, space, pca_dims=PCA_DIMS):
+        """pca_dims: reduce embeddings with more dimensions than this by PCA first; 0 = no PCA."""
         if self.running():
             return
         self.space = space
+        self.pca_dims = pca_dims
         self._cancelled = False
         self._error = ""
         self.status.emit("Reading the embeddings...")
@@ -191,11 +195,10 @@ class SessionMapJob(QtCore.QObject):
                 return
             X = np.vstack(blocks)
             params = dict(UMAP_PARAMS, input_dims=int(X.shape[1]))
-            if X.shape[1] > PCA_DIMS:
-                self.status.emit(f"Reducing {X.shape[1]} dimensions to {PCA_DIMS} by PCA...")
-                from .umap_worker import pca
-                X, kept = pca(X, PCA_DIMS)
-                params.update(pca_dims=PCA_DIMS, pca_variance_kept=kept)
+            if 0 < self.pca_dims < X.shape[1]:
+                self.status.emit(f"Reducing {X.shape[1]} dimensions to {self.pca_dims} by PCA...")
+                X, kept = pca(X, self.pca_dims)
+                params.update(pca_dims=self.pca_dims, pca_variance_kept=kept)
             if self._cancelled:
                 self._gathered.emit(None)
                 return
@@ -223,7 +226,7 @@ class SessionMapJob(QtCore.QObject):
         p.finished.connect(self._exited)
         p.errorOccurred.connect(self._failed)
         self.status.emit(f"Starting the UMAP worker ({python})...")
-        p.start(python, ["-u", WORKER, payload["input"], out, "--pca", str(PCA_DIMS),
+        p.start(python, ["-u", WORKER, payload["input"], out, "--pca", str(self.pca_dims),
                          "--neighbors", str(UMAP_PARAMS["neighbors"]),
                          "--min_dist", str(UMAP_PARAMS["min_dist"])])
 

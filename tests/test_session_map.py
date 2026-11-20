@@ -4,7 +4,7 @@ Computes a real map in the background on copies of three EMPIAR-10988
 working directories, then checks cross-tomogram selection, the navigator's
 counts, the view-only browser, Escape, switching tomograms (including in
 the middle of a computation) and out-of-date detection. Needs umap-learn in
-the running environment (requirements.txt / environment.yml); skipped if it
+the running environment (pip install -e .); skipped if it
 is missing or the dataset is absent.
 
     QT_QPA_PLATFORM=offscreen python3 tests/test_session_map.py
@@ -29,7 +29,7 @@ if not os.path.isdir(DATA):
     sys.exit(0)
 if subprocess.run([sys.executable, "-c", "import umap"], capture_output=True).returncode != 0:
     print(f"SKIPPED: umap-learn is not installed in {sys.executable} "
-          f"(conda env create -f environment.yml)")
+          f"(pip install umap-learn)")
     sys.exit(0)
 
 TMP = tempfile.mkdtemp(prefix="pickymate_session_map_test_")
@@ -117,7 +117,7 @@ try:
     assert status == "ok" and [n for n, _ in m.layout] == NAMES, (status, m and m.layout)
     assert any(t for _, t in progress) and progress[-1][0] == progress[-1][1]
     tables = {n: ctl.session.particle_table(n) for n in NAMES[1:]}
-    live = sum(1 for b in win.boxes if b[7] is not None)
+    live = sum(1 for b in win.boxes if b.embedding_row is not None)
     assert len(uw.canvas._xy) == live + sum(len(t["uids"]) for t in tables.values())
     assert uw.compute_button.text() == "Recompute" and not uw.progress_bar.isVisibleTo(uw)
     print(f"OK: computed in the background ({len(progress)} progress updates) -- "
